@@ -7,17 +7,33 @@ Machines that an agent's code uses for a bounded task, then throws away. One cli
 
 ## Run
 
+Needs Node 26 and rootless podman (tested with 6.1) for browsers; for Windows also KVM (the service's user in the `kvm` group), QEMU 11.1 or later with `qemu-img`, and for the one-off build `curl`, `pip`, `7z` and `genisoimage`.
+
     podman build -t machines-browser browser
     npm install
-    MACHINES_KEY=... node src/server.ts
+    MACHINES_KEY=$(openssl rand -hex 32) node src/server.ts
 
-It listens on 127.0.0.1 only, port `MACHINES_PORT` (default 8797; never 8790). Leftovers of an earlier run on the same port (containers, runtime files, VM overlays) are removed at start; VMs die with the service. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA). Run it as its own user: CDP is close to code execution in the container, whose user is the service's user (`--userns keep-id`).
+It listens on 127.0.0.1 only, port `MACHINES_PORT` (default 8797; never 8790). The key is the one secret its client holds: rollforward's `RF_MACHINES_KEY`, with `RF_MACHINES_URL` its address. `curl -H "authorization: Bearer $MACHINES_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files, VM overlays) are removed at start; VMs die with the service. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
 
-Windows needs a golden machine first: about 40 minutes, unattended, from the Windows 11 evaluation ISO and virtio-win.iso in `~/.local/share/machines/windows/` (or `$MACHINES_DATA/windows/`):
+Run it as a user of its own, next to rollforward's: CDP is close to code execution in the container, whose user is the service's user (`--userns keep-id`). As a systemd user service of that user, with lingering on (`loginctl enable-linger USER`):
+
+    # ~/.config/systemd/user/machines.service
+    [Service]
+    WorkingDirectory=%h/machines
+    EnvironmentFile=%h/.config/machines.env
+    ExecStart=/usr/bin/node src/server.ts
+    Restart=on-failure
+
+    [Install]
+    WantedBy=default.target
+
+with `MACHINES_KEY=...` in `~/.config/machines.env`, then `systemctl --user enable --now machines`.
+
+Windows needs a golden machine first: about 40 minutes, unattended, from the Windows 11 Enterprise evaluation ISO (Microsoft's Evaluation Center) and the stable `virtio-win.iso` (Fedora's virtio-win), both in `~/.local/share/machines/windows/` (or `$MACHINES_DATA/windows/`), the first named `win11-eval.iso` unless given:
 
     node windows/build.ts [windows.iso]
 
-It writes `golden.qcow2` and `golden.state` there; clones' overlays live in `vms-<port>/`. `MACHINES_WINDOWS_POOL` (default 1) clones wait paused; at most `MACHINES_WINDOWS_MAX` (default 3) run at once. The machine: 4 vCPUs, 4 GB, Windows 11 Enterprise evaluation (90 days), local administrator `machines` signed in automatically (its password only matters inside the offline VM), UAC off, Python 3.14 with pywin32 (`windows/requirements.txt`), working directory `C:\work`. No Office yet.
+It writes `golden.qcow2` (about 12 GB) and `golden.state` (4 GB) there; clones' overlays live in `vms-<port>/`. `MACHINES_WINDOWS_POOL` (default 1) clones wait paused; at most `MACHINES_WINDOWS_MAX` (default 3) run at once, 4 GB of memory each. Without a golden machine the service still serves browsers, and a Windows request fails. The machine: 4 vCPUs, 4 GB, Windows 11 Enterprise evaluation, local administrator `machines` signed in automatically (its password only matters inside the offline VM), UAC off, Python 3.14 with pywin32 (`windows/requirements.txt`), working directory `C:\work`. No Office yet, and no activation (see Open items).
 
 Tests: `npm test` (the browser image; the windows test runs once the golden machine exists).
 
