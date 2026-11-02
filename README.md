@@ -67,3 +67,9 @@ The screenshot is of the newest tab. Downloads land where the agent's Playwright
 
 - Playwright's `page.request` / `context.request` run in the agent's own process, not in the browser: they would leave from the agent's sandbox, not through this proxy. To use the page's cookies, fetch inside the page: `page.evaluate(u => fetch(u).then(r => r.text()), url)`.
 - The write rule is a firm default, not a wall: the agent's code drives a real browser.
+
+## Open items
+
+- **Licence:** the evaluation never activates, as the VM has no network (`LicenseStatus` 5, "Windows License is expired" on the desktop, from both the 25H2 and the 26H2 evaluation ISOs), and an unactivated evaluation may shut down hourly, inside a 2-hour lease. Real use needs a licence from IT that activates offline or through a KMS host the host relays to.
+- **PowerShell** stalled at startup in the specialize pass of setup (hence `setup.cmd`); in a signed-in clone it runs.
+- **Chromium** still posts twice per session to `update.googleapis.com`; the proxy blocks both (log noise only).
