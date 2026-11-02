@@ -5,7 +5,7 @@ import net from 'node:net'
 import dns from 'node:dns'
 import { Duplex } from 'node:stream'
 
-export type Site = { hosts: string[], start_url?: string, reads_that_post?: string[] }
+export type Site = { hosts: string[], start_url?: string }
 export type Entry = { t: string, method: string, url: string, status: number, blocked?: string, error?: string, live?: true }
 type Target = { scheme: string, authority: string }
 
@@ -13,7 +13,6 @@ const internal = new net.BlockList()
 for (const [a, n] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.168.0.0', 16]] as const) internal.addSubnet(a, n, 'ipv4')
 for (const [a, n] of [['::1', 128], ['::', 128], ['fc00::', 7], ['fe80::', 10], ['::ffff:0:0', 96]] as const) internal.addSubnet(a, n, 'ipv6')
 
-const reads = new Set(['GET', 'HEAD', 'OPTIONS'])
 const hopByHop = ['connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'proxy-authenticate', 'te', 'trailer', 'transfer-encoding', 'upgrade']
 
 // A tunnel that isn't TLS (ws:// goes through CONNECT too), wrapped so the HTTP server reads what was already peeked.
@@ -31,13 +30,12 @@ const plain = (socket: net.Socket) => {
 
 // One proxy per browser session, on a unix socket only that session's container can reach.
 // CONNECT tunnels are opened locally (TLS ends here, with a key the browser is told to accept),
-// so every request is seen whole: checked against the site's hosts and the write rule, then logged.
+// so every request is seen whole: checked against the site's hosts, then logged.
 export function startProxy(path: string, site: Site, key: { key: string, cert: string }, isLive: () => boolean, log: Entry[]) {
   const hosts = site.hosts.map(h => h.toLowerCase())
   const exact = new Set(hosts.filter(h => !h.startsWith('*.')))
   const suffixes = hosts.filter(h => h.startsWith('*.')).map(h => h.slice(1))
   const allowed = (host: string) => exact.has(host) || suffixes.some(s => host.endsWith(s))
-  const readsThatPost = (site.reads_that_post ?? []).map(p => new RegExp('^' + p.split('*').map(RegExp.escape).join('.*') + '$'))
   const secureContext = tls.createSecureContext(key)
   const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) }
 
@@ -59,7 +57,6 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const check = (req: http.IncomingMessage, url: URL | null) =>
     !url ? 'malformed request'
       : !allowed(url.hostname) ? 'host not on the list'
-      : !reads.has(req.method!) && !isLive() && !readsThatPost.some(r => r.test(url.href)) ? 'writes are off'
       : undefined
 
   const record = (req: http.IncomingMessage, url: URL | null, status: number, extra: Partial<Entry> = {}) =>

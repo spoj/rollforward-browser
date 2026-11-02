@@ -2,7 +2,7 @@
 
 Machines that an agent's code uses for a bounded task, then throws away. One client: the rollforward server, holding the service key.
 
-- **browser**: a podman container per session with Chromium, driven over CDP (Playwright `connectOverCDP`). The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts, blocks writes, and logs each request.
+- **browser**: a podman container per session with Chromium, driven over CDP (Playwright `connectOverCDP`). The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts and logs each request.
 - **windows**: a Windows VM (KVM, QEMU driven directly), leased for a bounded task and then thrown away. Clones of one golden machine, saved signed in and idle with its memory, wait paused in a pool; a lease resumes one (seconds) and sets its clock; closing kills it and discards its disk overlay, so the next lease starts from the golden state again. No network device at all: the host talks to a helper in the signed-in session over a virtio-serial port (scripts, files), and takes screenshots itself (QMP `screendump`, which works when Windows hangs on a dialog).
 
 ## Run
@@ -62,17 +62,16 @@ Every request carries `Authorization: Bearer $MACHINES_KEY`. Errors are `{error}
 
 ### browser
 
-`POST /sessions` `{kind: "browser", site: {hosts, start_url?, reads_that_post?}, state?}` → `{id, cdp, view}` (paths on this service)
+`POST /sessions` `{kind: "browser", site: {hosts, start_url?}, state?}` → `{id, cdp, view}` (paths on this service)
 
 - `hosts`: names the browser may reach, exact (`erp.example`) or `*.example` for any name under it. Anything else gets a 403 page.
 - Internal addresses (private, loopback, link-local, CGNAT, unique-local) are reachable only through a name listed exactly: a name matched by a wildcard that resolves only to internal addresses gets a 502. IP literals must be listed exactly.
-- Writes: requests other than GET, HEAD and OPTIONS get a 403, unless their URL matches a `reads_that_post` pattern (`*` matches anything, matched against the whole URL, e.g. `https://erp.example/jde/*.mafService*`) or a person is driving the live view.
 - `state`: a Playwright storageState (`{cookies, origins: [{origin, localStorage}]}`), loaded before the call returns. It lives only in the service's memory and the container's tmpfs.
 - `start_url`: the first tab goes there before the call returns (until the response arrives, not the load).
 
 `GET /sessions/:id/cdp` — websocket: CDP of the whole browser, for `chromium.connectOverCDP(url, {headers})`. Use `browser.contexts()[0]` (the saved login is there).
 
-`GET /sessions/:id/view` — the live view page: the browser's tabs, screencast, an address bar. It watches until the person presses Take control; then their mouse and keyboard go to the page and writes are allowed while they hold control. The page connects to the websockets `view/watch` and `view/drive` relative to its own URL (CDP like `cdp`; a `drive` connection is what counts as a person driving), so a proxy in front must pass those through, adding the key.
+`GET /sessions/:id/view` — the live view page: the browser's tabs, screencast, an address bar. It watches until the person presses Take control; then their mouse and keyboard go to the page. The page connects to the websockets `view/watch` and `view/drive` relative to its own URL (CDP like `cdp`; a `drive` connection is what counts as a person driving), so a proxy in front must pass those through, adding the key.
 
 `GET /sessions/:id/log` → `[{t, method, url, status, blocked?, error?, live?}]`, every request the browser made, in order: `blocked` says why the proxy refused it (403), `error` why upstream failed (502), `live` that a person was driving. Works after the ttl too.
 
@@ -91,7 +90,7 @@ The screenshot is of the newest tab. Downloads land where the agent's Playwright
 ## Notes for clients
 
 - Playwright's `page.request` / `context.request` run in the agent's own process, not in the browser: they would leave from the agent's sandbox, not through this proxy. To use the page's cookies, fetch inside the page: `page.evaluate(u => fetch(u).then(r => r.text()), url)`.
-- The write rule is a firm default, not a wall: the agent's code drives a real browser.
+- The proxy keeps to hosts, not to reads: whatever the session's login may do on its site, the browser may do. Every request is in `log`, with `live` when a person drove it.
 
 ## Open items
 
