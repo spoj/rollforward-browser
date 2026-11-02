@@ -24,6 +24,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const allowed = (host: string) => exact.has(host) || suffixes.some(s => host.endsWith(s))
   const readsThatPost = (site.reads_that_post ?? []).map(p => new RegExp('^' + p.split('*').map(RegExp.escape).join('.*') + '$'))
   const secureContext = tls.createSecureContext(key)
+  const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) }
 
   const lookup = (host: string, opts: dns.LookupOptions, cb: (...a: any[]) => void) =>
     dns.lookup(host, { all: true }, (err, addrs) => {
@@ -49,7 +50,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const upstreamOptions = (req: http.IncomingMessage, url: URL) => {
     const headers = { ...req.headers, host: url.host }
     for (const h of hopByHop) delete headers[h]
-    return { method: req.method, headers, lookup, servername: net.isIP(url.hostname) ? undefined : url.hostname }
+    return { method: req.method, headers, lookup, agent: agents[url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
   }
 
   const forward = (req: http.IncomingMessage, res: http.ServerResponse) => {
@@ -76,6 +77,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   }
 
   const forwardUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+    socket.on('error', () => socket.destroy())
     const url = urlOf(req)
     const blocked = check(req, url)
     if (blocked) {
@@ -88,6 +90,8 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     opts.headers.upgrade = req.headers.upgrade
     const up = (url.protocol === 'https:' ? https : http).request(url, opts)
     up.on('upgrade', (r, upSocket, upHead) => {
+      upSocket.on('error', () => socket.destroy())
+      socket.on('close', () => upSocket.destroy())
       record(req, url, 101)
       socket.write(`HTTP/1.1 101 Switching Protocols\r\n${Object.entries(r.headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`)
       upSocket.write(head)
@@ -110,6 +114,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const outer = http.createServer(forward)
   outer.on('upgrade', forwardUpgrade)
   outer.on('connect', (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+    socket.on('error', () => socket.destroy())
     socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
     const start = (first: Buffer) => {
       socket.pause()
@@ -120,6 +125,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     }
     head.length ? start(head) : socket.once('data', start)
   })
+  outer.on('close', () => Object.values(agents).forEach(a => a.destroy()))
   outer.listen(path)
   return outer
 }
