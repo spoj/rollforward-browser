@@ -77,12 +77,13 @@ def serve(port):
         buf += chunk
         while b'\n' in buf:
             line, buf = buf.split(b'\n', 1)
-            msg = json.loads(line)
+            msg = {}
             try:
+                msg = json.loads(line)
                 reply = handle(msg)
             except Exception as e:
                 reply = {'error': f'{type(e).__name__}: {e}'}
-            data = memoryview(json.dumps({'id': msg['id'], **reply}).encode() + b'\n')
+            data = memoryview(json.dumps({'id': msg.get('id'), **reply}).encode() + b'\n')
             while data:
                 data = data[port.write(data):]
 

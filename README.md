@@ -3,7 +3,7 @@
 Machines that an agent's code uses for a bounded task, then throws away. One client: the rollforward server, holding the service key.
 
 - **browser**: a podman container per session with Chromium, driven over CDP (Playwright `connectOverCDP`). The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts, blocks writes, and logs each request.
-- **windows**: not yet.
+- **windows**: a Windows VM (KVM, QEMU driven directly), leased for a bounded task and then thrown away. Clones of one golden machine, saved signed in and idle with its memory, wait paused in a pool; a lease resumes one (seconds) and sets its clock; closing kills it and discards its disk overlay, so the next lease starts from the golden state again. No network device at all: the host talks to a helper in the signed-in session over a virtio-serial port (scripts, files), and takes screenshots itself (QMP `screendump`, which works when Windows hangs on a dialog).
 
 ## Run
 
@@ -11,11 +11,23 @@ Machines that an agent's code uses for a bounded task, then throws away. One cli
     npm install
     MACHINES_KEY=... MACHINES_PORT=8797 node src/server.ts
 
+Windows needs a golden machine first (about 40 minutes, unattended; the Windows 11 evaluation ISO and virtio-win.iso in `~/.local/share/machines/windows/`, or `$MACHINES_DATA/windows/`):
+
+    node windows/build.ts [windows.iso]
+
+It writes `golden.qcow2` and `golden.state` there; clones' overlays live in `vms-<port>/`. `MACHINES_WINDOWS_POOL` (default 1) clones wait paused; at most `MACHINES_WINDOWS_MAX` (default 3) run at once, beyond that a lease gets a 503. The machine: 4 vCPUs, 4 GB, Windows 11 Enterprise evaluation (90 days), local administrator `machines` signed in automatically (its password only matters inside the offline VM), UAC off, Python 3.14 with pywin32, working directory `C:\work`. No Office yet.
+
 It listens on 127.0.0.1 only (default port 8797; never 8790). Leftover containers and runtime files of an earlier run on the same port are removed at start. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA). Tests: `npm test` (needs the image).
 
 ## API
 
 Every request carries `Authorization: Bearer $MACHINES_KEY`. Errors are `{error}` with a status: 400, 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 500.
+
+`POST /sessions` `{kind: "windows", ttl_s?}` → 201 `{id}`, or 503 when no machine is free.
+
+`POST /sessions/:id/run` `{lang: "python"|"powershell", script, timeout_s}` → `{exit, stdout, stderr, timed_out?}` (windows): the script runs in the signed-in session, in `C:\work`; past `timeout_s` its process tree is killed and `exit` is null.
+
+`GET|PUT /sessions/:id/files/C:/work/<path>` and `GET /sessions/:id/screenshot` work for windows too; `DELETE` → `{}`.
 
 `POST /sessions` `{kind: "browser", site: {hosts, start_url?, reads_that_post?}, state?, ttl_s?}` → 201 `{id, cdp, view}`
 
