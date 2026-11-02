@@ -9,35 +9,41 @@ Machines that an agent's code uses for a bounded task, then throws away. One cli
 
     podman build -t machines-browser browser
     npm install
-    MACHINES_KEY=... MACHINES_PORT=8797 node src/server.ts
+    MACHINES_KEY=... node src/server.ts
 
-Windows needs a golden machine first (about 40 minutes, unattended; the Windows 11 evaluation ISO and virtio-win.iso in `~/.local/share/machines/windows/`, or `$MACHINES_DATA/windows/`):
+It listens on 127.0.0.1 only, port `MACHINES_PORT` (default 8797; never 8790). Leftovers of an earlier run on the same port (containers, runtime files, VM overlays) are removed at start; VMs die with the service. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA). Run it as its own user: CDP is close to code execution in the container, whose user is the service's user (`--userns keep-id`).
+
+Windows needs a golden machine first: about 40 minutes, unattended, from the Windows 11 evaluation ISO and virtio-win.iso in `~/.local/share/machines/windows/` (or `$MACHINES_DATA/windows/`):
 
     node windows/build.ts [windows.iso]
 
-It writes `golden.qcow2` and `golden.state` there; clones' overlays live in `vms-<port>/`. `MACHINES_WINDOWS_POOL` (default 1) clones wait paused; at most `MACHINES_WINDOWS_MAX` (default 3) run at once, beyond that a lease gets a 503. The machine: 4 vCPUs, 4 GB, Windows 11 Enterprise evaluation (90 days), local administrator `machines` signed in automatically (its password only matters inside the offline VM), UAC off, Python 3.14 with pywin32, working directory `C:\work`. No Office yet.
+It writes `golden.qcow2` and `golden.state` there; clones' overlays live in `vms-<port>/`. `MACHINES_WINDOWS_POOL` (default 1) clones wait paused; at most `MACHINES_WINDOWS_MAX` (default 3) run at once. The machine: 4 vCPUs, 4 GB, Windows 11 Enterprise evaluation (90 days), local administrator `machines` signed in automatically (its password only matters inside the offline VM), UAC off, Python 3.14 with pywin32 (`windows/requirements.txt`), working directory `C:\work`. No Office yet.
 
-It listens on 127.0.0.1 only (default port 8797; never 8790). Leftover containers and runtime files of an earlier run on the same port are removed at start. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA). Tests: `npm test` (needs the image).
+Tests: `npm test` (the browser image; the windows test runs once the golden machine exists).
 
 ## API
 
-Every request carries `Authorization: Bearer $MACHINES_KEY`. Errors are `{error}` with a status: 400, 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 500.
+Every request carries `Authorization: Bearer $MACHINES_KEY`. Errors are `{error}` with a status: 400, 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 503 (no windows machine free), 500.
 
-`POST /sessions` `{kind: "windows", ttl_s?}` → 201 `{id}`, or 503 when no machine is free.
+`POST /sessions` `{kind, ..., ttl_s?}` → 201 `{id, ...}`. After `ttl_s` (default 3600) the session closes on its own; its result waits for `DELETE`.
 
-`POST /sessions/:id/run` `{lang: "python"|"powershell", script, timeout_s}` → `{exit, stdout, stderr, timed_out?}` (windows): the script runs in the signed-in session, in `C:\work`; past `timeout_s` its process tree is killed and `exit` is null.
+`DELETE /sessions/:id` → the session's result; then the machine is gone. A second `DELETE` is a 404.
 
-`GET|PUT /sessions/:id/files/C:/work/<path>` and `GET /sessions/:id/screenshot` work for windows too; `DELETE` → `{}`.
+`GET /sessions/:id/screenshot` → PNG.
 
-`POST /sessions` `{kind: "browser", site: {hosts, start_url?, reads_that_post?}, state?, ttl_s?}` → 201 `{id, cdp, view}`
+`GET|PUT /sessions/:id/files/<path>` — read or write a file in the machine by absolute path (`PUT` makes the directories): `/files/tmp/x` in a browser's container, `/files/C:/work/x.xlsx` in windows.
+
+`GET /sessions` → `[{id, kind, expires, closed}]`.
+
+### browser
+
+`POST /sessions` `{kind: "browser", site: {hosts, start_url?, reads_that_post?}, state?}` → `{id, cdp, view}` (paths on this service)
 
 - `hosts`: names the browser may reach, exact (`erp.example`) or `*.example` for any name under it. Anything else gets a 403 page.
 - Internal addresses (private, loopback, link-local, CGNAT, unique-local) are reachable only through a name listed exactly: a name matched by a wildcard that resolves only to internal addresses gets a 502. IP literals must be listed exactly.
 - Writes: requests other than GET, HEAD and OPTIONS get a 403, unless their URL matches a `reads_that_post` pattern (`*` matches anything, matched against the whole URL, e.g. `https://erp.example/jde/*.mafService*`) or a person is driving the live view.
 - `state`: a Playwright storageState (`{cookies, origins: [{origin, localStorage}]}`), loaded before the call returns. It lives only in the service's memory and the container's tmpfs.
 - `start_url`: the first tab goes there before the call returns (until the response arrives, not the load).
-- `ttl_s` (default 3600): then the session closes on its own; its result (below) waits for `DELETE`.
-- `cdp` and `view` are paths on this service.
 
 `GET /sessions/:id/cdp` — websocket: CDP of the whole browser, for `chromium.connectOverCDP(url, {headers})`. Use `browser.contexts()[0]` (the saved login is there).
 
@@ -45,16 +51,19 @@ Every request carries `Authorization: Bearer $MACHINES_KEY`. Errors are `{error}
 
 `GET /sessions/:id/log` → `[{t, method, url, status, blocked?, error?, live?}]`, every request the browser made, in order: `blocked` says why the proxy refused it (403), `error` why upstream failed (502), `live` that a person was driving. Works after the ttl too.
 
-`GET /sessions/:id/screenshot` → PNG of the newest tab.
+The screenshot is of the newest tab. Downloads land where the agent's Playwright tells Chromium: `await download.path()` gives that path in the container (`/tmp/playwright-artifacts-…/<guid>`), so fetch `GET /sessions/:id/files/tmp/playwright-artifacts-…/<guid>`; `download.saveAs()` can't work, as the file isn't where the agent's Playwright runs.
 
-`GET|PUT /sessions/:id/files/<path>` — read or write a file in the container by absolute path (`PUT` makes the directories). Downloads land where the agent's Playwright tells Chromium; `await download.path()` gives that path (`/tmp/playwright-artifacts-…/<guid>`), so fetch `GET /sessions/:id/files/tmp/playwright-artifacts-…/<guid>`. (`download.saveAs()` can't work: the file is in the container, not where the agent's Playwright runs.)
+`DELETE` → `{state, log}`: the refreshed login (null if the browser was gone) and the whole request log.
 
-`DELETE /sessions/:id` → `{state, log}`: the refreshed login (null if the browser was gone) and the whole request log. Then the container, its memory and the session's sockets are gone. A second `DELETE` is a 404.
+### windows
 
-`GET /sessions` → `[{id, kind, expires, closed}]`.
+`POST /sessions` `{kind: "windows"}` → `{id}` once a clone is resumed, signed in and its clock set.
+
+`POST /sessions/:id/run` `{lang: "python"|"powershell", script, timeout_s}` → `{exit, stdout, stderr, timed_out?}`: the script runs in the signed-in session, in `C:\work`; past `timeout_s` its process tree is killed and `exit` is null. One request at a time per machine: others wait their turn.
+
+`DELETE` → `{}`.
 
 ## Notes for clients
 
 - Playwright's `page.request` / `context.request` run in the agent's own process, not in the browser: they would leave from the agent's sandbox, not through this proxy. To use the page's cookies, fetch inside the page: `page.evaluate(u => fetch(u).then(r => r.text()), url)`.
 - The write rule is a firm default, not a wall: the agent's code drives a real browser.
-- Run the service as its own user: CDP is close to code execution in the container, and the container's user is the service's user (`--userns keep-id`).
