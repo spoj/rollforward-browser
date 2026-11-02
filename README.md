@@ -13,7 +13,7 @@ Needs Node 26 and rootless podman (tested with 6.1) for browsers; for Windows al
     npm install
     MACHINES_KEY=$(openssl rand -hex 32) node src/server.ts
 
-It listens on `MACHINES_HOST` (default 127.0.0.1), port `MACHINES_PORT` (default 8797; never 8790). The key is the one secret its client holds: rollforward's `RF_MACHINES_KEY`, with `RF_MACHINES_URL` its address. `curl -H "authorization: Bearer $MACHINES_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files, VM overlays) are removed at start; VMs die with the service. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
+It listens on `MACHINES_HOST` (default 127.0.0.1), port `MACHINES_PORT` (default 8797). The key is the one secret its client holds: rollforward's `RF_MACHINES_KEY`, with `RF_MACHINES_URL` its address. `curl -H "authorization: Bearer $MACHINES_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files, VM overlays) are removed at start; VMs die with the service. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
 
 Run it as a user of its own, next to rollforward's: CDP is close to code execution in the container, whose user is the service's user (`--userns keep-id`). As a systemd user service of that user, with lingering on (`loginctl enable-linger USER`):
 
