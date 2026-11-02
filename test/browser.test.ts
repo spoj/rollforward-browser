@@ -29,7 +29,7 @@ before(async () => {
   await once(portal.server, 'listening')
   const origin = `https://portal.localhost:${portal.port()}`
   site = { hosts: ['portal.localhost'], start_url: `${origin}/`, reads_that_post: [`${origin}/report*`] }
-  service = spawn('node', ['src/server.ts'], { env: { ...process.env, MACHINES_PORT: String(port), MACHINES_KEY: key, NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem` }, stdio: ['ignore', 'pipe', 'inherit'] })
+  service = spawn('node', ['src/server.ts'], { env: { ...process.env, MACHINES_PORT: String(port), MACHINES_KEY: key, MACHINES_WINDOWS_POOL: '0', NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem` }, stdio: ['ignore', 'pipe', 'inherit'] })
   await Promise.race([once(service.stdout!, 'data'), once(service, 'exit').then(() => { throw new Error('service exited') })])
 })
 

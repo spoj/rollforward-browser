@@ -4,6 +4,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import { BrowserSession, podman } from './browser.ts'
+import { WindowsSession, startPool, windowsDir } from './windows.ts'
 
 const port = Number(process.env.MACHINES_PORT ?? 8797)
 const key = process.env.MACHINES_KEY
@@ -13,7 +14,7 @@ const label = `machines=${port}`
 const viewPage = fs.readFileSync(new URL('view.html', import.meta.url))
 
 type Result = { state?: unknown, log?: unknown[] }
-type Session = BrowserSession & { expires?: number, timer?: NodeJS.Timeout, closing?: Promise<Result> }
+type Session = (BrowserSession | WindowsSession) & { expires?: number, timer?: NodeJS.Timeout, closing?: Promise<Result> }
 const sessions = new Map<string, Session>()
 
 const fail = (status: number, message: string) => Object.assign(new Error(message), { status })
@@ -26,12 +27,14 @@ const close = (s: Session) => {
 }
 
 async function open(spec: any) {
-  if (spec.kind !== 'browser') throw fail(400, `unknown kind: ${spec.kind}`)
   const id = crypto.randomBytes(8).toString('hex')
-  const s: Session = new BrowserSession(id, `${runDir}/${id}`, label, spec.site)
+  const s: Session = spec.kind === 'browser' ? new BrowserSession(id, `${runDir}/${id}`, label, spec.site)
+    : spec.kind === 'windows' ? new WindowsSession(id)
+    : (() => { throw fail(400, `unknown kind: ${spec.kind}`) })()
   sessions.set(id, s)
   try {
-    await s.start(spec.state, `ws://127.0.0.1:${port}/sessions/${id}/cdp`, { authorization: `Bearer ${key}` })
+    if (s instanceof BrowserSession) await s.start(spec.state, `ws://127.0.0.1:${port}/sessions/${id}/cdp`, { authorization: `Bearer ${key}` })
+    else await s.start()
   } catch (e) {
     sessions.delete(id)
     await close(s)
@@ -40,7 +43,7 @@ async function open(spec: any) {
   const ttl = (spec.ttl_s ?? 3600) * 1000
   s.expires = Date.now() + ttl
   s.timer = setTimeout(() => close(s).catch(e => console.error(`closing ${id}:`, e)), ttl)
-  return { id, cdp: `/sessions/${id}/cdp`, view: `/sessions/${id}/view` }
+  return s instanceof BrowserSession ? { id, cdp: `/sessions/${id}/cdp`, view: `/sessions/${id}/view` } : { id }
 }
 
 async function route(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -58,7 +61,11 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   }
   if (rest === '/log' && req.method === 'GET') return json(res, 200, s.log)
   if (s.closing) throw fail(410, 'session closed')
-  if (rest === '/view' && req.method === 'GET') return res.writeHead(200, { 'content-type': 'text/html' }).end(viewPage)
+  if (rest === '/run' && req.method === 'POST' && s instanceof WindowsSession) {
+    const { lang, script, timeout_s } = JSON.parse((await body(req)).toString())
+    return json(res, 200, await s.run(lang, script, timeout_s))
+  }
+  if (rest === '/view' && req.method === 'GET' && s instanceof BrowserSession) return res.writeHead(200, { 'content-type': 'text/html' }).end(viewPage)
   if (rest === '/screenshot' && req.method === 'GET') {
     const png = await s.screenshot()
     return res.writeHead(200, { 'content-type': 'image/png' }).end(png)
@@ -84,7 +91,7 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   socket.on('error', () => socket.destroy())
   const [, id, rest] = new URL(req.url!, 'http://x').pathname.match(/^\/sessions\/([^/]+)(\/cdp|\/view\/watch|\/view\/drive)$/) ?? []
   const s = sessions.get(id)
-  if (req.headers.authorization !== `Bearer ${key}` || !s || s.closing) return socket.end('HTTP/1.1 404 Not Found\r\nconnection: close\r\n\r\n')
+  if (req.headers.authorization !== `Bearer ${key}` || !(s instanceof BrowserSession) || s.closing) return socket.end('HTTP/1.1 404 Not Found\r\nconnection: close\r\n\r\n')
   const up = net.connect(s.cdpSocket)
   up.on('error', () => socket.destroy())
   const headers: Record<string, unknown> = { ...req.headers, host: 'localhost' }
@@ -102,4 +109,5 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
 await podman(['rm', '-f', '-t', '0', '--filter', `label=${label}`])
 fs.rmSync(runDir, { recursive: true, force: true })
 fs.mkdirSync(runDir, { mode: 0o700 })
+startPool(`${windowsDir}/vms-${port}`)
 server.listen(port, '127.0.0.1', () => console.log(`machines listening on 127.0.0.1:${port}`))
