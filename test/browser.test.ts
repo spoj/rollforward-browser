@@ -124,6 +124,41 @@ test('hosts matched by a wildcard may not reach internal addresses', async () =>
   await api('DELETE', `/sessions/${body.id}`)
 })
 
+test('the live view shows the browser and, once the person takes control, passes their input', async t => {
+  const { body } = await api('POST', '/sessions', { kind: 'browser', site })
+  const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
+  const page = agent.contexts()[0].pages()[0]
+  await page.waitForURL(/\/login$/)
+  const width = await page.evaluate(() => innerWidth)
+
+  const person = await chromium.launch()
+  t.after(() => person.close())
+  const view = await (await person.newContext({ extraHTTPHeaders: headers })).newPage()
+  await view.goto(`http://127.0.0.1:${port}${body.view}`)
+  await view.waitForFunction(() => (document.getElementById('img') as HTMLImageElement).src.startsWith('data:image/jpeg'))
+  const click = async (selector: string) => {
+    const box = (await page.locator(selector).boundingBox())!
+    const img = (await view.locator('#img').boundingBox())!
+    const scale = img.width / width
+    await view.mouse.click(img.x + (box.x + box.width / 2) * scale, img.y + (box.y + box.height / 2) * scale)
+  }
+  await click('#user')
+  await view.keyboard.type('bob')
+  assert.equal(await page.inputValue('#user'), '', 'watching passes no input')
+
+  await view.click('#drive')
+  await view.waitForFunction(() => document.title.includes('you have control'))
+  await click('#user')
+  await view.keyboard.type('bob')
+  await click('#password')
+  await view.keyboard.type('secret')
+  await view.keyboard.press('Enter')
+  await page.waitForSelector('text=Welcome bob')
+  await agent.close()
+  const closed = await api('DELETE', `/sessions/${body.id}`)
+  assert.ok(closed.body.log.find((e: any) => e.method === 'POST' && e.url.endsWith('/login') && e.live))
+})
+
 test('a session past its ttl is closed and keeps its result until collected', async () => {
   const { body } = await api('POST', '/sessions', { kind: 'browser', site, state: signedIn, ttl_s: 1 })
   await new Promise(r => setTimeout(r, 2500))

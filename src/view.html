@@ -54,7 +54,7 @@ function connect() {
     }
   }
   document.body.classList.toggle('drive', driving)
-  document.title = driving ? 'Live view (you have control)' : 'Live view (watching)'
+  document.title = 'Live view (connecting)'
   driveButton.textContent = driving ? 'Give back control' : 'Take control'
   url.disabled = !driving
 }
@@ -64,6 +64,7 @@ async function show(targetId) {
   current = targetId
   session = (await send('Target.attachToTarget', { targetId, flatten: true })).sessionId
   await send('Page.startScreencast', { format: 'jpeg', quality: 70 }, session)
+  document.title = driving ? 'Live view (you have control)' : 'Live view (watching)'
   render()
 }
 
@@ -84,7 +85,7 @@ const point = e => {
   const r = img.getBoundingClientRect()
   return { x: (e.clientX - r.left) * meta.deviceWidth / r.width, y: (e.clientY - r.top) * meta.deviceHeight / r.height }
 }
-const mouse = (type, e) => driving && meta && send('Input.dispatchMouseEvent', {
+const mouse = (type, e) => driving && session && meta && send('Input.dispatchMouseEvent', {
   type, ...point(e), modifiers: mods(e), buttons: e.buttons, clickCount: type === 'mouseMoved' ? 0 : e.detail || 1,
   button: type === 'mouseMoved' ? (e.buttons & 1 ? 'left' : 'none') : ['left', 'middle', 'right'][e.button],
 }, session)
@@ -93,23 +94,23 @@ img.onmouseup = e => mouse('mouseReleased', e)
 img.onmousemove = e => mouse('mouseMoved', e)
 img.oncontextmenu = e => e.preventDefault()
 img.onwheel = e => {
-  if (!driving || !meta) return
+  if (!driving || !session || !meta) return
   e.preventDefault()
   send('Input.dispatchMouseEvent', { type: 'mouseWheel', ...point(e), deltaX: e.deltaX, deltaY: e.deltaY, modifiers: mods(e) }, session)
 }
 img.onkeydown = e => {
-  if (!driving || ((e.ctrlKey || e.metaKey) && e.key === 'v')) return
+  if (!driving || !session || ((e.ctrlKey || e.metaKey) && e.key === 'v')) return
   e.preventDefault()
   const text = e.key === 'Enter' ? '\r' : e.key.length === 1 && !e.ctrlKey && !e.metaKey ? e.key : undefined
   send('Input.dispatchKeyEvent', { type: text ? 'keyDown' : 'rawKeyDown', key: e.key, code: e.code, text, unmodifiedText: text, windowsVirtualKeyCode: e.keyCode, modifiers: mods(e) }, session)
 }
 img.onkeyup = e => {
-  if (!driving) return
+  if (!driving || !session) return
   e.preventDefault()
   send('Input.dispatchKeyEvent', { type: 'keyUp', key: e.key, code: e.code, windowsVirtualKeyCode: e.keyCode, modifiers: mods(e) }, session)
 }
 document.onpaste = e => {
-  if (!driving || document.activeElement !== img) return
+  if (!driving || !session || document.activeElement !== img) return
   e.preventDefault()
   send('Input.insertText', { text: e.clipboardData.getData('text') }, session)
 }
