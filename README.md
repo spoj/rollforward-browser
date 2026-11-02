@@ -13,7 +13,7 @@ Needs Node 26 and rootless podman (tested with 6.1) for browsers; for Windows al
     npm install
     MACHINES_KEY=$(openssl rand -hex 32) node src/server.ts
 
-It listens on 127.0.0.1 only, port `MACHINES_PORT` (default 8797; never 8790). The key is the one secret its client holds: rollforward's `RF_MACHINES_KEY`, with `RF_MACHINES_URL` its address. `curl -H "authorization: Bearer $MACHINES_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files, VM overlays) are removed at start; VMs die with the service. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
+It listens on `MACHINES_HOST` (default 127.0.0.1), port `MACHINES_PORT` (default 8797; never 8790). The key is the one secret its client holds: rollforward's `RF_MACHINES_KEY`, with `RF_MACHINES_URL` its address. `curl -H "authorization: Bearer $MACHINES_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files, VM overlays) are removed at start; VMs die with the service. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
 
 Run it as a user of its own, next to rollforward's: CDP is close to code execution in the container, whose user is the service's user (`--userns keep-id`). As a systemd user service of that user, with lingering on (`loginctl enable-linger USER`):
 
@@ -28,6 +28,15 @@ Run it as a user of its own, next to rollforward's: CDP is close to code executi
     WantedBy=default.target
 
 with `MACHINES_KEY=...` in `~/.config/machines.env`, then `systemctl --user enable --now machines`.
+
+On a host of its own, such as a VM next to rollforward's:
+
+- **Listen on the private interface:** `MACHINES_HOST`, an IPv4 address of this host, such as `10.0.0.5`.
+- **Let only the rollforward host in:** a firewall rule allowing its address to `MACHINES_PORT`, and nothing else.
+- **Encrypt the link:** CDP and the live view carry signed-in sessions, and the key goes with every request. Either listen on a private link, WireGuard or Tailscale, and give rollforward its `http://` address there; or keep `MACHINES_HOST` at 127.0.0.1 behind a reverse proxy that ends TLS and passes websockets, such as Caddy, and give rollforward its `https://` address (with `NODE_EXTRA_CA_CERTS` on the rollforward host for a private CA).
+- **The sites are reached from here:** browsers' requests leave from this host, so it needs the routes to the sites (the ERP, the portals) and, for an internal CA, `NODE_EXTRA_CA_CERTS`; the rollforward host doesn't.
+- **KVM inside a VM** needs nested virtualization from the hypervisor (Hyper-V's `ExposeVirtualizationExtensions`, VMware's hardware-assisted virtualization, or a cloud size that allows it); without it, the host serves browsers only.
+- **Sizing:** a browser container is capped at 2 GB, about 0.2 GB idle and more on heavy sites. A Windows machine takes 4 GB and 4 vCPUs, at most `MACHINES_WINDOWS_MAX` (3) at once, the waiting pool clone included. Disk: about 16 GB for the golden machine (its 12 GB disk and 4 GB memory state), plus each clone's overlay, which grows with what its scripts write and goes when it closes.
 
 Windows needs a golden machine first: about 40 minutes, unattended, from the Windows 11 Enterprise evaluation ISO (Microsoft's Evaluation Center) and the stable `virtio-win.iso` (Fedora's virtio-win), both in `~/.local/share/machines/windows/` (or `$MACHINES_DATA/windows/`), the first named `win11-eval.iso` unless given:
 

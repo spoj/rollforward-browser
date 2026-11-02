@@ -7,6 +7,7 @@ import { BrowserSession, podman } from './browser.ts'
 import { WindowsSession, startPool, windowsDir } from './windows.ts'
 
 const port = Number(process.env.MACHINES_PORT ?? 8797)
+const host = process.env.MACHINES_HOST ?? '127.0.0.1'
 const key = process.env.MACHINES_KEY
 if (!key) throw new Error('MACHINES_KEY is not set')
 const runDir = `${os.tmpdir()}/machines-${port}`
@@ -33,7 +34,7 @@ async function open(spec: any) {
     : (() => { throw fail(400, `unknown kind: ${spec.kind}`) })()
   sessions.set(id, s)
   try {
-    if (s instanceof BrowserSession) await s.start(spec.state, `ws://127.0.0.1:${port}/sessions/${id}/cdp`, { authorization: `Bearer ${key}` })
+    if (s instanceof BrowserSession) await s.start(spec.state, `ws://${host}:${port}/sessions/${id}/cdp`, { authorization: `Bearer ${key}` })
     else await s.start()
   } catch (e) {
     sessions.delete(id)
@@ -110,4 +111,4 @@ await podman(['rm', '-f', '-t', '0', '--filter', `label=${label}`])
 fs.rmSync(runDir, { recursive: true, force: true })
 fs.mkdirSync(runDir, { mode: 0o700 })
 startPool(`${windowsDir}/vms-${port}`)
-server.listen(port, '127.0.0.1', () => console.log(`machines listening on 127.0.0.1:${port}`))
+server.listen(port, host, () => console.log(`machines listening on ${host}:${port}`))
