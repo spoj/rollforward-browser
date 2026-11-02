@@ -47,6 +47,11 @@ export function startPortal(tls: { key: string, cert: string }) {
       return res.writeHead(200, { 'content-type': 'text/csv', 'content-disposition': 'attachment; filename=report.csv' }).end('account,amount\ncash,100\n')
     res.writeHead(404).end()
   })
+  server.on('upgrade', (req, socket) => {
+    const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: ${accept}\r\n\r\n`)
+    socket.write(Buffer.from([0x81, 5, ...Buffer.from('hello')]))
+  })
   server.listen(0, '::')
   return { server, sessions, writes, port: () => (server.address() as AddressInfo).port }
 }

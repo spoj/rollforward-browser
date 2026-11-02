@@ -94,6 +94,9 @@ test('an agent works with the saved login inside the site rules', async () => {
   assert.match(await page.textContent('body') ?? '', /writes are off/)
   assert.deepEqual(portal.writes, [])
 
+  const message = await page.evaluate(() => new Promise(resolve => { new WebSocket(`wss://${location.host}/ws`).onmessage = e => resolve(e.data) }))
+  assert.equal(message, 'hello')
+
   const shot = await api('GET', `/sessions/${id}/screenshot`)
   assert.deepEqual([...shot.body.subarray(1, 4)], [...Buffer.from('PNG')])
   await agent.close()
@@ -103,6 +106,7 @@ test('an agent works with the saved login inside the site rules', async () => {
   assert.equal(find('POST', '/report').status, 200)
   assert.equal(find('POST', '/update').blocked, 'writes are off')
   assert.equal(find('GET', '/download').status, 200)
+  assert.equal(find('GET', '/ws').status, 101)
   assert.equal(log.find((e: any) => new URL(e.url).hostname === 'other.localhost').blocked, 'host not on the list')
 
   const closed = await api('DELETE', `/sessions/${id}`)
