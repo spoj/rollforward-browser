@@ -176,6 +176,7 @@ function refill() {
 async function lease() {
   let vm = ready.shift()
   if (!vm) {
+    if (!fs.existsSync(golden.state)) throw Object.assign(new Error('no golden windows machine: run windows/build.ts'), { status: 503 })
     if (running >= max) throw Object.assign(new Error('no windows machine free'), { status: 503 })
     running++
     vm = await restore(`${vmsDir}/${crypto.randomUUID()}`).catch(e => { running--; throw e })
