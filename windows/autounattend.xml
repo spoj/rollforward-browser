@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Windows 11 evaluation, unattended, on SeaBIOS (MBR) with no TPM: setup's hardware checks are bypassed.
      One local administrator, signed in automatically; UAC off so the helper and its scripts run elevated.
-     setup.ps1 on the provisioning disc does the rest in the specialize pass (FirstLogonCommands don't run with OOBE skipped). -->
+     The specialize pass stages the provisioning disc on C: and its SetupComplete.cmd, which runs setup.cmd after setup. -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
     <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -87,7 +87,7 @@
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
           <Order>2</Order>
-          <Path>cmd /c for %d in (D E F G H) do if exist %d:\setup.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %d:\setup.ps1</Path>
+          <Path>cmd /c for %d in (D E F G H) do if exist %d:\setup.cmd (xcopy /e /i /y %d:\ C:\machines\setup\ &amp; mkdir C:\Windows\Setup\Scripts &amp; copy /y %d:\SetupComplete.cmd C:\Windows\Setup\Scripts\)</Path>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>

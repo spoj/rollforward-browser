@@ -1,4 +1,4 @@
-// Builds the golden Windows machine: an unattended install from the evaluation ISO (setup.ps1 installs the
+// Builds the golden Windows machine: an unattended install from the evaluation ISO (setup.cmd installs the
 // channel driver, Python and the helper), shut down once the helper answers, then a boot without the install
 // discs to the signed-in desktop, saved with its memory.
 // Usage: node windows/build.ts [path/to/windows.iso]   (needs virtio-win.iso in the windows data dir)
@@ -13,7 +13,7 @@ const settleS = Number(process.env.MACHINES_SETTLE_S ?? 180)
 
 fs.rmSync(prov, { recursive: true, force: true })
 fs.mkdirSync(`${prov}/wheels`, { recursive: true })
-for (const f of ['autounattend.xml', 'setup.ps1', 'helper.py', 'requirements.txt']) fs.copyFileSync(`${here}/${f}`, `${prov}/${f}`)
+for (const f of ['autounattend.xml', 'SetupComplete.cmd', 'setup.cmd', 'helper.py', 'requirements.txt']) fs.copyFileSync(`${here}/${f}`, `${prov}/${f}`)
 if (!fs.existsSync(`${windowsDir}/${python}`)) await run('curl', ['-fsSL', '-o', `${windowsDir}/${python}`, `https://www.python.org/ftp/python/3.14.10/${python}`])
 fs.copyFileSync(`${windowsDir}/${python}`, `${prov}/${python}`)
 await run('pip', ['download', '--quiet', '--only-binary=:all:', '--platform', 'win_amd64', '--python-version', '3.14', '--implementation', 'cp', '-d', `${prov}/wheels`, '-r', `${here}/requirements.txt`])
@@ -35,7 +35,7 @@ await install.connect()
 let timer = watch(install)
 await install.ready(90 * 60_000)
 console.log('helper up; shutting down to drop the install discs')
-await install.request({ op: 'run', lang: 'powershell', script: 'shutdown /s /t 5', timeout_s: 60 })
+await install.request({ op: 'run', lang: 'python', script: 'import subprocess\nsubprocess.run(["shutdown", "/s", "/t", "5"])', timeout_s: 60 })
 await install.exited
 clearInterval(timer)
 
