@@ -1,0 +1,128 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>Live view</title>
+<style>
+  body { margin: 0; font: 14px system-ui, sans-serif; background: #222; color: #eee; display: flex; flex-direction: column; height: 100vh }
+  #bar { display: flex; gap: 6px; padding: 6px; align-items: center }
+  #url { flex: 1; min-width: 0 }
+  #tabs button.on { font-weight: bold }
+  #screen { flex: 1; min-height: 0; display: flex; justify-content: center; align-items: flex-start }
+  #img { max-width: 100%; max-height: 100%; outline: none }
+  body.drive #img { box-shadow: 0 0 0 3px #e83 }
+</style>
+<div id="bar">
+  <span id="tabs"></span>
+  <input id="url" disabled>
+  <button id="drive">Take control</button>
+</div>
+<div id="screen"><img id="img" tabindex="0" alt=""></div>
+<script type="module">
+const $ = id => document.getElementById(id)
+const img = $('img'), url = $('url'), tabs = $('tabs'), driveButton = $('drive')
+let ws, nextId, pending, targets, current, session, meta, driving = false
+
+const send = (method, params = {}, sessionId) => new Promise(resolve => {
+  const id = nextId++
+  pending.set(id, resolve)
+  ws.send(JSON.stringify({ id, method, params, sessionId }))
+})
+
+function connect() {
+  nextId = 1, pending = new Map(), targets = new Map(), current = session = null
+  ws = new WebSocket(new URL(driving ? 'view/drive' : 'view/watch', location.href).href.replace(/^http/, 'ws'))
+  ws.onopen = () => send('Target.setDiscoverTargets', { discover: true })
+  ws.onclose = () => document.title = 'Live view (disconnected)'
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data)
+    if (m.id) return pending.get(m.id)?.(m.result), pending.delete(m.id)
+    if (m.method === 'Target.targetCreated' || m.method === 'Target.targetInfoChanged') {
+      const t = m.params.targetInfo
+      if (t.type !== 'page') return
+      targets.set(t.targetId, t)
+      if (!current) show(t.targetId)
+      render()
+    }
+    if (m.method === 'Target.targetDestroyed' && targets.delete(m.params.targetId)) {
+      if (current === m.params.targetId) current = null, targets.size && show(targets.keys().next().value)
+      render()
+    }
+    if (m.method === 'Page.screencastFrame' && m.sessionId === session) {
+      img.src = 'data:image/jpeg;base64,' + m.params.data
+      meta = m.params.metadata
+      send('Page.screencastFrameAck', { sessionId: m.params.sessionId }, session)
+    }
+  }
+  document.body.classList.toggle('drive', driving)
+  document.title = driving ? 'Live view (you have control)' : 'Live view (watching)'
+  driveButton.textContent = driving ? 'Give back control' : 'Take control'
+  url.disabled = !driving
+}
+
+async function show(targetId) {
+  if (session) send('Target.detachFromTarget', { sessionId: session })
+  current = targetId
+  session = (await send('Target.attachToTarget', { targetId, flatten: true })).sessionId
+  await send('Page.startScreencast', { format: 'jpeg', quality: 70 }, session)
+  render()
+}
+
+function render() {
+  tabs.replaceChildren(...[...targets.values()].map(t => {
+    const b = document.createElement('button')
+    b.textContent = (t.title || t.url).slice(0, 24)
+    b.title = t.url
+    b.className = t.targetId === current ? 'on' : ''
+    b.onclick = () => show(t.targetId)
+    return b
+  }))
+  if (document.activeElement !== url) url.value = targets.get(current)?.url ?? ''
+}
+
+const mods = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0)
+const point = e => {
+  const r = img.getBoundingClientRect()
+  return { x: (e.clientX - r.left) * meta.deviceWidth / r.width, y: (e.clientY - r.top) * meta.deviceHeight / r.height }
+}
+const mouse = (type, e) => driving && meta && send('Input.dispatchMouseEvent', {
+  type, ...point(e), modifiers: mods(e), buttons: e.buttons, clickCount: type === 'mouseMoved' ? 0 : e.detail || 1,
+  button: type === 'mouseMoved' ? (e.buttons & 1 ? 'left' : 'none') : ['left', 'middle', 'right'][e.button],
+}, session)
+img.onmousedown = e => { img.focus(); mouse('mousePressed', e); e.preventDefault() }
+img.onmouseup = e => mouse('mouseReleased', e)
+img.onmousemove = e => mouse('mouseMoved', e)
+img.oncontextmenu = e => e.preventDefault()
+img.onwheel = e => {
+  if (!driving || !meta) return
+  e.preventDefault()
+  send('Input.dispatchMouseEvent', { type: 'mouseWheel', ...point(e), deltaX: e.deltaX, deltaY: e.deltaY, modifiers: mods(e) }, session)
+}
+img.onkeydown = e => {
+  if (!driving || ((e.ctrlKey || e.metaKey) && e.key === 'v')) return
+  e.preventDefault()
+  const text = e.key === 'Enter' ? '\r' : e.key.length === 1 && !e.ctrlKey && !e.metaKey ? e.key : undefined
+  send('Input.dispatchKeyEvent', { type: text ? 'keyDown' : 'rawKeyDown', key: e.key, code: e.code, text, unmodifiedText: text, windowsVirtualKeyCode: e.keyCode, modifiers: mods(e) }, session)
+}
+img.onkeyup = e => {
+  if (!driving) return
+  e.preventDefault()
+  send('Input.dispatchKeyEvent', { type: 'keyUp', key: e.key, code: e.code, windowsVirtualKeyCode: e.keyCode, modifiers: mods(e) }, session)
+}
+document.onpaste = e => {
+  if (!driving || document.activeElement !== img) return
+  e.preventDefault()
+  send('Input.insertText', { text: e.clipboardData.getData('text') }, session)
+}
+url.onkeydown = e => {
+  if (e.key !== 'Enter') return
+  send('Page.navigate', { url: /^\w+:/.test(url.value) ? url.value : 'https://' + url.value }, session)
+  img.focus()
+}
+driveButton.onclick = () => {
+  driving = !driving
+  ws.onclose = null
+  ws.close()
+  connect()
+}
+connect()
+</script>
