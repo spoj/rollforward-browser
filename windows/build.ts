@@ -1,5 +1,6 @@
 // Builds the golden Windows machine: an unattended install from the evaluation ISO (setup.ps1 installs the
-// channel driver, Python and the helper, then shuts down), then a boot to the signed-in desktop, saved with memory.
+// channel driver, Python and the helper), shut down once the helper answers, then a boot without the install
+// discs to the signed-in desktop, saved with its memory.
 // Usage: node windows/build.ts [path/to/windows.iso]   (needs virtio-win.iso in the windows data dir)
 import fs from 'node:fs'
 import { Vm, golden, windowsDir, run } from '../src/windows.ts'
@@ -25,13 +26,16 @@ await run('qemu-img', ['create', '-q', '-f', 'qcow2', golden.disk, '64G'])
 
 const watch = (vm: Vm) => setInterval(() => vm.screenshot().then(png => fs.writeFileSync(`${windowsDir}/build.png`, png), () => {}), 30_000)
 
-console.log('installing (setup.ps1 shuts the machine down when done)')
+console.log('installing')
 const install = new Vm(`${windowsDir}/build`, golden.disk, [
   '-drive', `file=${iso},media=cdrom,if=none,id=cd0,readonly=on`, '-device', 'ide-cd,drive=cd0,bus=ide.1,bootindex=2',
   '-drive', `file=${windowsDir}/provision.iso,media=cdrom,if=none,id=cd1,readonly=on`, '-device', 'ide-cd,drive=cd1,bus=ide.2',
 ])
 await install.connect()
 let timer = watch(install)
+await install.ready(90 * 60_000)
+console.log('helper up; shutting down to drop the install discs')
+await install.request({ op: 'run', lang: 'powershell', script: 'shutdown /s /t 5', timeout_s: 60 })
 await install.exited
 clearInterval(timer)
 

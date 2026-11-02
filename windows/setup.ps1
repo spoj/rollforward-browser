@@ -1,4 +1,4 @@
-# Runs once, at the first sign-in during the image build, from the provisioning disc; then shuts the machine down.
+# Runs once, as SYSTEM in the specialize pass of the image build, from the provisioning disc.
 $ErrorActionPreference = 'Stop'
 Start-Transcript C:\machines-setup.log
 $here = Split-Path $PSCommandPath
@@ -17,7 +17,7 @@ if ($LASTEXITCODE) { throw "pip failed: $LASTEXITCODE" }
 
 New-Item -ItemType Directory -Force C:\machines, C:\work | Out-Null
 Copy-Item "$here\helper.py" C:\machines\
-Set-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run machines "`"$(Split-Path $python)\pythonw.exe`" C:\machines\helper.py"
+Set-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Run machines "`"$(Split-Path $python)\pythonw.exe`" C:\machines\helper.py"
 
 # A quiet desktop that never sleeps or locks. None of this is worth failing the build over.
 $ErrorActionPreference = 'Continue'
@@ -25,13 +25,9 @@ powercfg /hibernate off
 powercfg /change monitor-timeout-ac 0
 powercfg /change standby-timeout-ac 0
 powercfg /change disk-timeout-ac 0
-reg add 'HKCU\Control Panel\Desktop' /v ScreenSaveActive /t REG_SZ /d 0 /f
+reg add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop' /v ScreenSaveActive /t REG_SZ /d 0 /f
 reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization /v NoLockScreen /t REG_DWORD /d 1 /f
 reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f
 reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive /v DisableFileSyncNGSC /t REG_DWORD /d 1 /f
-Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run OneDriveSetup -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath C:\
-& $python -c "import win32api as a; d = a.EnumDisplaySettings(None, -1); d.PelsWidth, d.PelsHeight = 1920, 1080; print(a.ChangeDisplaySettings(d, 1))"
-
 Stop-Transcript
-shutdown /s /t 5

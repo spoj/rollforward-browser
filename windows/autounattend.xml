@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Windows 11 evaluation, unattended, on SeaBIOS (MBR) with no TPM: setup's hardware checks are bypassed.
      One local administrator, signed in automatically; UAC off so the helper and its scripts run elevated.
-     setup.ps1 on the provisioning disc does the rest at first sign-in. -->
+     setup.ps1 on the provisioning disc does the rest in the specialize pass (FirstLogonCommands don't run with OOBE skipped). -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
     <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -85,6 +85,10 @@
           <Order>1</Order>
           <Path>reg.exe add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>
         </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c for %d in (D E F G H) do if exist %d:\setup.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %d:\setup.ps1</Path>
+        </RunSynchronousCommand>
       </RunSynchronous>
     </component>
     <component name="Microsoft-Windows-Security-SPP-UX" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -127,12 +131,11 @@
         <SkipUserOOBE>true</SkipUserOOBE>
         <SkipMachineOOBE>true</SkipMachineOOBE>
       </OOBE>
-      <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add">
-          <Order>1</Order>
-          <CommandLine>cmd /c for %d in (D E F G H) do if exist %d:\setup.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %d:\setup.ps1</CommandLine>
-        </SynchronousCommand>
-      </FirstLogonCommands>
+      <Display>
+        <ColorDepth>32</ColorDepth>
+        <HorizontalResolution>1920</HorizontalResolution>
+        <VerticalResolution>1080</VerticalResolution>
+      </Display>
     </component>
   </settings>
 </unattend>
