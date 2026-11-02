@@ -4,6 +4,7 @@ import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
+import net from 'node:net'
 import { chromium } from 'playwright-core'
 import { startPortal } from './portal.ts'
 
@@ -125,6 +126,21 @@ test('hosts matched by a wildcard may not reach internal addresses', async () =>
   assert.equal(res!.status(), 502)
   assert.match(await page.textContent('body') ?? '', /resolves only to internal addresses/)
   await agent.close()
+  await api('DELETE', `/sessions/${body.id}`)
+})
+
+test('malformed requests to the proxy get a 403 and are logged', async () => {
+  const { body } = await api('POST', '/sessions', { kind: 'browser', site })
+  const ask = async (raw: string) => {
+    const s = net.connect(`${os.tmpdir()}/machines-${port}/${body.id}/proxy.sock`)
+    s.end(raw)
+    return Buffer.concat(await s.toArray()).toString()
+  }
+  assert.match(await ask('GET /relative HTTP/1.1\r\nhost: portal.localhost\r\n\r\n'), /403[^]*malformed request/)
+  assert.match(await ask('CONNECT portal.localhost:443 HTTP/1.1\r\n\r\nGET http://other.localhost/ HTTP/1.1\r\nhost: x\r\n\r\n'), /200 Connection Established[^]*403[^]*malformed request/)
+  assert.match(await ask('CONNECT a:b:c HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\nhost: x\r\n\r\n'), /403[^]*malformed request/)
+  const { body: log } = await api('GET', `/sessions/${body.id}/log`)
+  assert.equal(log.filter((e: any) => e.blocked === 'malformed request').length, 3)
   await api('DELETE', `/sessions/${body.id}`)
 })
 
