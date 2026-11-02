@@ -6,7 +6,11 @@
   body { margin: 0; font: 14px system-ui, sans-serif; background: #222; color: #eee; display: flex; flex-direction: column; height: 100vh }
   #bar { display: flex; gap: 6px; padding: 6px; align-items: center }
   #url { flex: 1; min-width: 0 }
-  #tabs button.on { font-weight: bold }
+  button, input { font: inherit; color: inherit; background: #333; border: 1px solid #555; border-radius: 4px; padding: 3px 8px }
+  input:disabled { color: #999 }
+  #tabs button.on { background: #555 }
+  #drive { background: #e83; border-color: #e83; color: #111 }
+  body.drive #drive { background: #333; border-color: #555; color: inherit }
   #screen { flex: 1; min-height: 0; display: flex; justify-content: center; align-items: flex-start }
   #img { max-width: 100%; max-height: 100%; outline: none }
   body.drive #img { box-shadow: 0 0 0 3px #e83 }
