@@ -1,5 +1,5 @@
 {
-  "name": "machines",
+  "name": "rollforward-browser",
   "private": true,
   "type": "module",
   "scripts": {

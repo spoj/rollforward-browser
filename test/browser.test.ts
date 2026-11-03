@@ -15,7 +15,7 @@ const api = async (method: string, path: string, body?: unknown) => {
   const res = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: typeof body === 'string' || body === undefined ? body : JSON.stringify(body) })
   return { status: res.status, body: res.headers.get('content-type') === 'application/json' ? await res.json() : Buffer.from(await res.arrayBuffer()) }
 }
-const tmp = fs.mkdtempSync(`${os.tmpdir()}/machines-test-`)
+const tmp = fs.mkdtempSync(`${os.tmpdir()}/rollforward-browser-test-`)
 const openssl = (...args: string[]) => execFileSync('openssl', args, { cwd: tmp, stdio: 'ignore' })
 let portal: ReturnType<typeof startPortal>
 let service: ChildProcess
@@ -30,7 +30,7 @@ before(async () => {
   await once(portal.server, 'listening')
   const origin = `https://portal.localhost:${portal.port()}`
   site = { hosts: ['portal.localhost'], start_url: `${origin}/` }
-  service = spawn('node', ['src/server.ts'], { env: { ...process.env, MACHINES_PORT: String(port), MACHINES_KEY: key, MACHINES_WINDOWS_POOL: '0', NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem` }, stdio: ['ignore', 'pipe', 'inherit'] })
+  service = spawn('node', ['src/server.ts'], { env: { ...process.env, BROWSER_PORT: String(port), BROWSER_KEY: key, NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem` }, stdio: ['ignore', 'pipe', 'inherit'] })
   await Promise.race([once(service.stdout!, 'data'), once(service, 'exit').then(() => { throw new Error('service exited') })])
 })
 
@@ -40,12 +40,12 @@ after(() => {
   fs.rmSync(tmp, { recursive: true })
 })
 
-const leftovers = () => execFileSync('podman', ['ps', '-a', '-q', '--filter', `label=machines=${port}`]).toString().trim() + fs.readdirSync(`${os.tmpdir()}/machines-${port}`).join(' ')
+const leftovers = () => execFileSync('podman', ['ps', '-a', '-q', '--filter', `label=rollforward-browser=${port}`]).toString().trim() + fs.readdirSync(`${os.tmpdir()}/rollforward-browser-${port}`).join(' ')
 
 let signedIn: any
 
 test('a person signs in through the live view; closing returns the login', async () => {
-  const opened = await api('POST', '/sessions', { kind: 'browser', site })
+  const opened = await api('POST', '/sessions', { site })
   assert.equal(opened.status, 201)
   const { id, view } = opened.body
   assert.match((await api('GET', view)).body.toString(), /Live view/)
@@ -68,7 +68,7 @@ test('a person signs in through the live view; closing returns the login', async
 })
 
 test("an agent works with the saved login on the site's hosts, and every request is logged", async () => {
-  const opened = await api('POST', '/sessions', { kind: 'browser', site, state: signedIn })
+  const opened = await api('POST', '/sessions', { site, state: signedIn })
   assert.equal(opened.status, 201)
   const { id, cdp } = opened.body
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${cdp}`, { headers })
@@ -118,7 +118,7 @@ test("an agent works with the saved login on the site's hosts, and every request
 })
 
 test('hosts matched by a wildcard may not reach internal addresses', async () => {
-  const { body } = await api('POST', '/sessions', { kind: 'browser', site: { ...site, hosts: ['portal.localhost', '*.portal.localhost'] } })
+  const { body } = await api('POST', '/sessions', { site: { ...site, hosts: ['portal.localhost', '*.portal.localhost'] } })
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
   const page = agent.contexts()[0].pages()[0]
   const res = await page.goto(`https://sub.portal.localhost:${portal.port()}/`)
@@ -129,9 +129,9 @@ test('hosts matched by a wildcard may not reach internal addresses', async () =>
 })
 
 test('malformed requests to the proxy get a 403 and are logged', async () => {
-  const { body } = await api('POST', '/sessions', { kind: 'browser', site })
+  const { body } = await api('POST', '/sessions', { site })
   const ask = async (raw: string) => {
-    const s = net.connect(`${os.tmpdir()}/machines-${port}/${body.id}/proxy.sock`)
+    const s = net.connect(`${os.tmpdir()}/rollforward-browser-${port}/${body.id}/proxy.sock`)
     s.end(raw)
     return Buffer.concat(await s.toArray()).toString()
   }
@@ -144,7 +144,7 @@ test('malformed requests to the proxy get a 403 and are logged', async () => {
 })
 
 test('the live view shows the browser and, once the person takes control, passes their input', async t => {
-  const { body } = await api('POST', '/sessions', { kind: 'browser', site })
+  const { body } = await api('POST', '/sessions', { site })
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
   const page = agent.contexts()[0].pages()[0]
   await page.waitForURL(/\/login$/)
@@ -186,7 +186,7 @@ test('the live view shows the browser and, once the person takes control, passes
 })
 
 test('a session past its ttl is closed and keeps its result until collected', async () => {
-  const { body } = await api('POST', '/sessions', { kind: 'browser', site, state: signedIn, ttl_s: 1 })
+  const { body } = await api('POST', '/sessions', { site, state: signedIn, ttl_s: 1 })
   await new Promise(r => setTimeout(r, 2500))
   assert.equal((await api('GET', `/sessions/${body.id}/screenshot`)).status, 410)
   assert.equal((await api('GET', `/sessions/${body.id}/log`)).status, 200)

@@ -6,7 +6,7 @@ import type { Server } from 'node:net'
 import { chromium, type Browser } from 'playwright-core'
 import { startProxy, type Entry, type Site } from './proxy.ts'
 
-const pem = execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=machines', '-days', '3650', '-keyout', '-', '-out', '-'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString()
+const pem = execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=rollforward-browser', '-days', '3650', '-keyout', '-', '-out', '-'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString()
 const tlsKey = { key: pem.slice(0, pem.indexOf('-----BEGIN CERTIFICATE')), cert: pem.slice(pem.indexOf('-----BEGIN CERTIFICATE')) }
 const spki = crypto.createHash('sha256').update(new crypto.X509Certificate(tlsKey.cert).publicKey.export({ type: 'spki', format: 'der' })).digest('base64')
 
@@ -20,7 +20,6 @@ const cdpVersion = (sock: string) => new Promise<string>((resolve, reject) =>
   }).on('error', reject))
 
 export class BrowserSession {
-  kind = 'browser' as const
   log: Entry[] = []
   drivers = 0
   wsPath = ''
@@ -39,13 +38,13 @@ export class BrowserSession {
     this.label = label
     this.site = site
     this.cdpSocket = `${dir}/cdp.sock`
-    this.container = `machines-${id}`
+    this.container = `rollforward-browser-${id}`
   }
 
   async start(state: unknown, cdpUrl: string, headers: Record<string, string>) {
     fs.mkdirSync(this.dir, { mode: 0o700 })
     this.proxy = startProxy(`${this.dir}/proxy.sock`, this.site, tlsKey, () => this.drivers > 0, this.log)
-    await podman(['run', '-d', '--rm', '--name', this.container, '--label', this.label, ...containerFlags, '-v', `${this.dir}:/run/machines`, 'machines-browser', spki])
+    await podman(['run', '-d', '--rm', '--name', this.container, '--label', this.label, ...containerFlags, '-v', `${this.dir}:/run/rollforward-browser`, 'rollforward-browser', spki])
     for (let i = 0; !this.wsPath; i++) {
       this.wsPath = await cdpVersion(this.cdpSocket).catch(e => { if (i === 100) throw e; return '' })
       if (!this.wsPath) await new Promise(r => setTimeout(r, 100))

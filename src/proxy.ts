@@ -73,7 +73,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     const blocked = check(req, url)
     if (blocked) {
       record(req, url, 403, { blocked })
-      res.writeHead(403, { 'content-type': 'text/plain' }).end(`machines: ${blocked}: ${req.method} ${url?.href ?? req.url}\n`)
+      res.writeHead(403, { 'content-type': 'text/plain' }).end(`rollforward-browser: ${blocked}: ${req.method} ${url?.href ?? req.url}\n`)
       return
     }
     const up = (url!.protocol === 'https:' ? https : http).request(url, upstreamOptions(req, url), r => {
@@ -85,7 +85,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     })
     up.on('error', e => {
       record(req, url, 502, { error: e.message })
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' }).end(`machines: ${e.message}\n`)
+      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' }).end(`rollforward-browser: ${e.message}\n`)
       else res.destroy()
     })
     req.pipe(up)
