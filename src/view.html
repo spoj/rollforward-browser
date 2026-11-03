@@ -12,7 +12,8 @@
   #drive { background: #e83; border-color: #e83; color: #111 }
   body.drive #drive { background: #333; border-color: #555; color: inherit }
   #screen { flex: 1; min-height: 0; display: flex; justify-content: center; align-items: flex-start }
-  #img { max-width: 100%; max-height: 100%; outline: none }
+  #img { max-width: 100%; max-height: 100% }
+  #kb { position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; font-size: 16px }
   body.drive #img { box-shadow: 0 0 0 3px #e83 }
 </style>
 <div id="bar">
@@ -20,11 +21,12 @@
   <input id="url" disabled>
   <button id="drive">Take control</button>
 </div>
-<div id="screen"><img id="img" tabindex="0" alt=""></div>
+<div id="screen"><img id="img" alt=""></div>
+<input id="kb" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
 <script type="module">
 const $ = id => document.getElementById(id)
-const img = $('img'), url = $('url'), tabs = $('tabs'), driveButton = $('drive')
-let ws, nextId, pending, targets, current, session, meta, driving = false
+const img = $('img'), url = $('url'), tabs = $('tabs'), driveButton = $('drive'), kb = $('kb')
+let ws, nextId, pending, targets, current, session, meta, driving = false, typed = ''
 
 const send = (method, params = {}, sessionId) => new Promise(resolve => {
   const id = nextId++
@@ -93,7 +95,8 @@ const mouse = (type, e) => driving && session && meta && send('Input.dispatchMou
   type, ...point(e), modifiers: mods(e), buttons: e.buttons, clickCount: type === 'mouseMoved' ? 0 : e.detail || 1,
   button: type === 'mouseMoved' ? (e.buttons & 1 ? 'left' : 'none') : ['left', 'middle', 'right'][e.button],
 }, session)
-img.onmousedown = e => { img.focus(); mouse('mousePressed', e); e.preventDefault() }
+// Keys go through a hidden input: a phone shows its keyboard only for one, and that keyboard's text arrives as input events, not keys.
+img.onmousedown = e => { if (driving) kb.value = typed = '', kb.focus(); mouse('mousePressed', e); e.preventDefault() }
 img.onmouseup = e => mouse('mouseReleased', e)
 img.onmousemove = e => mouse('mouseMoved', e)
 img.oncontextmenu = e => e.preventDefault()
@@ -102,29 +105,34 @@ img.onwheel = e => {
   e.preventDefault()
   send('Input.dispatchMouseEvent', { type: 'mouseWheel', ...point(e), deltaX: e.deltaX, deltaY: e.deltaY, modifiers: mods(e) }, session)
 }
-img.onkeydown = e => {
-  if (!driving || !session || ((e.ctrlKey || e.metaKey) && e.key === 'v')) return
+kb.onkeydown = e => {
+  if (!driving || !session || e.keyCode === 229 || ((e.ctrlKey || e.metaKey) && e.key === 'v')) return
   e.preventDefault()
   const text = e.key === 'Enter' ? '\r' : e.key.length === 1 && !e.ctrlKey && !e.metaKey ? e.key : undefined
   send('Input.dispatchKeyEvent', { type: text ? 'keyDown' : 'rawKeyDown', key: e.key, code: e.code, text, unmodifiedText: text, windowsVirtualKeyCode: e.keyCode, modifiers: mods(e) }, session)
 }
-img.onkeyup = e => {
-  if (!driving || !session) return
+kb.onkeyup = e => {
+  if (!driving || !session || e.keyCode === 229) return
   e.preventDefault()
   send('Input.dispatchKeyEvent', { type: 'keyUp', key: e.key, code: e.code, windowsVirtualKeyCode: e.keyCode, modifiers: mods(e) }, session)
 }
-document.onpaste = e => {
-  if (!driving || !session || document.activeElement !== img) return
-  e.preventDefault()
-  send('Input.insertText', { text: e.clipboardData.getData('text') }, session)
+kb.oninput = () => {
+  if (!driving || !session) return
+  let same = 0
+  while (same < typed.length && typed[same] === kb.value[same]) same++
+  for (let i = same; i < typed.length; i++)
+    for (const type of ['rawKeyDown', 'keyUp']) send('Input.dispatchKeyEvent', { type, key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 }, session)
+  if (kb.value.length > same) send('Input.insertText', { text: kb.value.slice(same) }, session)
+  typed = kb.value
 }
 url.onkeydown = e => {
   if (e.key !== 'Enter') return
   send('Page.navigate', { url: /^\w+:/.test(url.value) ? url.value : 'https://' + url.value }, session)
-  img.focus()
+  kb.focus()
 }
 driveButton.onclick = () => {
   driving = !driving
+  kb.blur()
   ws.onclose = null
   ws.close()
   connect()

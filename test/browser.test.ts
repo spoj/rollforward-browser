@@ -164,11 +164,18 @@ test('the live view shows the browser and, once the person takes control, passes
   await click('#user')
   await view.keyboard.type('bob')
   assert.equal(await page.inputValue('#user'), '', 'watching passes no input')
+  assert.notEqual(await view.evaluate(() => document.activeElement!.id), 'kb', 'watching opens no keyboard')
 
   await view.click('#drive')
   await view.waitForFunction(() => document.title.includes('you have control'))
   await click('#user')
-  await view.keyboard.type('bob')
+  assert.equal(await view.evaluate(() => document.activeElement!.id), 'kb', 'a tap opens the keyboard')
+  await view.keyboard.insertText('bobb')
+  await view.evaluate(() => {
+    const kb = document.getElementById('kb') as HTMLInputElement
+    kb.value = kb.value.slice(0, -1)
+    kb.dispatchEvent(new Event('input'))
+  })
   await click('#password')
   await view.keyboard.type('secret')
   await view.keyboard.press('Enter')
