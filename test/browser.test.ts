@@ -143,7 +143,7 @@ test('malformed requests to the proxy get a 403 and are logged', async () => {
   await api('DELETE', `/sessions/${body.id}`)
 })
 
-test('the live view shows the browser and, once the person takes control, passes their input', async t => {
+test('the live view shows the browser and, once the person takes control or opens it with ?drive, passes their input', async t => {
   const { body } = await api('POST', '/sessions', { site })
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
   const page = agent.contexts()[0].pages()[0]
@@ -152,6 +152,10 @@ test('the live view shows the browser and, once the person takes control, passes
 
   const person = await chromium.launch()
   t.after(() => person.close())
+  const signIn = await (await person.newContext({ extraHTTPHeaders: headers })).newPage()
+  await signIn.goto(`http://127.0.0.1:${port}${body.view}?drive`)
+  await signIn.waitForFunction(() => document.title.includes('you have control'))
+  await signIn.close()
   const view = await (await person.newContext({ extraHTTPHeaders: headers })).newPage()
   await view.goto(`http://127.0.0.1:${port}${body.view}`)
   await view.waitForFunction(() => (document.getElementById('img') as HTMLImageElement).src.startsWith('data:image/jpeg'))

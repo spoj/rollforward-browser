@@ -26,7 +26,8 @@
 <script type="module">
 const $ = id => document.getElementById(id)
 const img = $('img'), url = $('url'), tabs = $('tabs'), driveButton = $('drive'), kb = $('kb')
-let ws, nextId, pending, targets, current, session, meta, driving = false, typed = ''
+// ?drive starts the person in control, as for signing in.
+let ws, nextId, pending, targets, current, session, meta, driving = new URLSearchParams(location.search).has('drive'), typed = ''
 
 const send = (method, params = {}, sessionId) => new Promise(resolve => {
   const id = nextId++
