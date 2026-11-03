@@ -1,0 +1,34 @@
+# The tests on every push and pull request, against the browser image built here. A tag's run, once they pass, pushes that image
+# to ghcr.io as the tag and makes the tag's GitHub Release, which the host's updater deploys (README); a tag whose message has a
+# line starting "Manual:" makes a prerelease, which it stops at.
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: podman build -t rollforward-browser browser
+      - run: npm ci
+      - run: npm test
+      - if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${{ github.repository }}:$GITHUB_REF_NAME"
+          echo "$GH_TOKEN" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          podman tag rollforward-browser "$image" && podman push "$image"
+          git fetch -q -f origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          notes=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "$notes" $(grep -q '^Manual:' <<< "$notes" && echo --prerelease)
