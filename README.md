@@ -30,7 +30,7 @@ Run it as a user of its own, next to rollforward's: CDP is close to code executi
 
 with `BROWSER_KEY=...` in `~/.config/rollforward-browser.env`, then `systemctl --user enable --now rollforward-browser`. `ExecStart` names Node 26 where it is, such as `/opt/node-v26/bin/node` beside an older system node.
 
-**Updates come by themselves.** `scripts/update.ts` moves the checkout to the newest GitHub Release once every check on its commit has passed. CI makes one from each tag whose tests pass, after pushing its image; a tag with a `Manual:` line in its message makes a prerelease, which the updater stops before, for a person to deploy by hand. If the release changed `browser/`, the updater pulls its image first, however long that takes, and switches code and image together; otherwise the running image stays, so a new Chromium comes only with a change to `browser/`. It restarts the service; if the service doesn't answer, code and image go back, and that release isn't tried again. It asks GitHub without a token, so every 15 minutes, as a timer of the same user:
+**Updates come by themselves.** `scripts/update.ts` moves the checkout to the newest GitHub Release once every check on its commit has passed. CI makes one from each tag whose tests pass, after pushing its image; a tag with a `Manual:` line in its message makes a prerelease, which the updater stops before, for a person to deploy by hand. If the release changed `browser/`, the updater pulls its image first, however long that takes, and switches code and image together; otherwise the running image stays, so a new Chromium comes only with a change to `browser/`. It drains the service first: on SIGUSR2 the service opens no session, and once every open one has been collected, its request log with it, or 30 minutes have passed, `GET /drained` answers 200. Then it moves code and image and restarts the service; if the service doesn't answer, code and image go back, and that release isn't tried again, and if going back fails too, the service restarts as the checkout is. It asks GitHub without a token, so every 15 minutes, as a timer of the same user:
 
     # ~/.config/systemd/user/rollforward-browser-update.service
     [Service]
@@ -49,7 +49,7 @@ with `BROWSER_KEY=...` in `~/.config/rollforward-browser.env`, then `systemctl -
     [Install]
     WantedBy=timers.target
 
-then `systemctl --user enable --now rollforward-browser-update.timer`; `journalctl --user -u rollforward-browser-update` shows what it did. A restart ends the browsers open at the time.
+then `systemctl --user enable --now rollforward-browser-update.timer`; `journalctl --user -u rollforward-browser-update` shows what it did. A restart without the drain ends the browsers open at the time, and their logs with them.
 
 On a host of its own, such as a VM next to rollforward's:
 
@@ -63,7 +63,7 @@ Tests: `npm test` (needs the image).
 
 ## API
 
-Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}` with a status: 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 500.
+Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}` with a status: 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 503 (a new session while the service drains for an update), 500.
 
 `POST /sessions` `{site: {hosts, start_url?}, state?, ttl_s?}` → 201 `{id, cdp, view}` (paths on this service). After `ttl_s` (default 3600) the session closes on its own; its result waits for `DELETE`.
 
@@ -85,6 +85,8 @@ Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}`
 `GET|PUT /sessions/:id/files/<path>` — read or write a file in the container by absolute path (`PUT` makes the directories), such as `/files/tmp/x`. Downloads land where the agent's Playwright tells Chromium: `await download.path()` gives that path in the container (`/tmp/playwright-artifacts-…/<guid>`), so fetch `GET /sessions/:id/files/tmp/playwright-artifacts-…/<guid>`; `download.saveAs()` can't work, as the file isn't where the agent's Playwright runs.
 
 `DELETE /sessions/:id` → `{state, log}`: the refreshed login (null if the browser was gone) and the whole request log; then the container is gone. A second `DELETE` is a 404.
+
+`GET /drained` → 200 once the service, sent SIGUSR2, has had every session collected or drained for 30 minutes; 503 before, with `{open}`, the sessions not yet collected.
 
 ## Notes for clients
 

@@ -2,7 +2,7 @@
 // at once. A release is taken once every check on its commit has passed, and never past a prerelease, which a tag with a Manual:
 // line makes for a release that needs a person first. A release that changed browser/ brings its image, pulled first however long
 // that takes; otherwise the running image stays. If the service doesn't answer after the move, code and image go back, and that
-// release isn't tried again.
+// release isn't tried again; if going back fails too, the service restarts as the checkout is, never left drained.
 //   node scripts/update.ts      (BROWSER_KEY, and BROWSER_PORT if not 8797, from the service's environment file)
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -12,7 +12,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
 const repo = 'spoj/rollforward-browser', image = 'ghcr.io/spoj/rollforward-browser'
-const health = `http://127.0.0.1:${process.env.BROWSER_PORT ?? 8797}/sessions`
+const health = `http://127.0.0.1:${process.env.BROWSER_PORT ?? 8797}/sessions`, auth = { authorization: `Bearer ${process.env.BROWSER_KEY}` }
 const app = join(dirname(fileURLToPath(import.meta.url)), '..'), state = join(homedir(), '.local', 'state', 'rollforward-browser-update.json')
 const sh = (cmd: string, ...args: string[]) => execFileSync(cmd, args, { cwd: app, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).trim()
 async function github(path: string) {
@@ -38,7 +38,15 @@ if (!checks.length || checks.some((c: any) => c.status !== 'completed' || !['suc
 }
 
 // The checkout at `to`, with what changed since `from` installed, `img` (if any) as the image the service runs, and the service restarted.
-function move(from: string, to: string, img?: string) {
+// The service drains first, on SIGUSR2, so the browsers open end on the release they opened on and their request logs reach
+// rollforward: it opens no session, and says on /drained when every session has been collected, or 30 minutes have passed. One that
+// restarted meanwhile, as v0.1.3 does when the signal kills it, or that doesn't answer within 35 minutes, is restarted all the same.
+async function move(from: string, to: string, img?: string) {
+  const pid = () => sh('systemctl', '--user', 'show', '--property=MainPID', '--value', 'rollforward-browser'), was = pid()
+  if (was !== '0') {
+    sh('systemctl', '--user', 'kill', '--kill-whom=main', '--signal=SIGUSR2', 'rollforward-browser')
+    for (let i = 0; i < 420 && pid() === was && !(await fetch(new URL('/drained', health), { headers: auth }).then(r => r.ok, () => false)); i++) await sleep(5000)
+  }
   sh('git', 'checkout', '-q', '--detach', to)
   if (sh('git', 'diff', '--name-only', from, to, '--', 'package-lock.json')) sh('npm', 'ci', '--omit=dev', '--no-audit', '--no-fund')
   if (img) sh('podman', 'tag', img, 'rollforward-browser')
@@ -47,7 +55,7 @@ function move(from: string, to: string, img?: string) {
 async function answers() {
   for (let i = 0; i < 30; i++) {
     await sleep(2000)
-    if (await fetch(health, { headers: { authorization: `Bearer ${process.env.BROWSER_KEY}` } }).then(r => r.ok, () => false)) return true
+    if (await fetch(health, { headers: auth }).then(r => r.ok, () => false)) return true
   }
   return false
 }
@@ -61,7 +69,7 @@ if (fresh) {
   sh('podman', 'tag', 'rollforward-browser', 'rollforward-browser:previous')
 }
 try {
-  move(current, target, fresh)
+  await move(current, target, fresh)
   if (await answers()) {
     console.log(`on ${target}`)
     process.exit(0)
@@ -70,8 +78,14 @@ try {
 } catch (e) {
   console.log(`${target} failed: ${(e as Error).message}`)
 }
-move(target, current, fresh && 'rollforward-browser:previous')
+// Recorded first, so a way back that fails too doesn't drain the service again at the next tick.
 mkdirSync(dirname(state), { recursive: true })
 writeFileSync(state, JSON.stringify({ bad: [...bad, target] }))
-console.log(`back on ${current}; ${target} won't be tried again`)
+try {
+  await move(target, current, fresh && 'rollforward-browser:previous')
+  console.log(`back on ${current}; ${target} won't be tried again`)
+} catch (e) {
+  console.log(`going back to ${current} failed: ${(e as Error).message}; the service restarts as the checkout is, and ${target} won't be tried again`)
+  sh('systemctl', '--user', 'restart', 'rollforward-browser')
+}
 process.exitCode = 1

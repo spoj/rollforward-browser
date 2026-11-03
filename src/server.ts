@@ -16,6 +16,11 @@ const viewPage = fs.readFileSync(new URL('view.html', import.meta.url))
 type Result = { state: unknown, log: unknown[] }
 type Session = BrowserSession & { expires?: number, timer?: NodeJS.Timeout, closing?: Promise<Result> }
 const sessions = new Map<string, Session>()
+// An update (scripts/update.ts) drains the service before it moves the checkout: no session opens, and once every session has been
+// collected with DELETE, its request log with it, or 30 minutes have passed, GET /drained answers 200, for the update to move it and
+// restart the service.
+let drainUntil = 0
+process.on('SIGUSR2', () => { drainUntil ||= Date.now() + 30 * 60_000 })
 
 const fail = (status: number, message: string) => Object.assign(new Error(message), { status })
 const json = (res: http.ServerResponse, status: number, body: unknown) =>
@@ -46,6 +51,8 @@ async function open(spec: any) {
 async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   if (req.headers.authorization !== `Bearer ${key}`) throw fail(401, 'bad key')
   const { pathname } = new URL(req.url!, 'http://x')
+  if (pathname === '/drained' && req.method === 'GET') return json(res, drainUntil && (!sessions.size || Date.now() > drainUntil) ? 200 : 503, { open: sessions.size })
+  if (pathname === '/sessions' && req.method === 'POST' && drainUntil) throw fail(503, 'updating: try again in a few minutes')
   if (pathname === '/sessions' && req.method === 'POST') return json(res, 201, await open(JSON.parse((await body(req)).toString())))
   if (pathname === '/sessions' && req.method === 'GET') return json(res, 200, [...sessions.values()].map(s => ({ id: s.id, expires: s.expires, closed: !!s.closing })))
   const [, id, rest] = pathname.match(/^\/sessions\/([^/]+)(.*)$/) ?? []

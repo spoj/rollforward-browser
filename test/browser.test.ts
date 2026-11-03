@@ -199,3 +199,17 @@ test('a session past its ttl is closed and keeps its result until collected', as
   assert.ok(closed.body.state.cookies.length)
   assert.equal((await api('DELETE', `/sessions/${body.id}`)).status, 404)
 })
+
+// Last: a drained service opens no more sessions.
+test('an update drains the service: no session opens, and /drained answers once every session has been collected', async () => {
+  const { body } = await api('POST', '/sessions', { site })
+  assert.equal((await api('GET', '/drained')).status, 503, 'no drain asked')
+  service.kill('SIGUSR2')
+  await new Promise(r => setTimeout(r, 200))
+  const refused = await api('POST', '/sessions', { site })
+  assert.deepEqual([refused.status, refused.body.error], [503, 'updating: try again in a few minutes'])
+  assert.equal((await api('GET', `/sessions/${body.id}/screenshot`)).status, 200, 'the open one carries on')
+  assert.equal((await api('GET', '/drained')).status, 503, 'one is still open')
+  assert.ok((await api('DELETE', `/sessions/${body.id}`)).body.log.length, 'its log is collected')
+  assert.equal((await api('GET', '/drained')).status, 200)
+})
