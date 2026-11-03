@@ -37,14 +37,17 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const suffixes = hosts.filter(h => h.startsWith('*.')).map(h => h.slice(1))
   const allowed = (host: string) => exact.has(host) || suffixes.some(s => host.endsWith(s))
   const secureContext = tls.createSecureContext(key)
-  const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) }
+  // One address per connection, IPv4 where the host has one, with no racing of the two: on a machine with no IPv6 route, Node's
+  // happy eyeballs falls back to IPv6 whenever IPv4 is slower than 500ms, as in a page's burst of requests, and fails.
+  const agents = { 'http:': new http.Agent({ keepAlive: true, autoSelectFamily: false }), 'https:': new https.Agent({ keepAlive: true, autoSelectFamily: false }) }
 
-  const lookup = (host: string, opts: dns.LookupOptions, cb: (...a: any[]) => void) =>
+  const lookup = (host: string, _opts: dns.LookupOptions, cb: (...a: any[]) => void) =>
     dns.lookup(host, { all: true }, (err, addrs) => {
       if (err) return cb(err)
       const ok = exact.has(host) ? addrs : addrs.filter(a => !internal.check(a.address, a.family === 6 ? 'ipv6' : 'ipv4'))
       if (!ok.length) return cb(new Error(`${host} resolves only to internal addresses`))
-      opts.all ? cb(null, ok) : cb(null, ok[0].address, ok[0].family)
+      const one = ok.find(a => a.family === 4) ?? ok[0]
+      cb(null, one.address, one.family)
     })
 
   // Inside a tunnel, origin-form only; outside, absolute http(s) URLs only. Anything else is malformed.
