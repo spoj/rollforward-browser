@@ -1,0 +1,16 @@
+# Each tag's browser image, for hosts that can't build it: podman pull ghcr.io/spoj/rollforward-browser:TAG
+name: image
+on:
+  push:
+    tags: ['v*']
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - run: podman build -t "ghcr.io/${{ github.repository }}:${{ github.ref_name }}" browser
+      - run: podman push "ghcr.io/${{ github.repository }}:${{ github.ref_name }}"

@@ -1,4 +1,5 @@
 FROM docker.io/library/debian:trixie-slim
+LABEL org.opencontainers.image.source=https://github.com/spoj/rollforward-browser
 RUN apt-get update \
  && apt-get install -y --no-install-recommends chromium socat fonts-liberation fonts-noto-core \
  && rm -rf /var/lib/apt/lists/*

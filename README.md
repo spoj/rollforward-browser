@@ -12,6 +12,8 @@ Needs Node 26 and rootless podman (tested with 6.1).
     npm install
     BROWSER_KEY=$(openssl rand -hex 32) node src/server.ts
 
+Where the image can't be built, as on a host that can't reach Debian's mirrors, pull the one each tag publishes and give it the name the service runs: `podman pull ghcr.io/spoj/rollforward-browser:TAG && podman tag ghcr.io/spoj/rollforward-browser:TAG rollforward-browser`.
+
 It listens on `BROWSER_HOST` (default 127.0.0.1), port `BROWSER_PORT` (default 8797). The key is the one secret its client holds: rollforward's `RF_BROWSER_KEY`, with `RF_BROWSER_URL` its address. `curl -H "authorization: Bearer $BROWSER_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files) are removed at start. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
 
 Run it as a user of its own, next to rollforward's: CDP is close to code execution in the container, whose user is the service's user (`--userns keep-id`). As a systemd user service of that user, with lingering on (`loginctl enable-linger USER`):
@@ -26,7 +28,7 @@ Run it as a user of its own, next to rollforward's: CDP is close to code executi
     [Install]
     WantedBy=default.target
 
-with `BROWSER_KEY=...` in `~/.config/rollforward-browser.env`, then `systemctl --user enable --now rollforward-browser`.
+with `BROWSER_KEY=...` in `~/.config/rollforward-browser.env`, then `systemctl --user enable --now rollforward-browser`. `ExecStart` names Node 26 where it is, such as `/opt/node-v26/bin/node` beside an older system node.
 
 On a host of its own, such as a VM next to rollforward's:
 
