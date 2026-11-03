@@ -20,7 +20,10 @@ jobs:
           node-version: 26
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: podman build -t rollforward-browser browser
-      - run: npm ci
+      # The live view's test drives it as a person would, from a browser of its own.
+      - run: |
+          npm ci
+          npx playwright-core install --with-deps chromium
       - run: npm test
       - if: startsWith(github.ref, 'refs/tags/v')
         env:

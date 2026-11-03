@@ -30,6 +30,27 @@ Run it as a user of its own, next to rollforward's: CDP is close to code executi
 
 with `BROWSER_KEY=...` in `~/.config/rollforward-browser.env`, then `systemctl --user enable --now rollforward-browser`. `ExecStart` names Node 26 where it is, such as `/opt/node-v26/bin/node` beside an older system node.
 
+**Updates come by themselves.** `scripts/update.ts` moves the checkout and the image to the newest GitHub Release once every check on its commit has passed. CI makes one from each tag whose tests pass, after pushing its image; a tag with a `Manual:` line in its message makes a prerelease, which the updater stops before, for a person to deploy by hand. It pulls the image first, however long that takes, then switches code and image together and restarts the service; if the service doesn't answer, both go back, and that release isn't tried again. It asks GitHub without a token, so every 15 minutes, as a timer of the same user:
+
+    # ~/.config/systemd/user/rollforward-browser-update.service
+    [Service]
+    Type=oneshot
+    WorkingDirectory=%h/rollforward-browser
+    EnvironmentFile=%h/.config/rollforward-browser.env
+    Environment=PATH=/opt/node-v26/bin:/usr/bin
+    ExecStart=/opt/node-v26/bin/node scripts/update.ts
+    TimeoutStartSec=3h
+
+    # ~/.config/systemd/user/rollforward-browser-update.timer
+    [Timer]
+    OnBootSec=5min
+    OnUnitActiveSec=15min
+
+    [Install]
+    WantedBy=timers.target
+
+then `systemctl --user enable --now rollforward-browser-update.timer`; `journalctl --user -u rollforward-browser-update` shows what it did. A restart ends the browsers open at the time.
+
 On a host of its own, such as a VM next to rollforward's:
 
 - **Listen on the private interface:** `BROWSER_HOST`, an IPv4 address of this host, such as `10.0.0.5`.
