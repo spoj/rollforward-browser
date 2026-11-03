@@ -2,7 +2,7 @@
 
 Browsers that an agent's code uses for a bounded task on one website, then throws away. One client: the [rollforward](https://github.com/spoj/rollforward) server, holding the service key.
 
-Each session is a podman container with Chromium, driven over CDP (Playwright `connectOverCDP`). The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts and logs each request.
+Each session is a podman container with Chromium, driven over CDP (Playwright `connectOverCDP`). The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts and logs each request. Chromium's own calls, such as its updaters', autofill's and its leak check of the passwords people sign in with, are switched off (`browser/`), so a log holds only what the session's pages asked for.
 
 ## Run
 
@@ -93,10 +93,6 @@ Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}`
 
 - Playwright's `page.request` / `context.request` run in the agent's own process, not in the browser: they would leave from the agent's sandbox, not through this proxy. To use the page's cookies, fetch inside the page: `page.evaluate(u => fetch(u).then(r => r.text()), url)`.
 - The proxy keeps to hosts, not to reads: whatever the session's login may do on its site, the browser may do. Every request is in `log`, with `live` when a person drove it.
-
-## Open items
-
-- **Chromium** still posts twice per session to `update.googleapis.com`; the proxy blocks both (log noise only).
 
 ## License
 

@@ -1,5 +1,8 @@
 #!/bin/sh
 export HOME=/tmp
+# Chromium asks update.googleapis.com for its on-device AI models' manifest even with component updates off, unless told of one
+# that names none.
+printf '{}' > /tmp/models.json
 socat TCP-LISTEN:3128,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/rollforward-browser/proxy.sock &
 socat UNIX-LISTEN:/run/rollforward-browser/cdp.sock,fork TCP:127.0.0.1:9222 &
 exec /usr/lib/chromium/chromium --headless --no-sandbox --disable-dev-shm-usage \
@@ -11,7 +14,7 @@ exec /usr/lib/chromium/chromium --headless --no-sandbox --disable-dev-shm-usage 
   --disable-field-trial-config --disable-background-networking --disable-component-update \
   --disable-component-extensions-with-background-pages --disable-client-side-phishing-detection \
   --disable-default-apps --disable-extensions --disable-sync --disable-breakpad --metrics-recording-only \
-  --disable-search-engine-choice-screen --disable-back-forward-cache \
+  --disable-search-engine-choice-screen --disable-back-forward-cache --optimization-guide-manifest-override=/tmp/models.json \
   --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding \
-  --disable-features=OptimizationHints,NetworkTimeServiceQuerying,AimEnabled,Translate,MediaRouter,DialMediaRouteProvider,HttpsUpgrades,LensOverlay \
+  --disable-features=OptimizationHints,NetworkTimeServiceQuerying,AimEnabled,Translate,MediaRouter,DialMediaRouteProvider,HttpsUpgrades,LensOverlay,AutofillServerCommunication \
   about:blank

@@ -64,6 +64,7 @@ test('a person signs in through the live view; closing returns the login', async
   assert.ok(signedIn.cookies.find((c: any) => c.name === 'sid'))
   assert.deepEqual(signedIn.origins[0].localStorage, [{ name: 'portal-pref', value: 'dense' }])
   assert.ok(closed.body.log.find((e: any) => e.method === 'POST' && e.url.endsWith('/login') && e.status === 303 && e.live))
+  assert.deepEqual(closed.body.log.filter((e: any) => new URL(e.url).hostname !== 'portal.localhost'), [], "nothing of Chromium's own, such as autofill's or its updater's, leaves the browser")
   assert.equal(leftovers(), '')
 })
 
@@ -108,6 +109,7 @@ test("an agent works with the saved login on the site's hosts, and every request
   assert.equal(find('GET', '/download').status, 200)
   assert.equal(find('GET', '/ws').status, 101)
   assert.equal(log.find((e: any) => new URL(e.url).hostname === 'other.localhost').blocked, 'host not on the list')
+  assert.deepEqual([...new Set(log.filter((e: any) => e.blocked).map((e: any) => new URL(e.url).hostname))], ['other.localhost'], "only the page's own: nothing of Chromium's leaves the browser")
 
   const closed = await api('DELETE', `/sessions/${id}`)
   const sid = (state: any) => state.cookies.find((c: any) => c.name === 'sid').value
