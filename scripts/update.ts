@@ -1,8 +1,8 @@
-// Moves this checkout, and the browser image, to the newest release CI made, then restarts the service: a systemd timer runs it
-// (README), and never twice at once. A release is taken once every check on its commit has passed, and never past a prerelease,
-// which a tag with a Manual: line makes for a release that needs a person first. Its image is pulled first, however long that
-// takes, and the switch comes after. If the service doesn't answer after the move, code and image go back, and that release isn't
-// tried again.
+// Moves this checkout to the newest release CI made, then restarts the service: a systemd timer runs it (README), and never twice
+// at once. A release is taken once every check on its commit has passed, and never past a prerelease, which a tag with a Manual:
+// line makes for a release that needs a person first. A release that changed browser/ brings its image, pulled first however long
+// that takes; otherwise the running image stays. If the service doesn't answer after the move, code and image go back, and that
+// release isn't tried again.
 //   node scripts/update.ts      (BROWSER_KEY, and BROWSER_PORT if not 8797, from the service's environment file)
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -37,11 +37,11 @@ if (!checks.length || checks.some((c: any) => c.status !== 'completed' || !['suc
   process.exit(0)
 }
 
-// The checkout at `to`, with what changed since `from` installed, `img` as the image the service runs, and the service restarted.
-function move(from: string, to: string, img: string) {
+// The checkout at `to`, with what changed since `from` installed, `img` (if any) as the image the service runs, and the service restarted.
+function move(from: string, to: string, img?: string) {
   sh('git', 'checkout', '-q', '--detach', to)
   if (sh('git', 'diff', '--name-only', from, to, '--', 'package-lock.json')) sh('npm', 'ci', '--omit=dev', '--no-audit', '--no-fund')
-  sh('podman', 'tag', img, 'rollforward-browser')
+  if (img) sh('podman', 'tag', img, 'rollforward-browser')
   sh('systemctl', '--user', 'restart', 'rollforward-browser')
 }
 async function answers() {
@@ -52,12 +52,16 @@ async function answers() {
   return false
 }
 
-console.log(`${current} -> ${target}: pulling ${image}:${target}`)
-sh('podman', 'pull', '-q', `${image}:${target}`)
-sh('podman', 'tag', 'rollforward-browser', 'rollforward-browser:previous')
+console.log(`${current} -> ${target}`)
 sh('git', 'fetch', '-q', '--tags', 'origin')
+const fresh = sh('git', 'diff', '--name-only', current, target, '--', 'browser') ? `${image}:${target}` : undefined
+if (fresh) {
+  console.log(`pulling ${fresh}`)
+  sh('podman', 'pull', '-q', fresh)
+  sh('podman', 'tag', 'rollforward-browser', 'rollforward-browser:previous')
+}
 try {
-  move(current, target, `${image}:${target}`)
+  move(current, target, fresh)
   if (await answers()) {
     console.log(`on ${target}`)
     process.exit(0)
@@ -66,7 +70,7 @@ try {
 } catch (e) {
   console.log(`${target} failed: ${(e as Error).message}`)
 }
-move(target, current, 'rollforward-browser:previous')
+move(target, current, fresh && 'rollforward-browser:previous')
 mkdirSync(dirname(state), { recursive: true })
 writeFileSync(state, JSON.stringify({ bad: [...bad, target] }))
 console.log(`back on ${current}; ${target} won't be tried again`)
