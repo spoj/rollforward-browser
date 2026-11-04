@@ -7,7 +7,7 @@ import os from 'node:os'
 import net from 'node:net'
 import { chromium } from 'playwright-core'
 import { startPortal } from './portal.ts'
-import { isInternal } from '../src/proxy.ts'
+import { isInternal, isNever } from '../src/proxy.ts'
 
 const port = 8798
 const key = 'test-key'
@@ -266,6 +266,10 @@ test("internal addresses are the private ranges, an IPv4-mapped answer by its IP
   for (const a of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '192.168.0.1', '169.254.1.1', '100.64.0.1']) assert.equal(isInternal(a, 4), true)
   assert.equal(isInternal('::ffff:127.0.0.1', 6), true)
   assert.equal(isInternal('::ffff:8.8.8.8', 6), false)
+  assert.equal(isInternal('168.63.129.16', 4), true, "Azure's WireServer")
+  for (const a of ['169.254.169.254', '168.63.129.16', '0.0.0.0']) assert.equal(isNever(a, 4), true, `${a}, not even for an exact host`)
+  for (const [a, f] of [['::ffff:169.254.169.254', 6], ['fe80::1', 6]] as const) assert.equal(isNever(a, f), true, a)
+  for (const a of ['10.1.2.3', '192.168.0.1', '127.0.0.1', '8.8.8.8']) assert.equal(isNever(a, 4), false, `${a}, an intranet's, this machine's or the internet's`)
   for (const a of ['::1', '::', 'fc00::1', 'fe80::1']) assert.equal(isInternal(a, 6), true)
   assert.equal(isInternal('2a04:4e42:68::347', 6), false)
 })
