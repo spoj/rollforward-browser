@@ -5,7 +5,8 @@ import net from 'node:net'
 import dns from 'node:dns'
 import { Duplex } from 'node:stream'
 
-// `public`, for a person's own site rather than one an admin set up: none of its hosts, exact ones included, reaches an internal address.
+// `public`, for a person's own site rather than one an admin set up: none of its hosts, exact ones included, reaches an internal
+// address, and it goes over https only.
 export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string>, public?: boolean }
 export type Entry = { t: string, method: string, url: string, status: number, blocked?: string, error?: string, live?: true }
 type Target = { scheme: string, authority: string }
@@ -73,6 +74,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
 
   const check = (req: http.IncomingMessage, url: URL | null) =>
     !url ? 'malformed request'
+      : site.public && url.protocol !== 'https:' ? 'https only'
       : !allowed(url.hostname) ? 'host not on the list'
       : undefined
 

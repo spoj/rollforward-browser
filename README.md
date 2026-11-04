@@ -74,7 +74,9 @@ Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}`
 - `start_url`: the first tab goes there before the call returns (until the response arrives, not the load).
 - `headers`: `{name: value}`, added by the proxy to every request to `start_url`'s origin and no other, such as a token a site's sign-in needs that its pages never send. The browser never holds them, so nothing on its CDP can read them, and the log doesn't record headers.
 
-`PUT /sessions/:id/hosts` `{hosts}` → 200 `{hosts}`: the session's hosts from then on, as a person allows another a page of it was refused.
+`PUT /sessions/:id/hosts` `{hosts}` → 200 `{hosts}`: the session's hosts from then on, as a person allows another a page of it was refused. `POST /sessions/:id/reload` loads the newest tab again.
+
+A `public` site's requests go over https only; any other gets a 403.
 
 `GET /sessions` → `[{id, expires, closed}]`.
 

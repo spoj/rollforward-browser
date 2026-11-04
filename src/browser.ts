@@ -78,6 +78,11 @@ export class BrowserSession {
     return { url: p.url(), password: await p.isVisible('input[type=password]') }
   }
 
+  // The newest tab loaded again, as a host its page needed is allowed.
+  async reload() {
+    await this.pw!.contexts()[0].pages().at(-1)!.reload({ waitUntil: 'commit' })
+  }
+
   readFile(path: string) {
     return podman(['exec', this.container, 'cat', '--', path])
   }

@@ -159,6 +159,9 @@ test("a person's own site reaches no internal address, not even by an exact host
   assert.equal((await page.goto(other))!.status(), 403)
   assert.deepEqual((await api('PUT', `/sessions/${body.id}/hosts`, { hosts: ['portal.localhost', 'other.localhost'] })).body, { hosts: ['portal.localhost', 'other.localhost'] })
   assert.equal((await page.goto(other))!.status(), 200)
+  const again = page.waitForEvent('load')
+  assert.equal((await api('POST', `/sessions/${body.id}/reload`)).status, 200)
+  await again
   assert.equal((await api('PUT', `/sessions/${body.id}/hosts`, { hosts: ['bad host'] })).status, 400)
   await agent.close()
   await api('DELETE', `/sessions/${body.id}`)

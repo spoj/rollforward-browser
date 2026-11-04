@@ -73,6 +73,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     s.site.hosts = hosts
     return json(res, 200, { hosts })
   }
+  if (rest === '/reload' && req.method === 'POST') return (await s.reload(), json(res, 200, {}))
   if (rest === '/screenshot' && req.method === 'GET') {
     const png = await s.screenshot()
     return res.writeHead(200, { 'content-type': 'image/png' }).end(png)
