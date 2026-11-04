@@ -161,6 +161,21 @@ test('malformed requests to the proxy get a 403 and are logged', async () => {
   await api('DELETE', `/sessions/${body.id}`)
 })
 
+test('a page says where the newest tab is and whether it shows a password field, as a sign-in does', async () => {
+  const { id, cdp } = (await api('POST', '/sessions', { site })).body
+  const page = await api('GET', `/sessions/${id}/page`)
+  const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${cdp}`, { headers }), tab = agent.contexts()[0].pages()[0]
+  await tab.fill('#user', 'ann')
+  await tab.fill('#password', 'secret')
+  await tab.click('button')
+  await tab.waitForSelector('text=Welcome ann')
+  await agent.close()
+  const after = await api('GET', `/sessions/${id}/page`)
+  await api('DELETE', `/sessions/${id}`)
+  assert.deepEqual(page.body, { url: `${site.start_url}login`, password: true }, 'signed out: the sign-in page')
+  assert.deepEqual(after.body, { url: site.start_url, password: false }, 'signed in: the page itself')
+})
+
 test('the live view shows the browser and, once the person takes control or opens it with ?drive, passes their input', async t => {
   const { body } = await api('POST', '/sessions', { site })
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })

@@ -71,6 +71,13 @@ export class BrowserSession {
     return await this.pw!.contexts()[0].pages().at(-1)!.screenshot()
   }
 
+  // The newest tab once loaded: its address, and whether it shows a password field, as a sign-in page does.
+  async page() {
+    const p = this.pw!.contexts()[0].pages().at(-1)!
+    await p.waitForLoadState('load')
+    return { url: p.url(), password: await p.isVisible('input[type=password]') }
+  }
+
   readFile(path: string) {
     return podman(['exec', this.container, 'cat', '--', path])
   }

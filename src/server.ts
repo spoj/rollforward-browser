@@ -66,6 +66,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   if (rest === '/log' && req.method === 'GET') return json(res, 200, s.log)
   if (s.closing) throw fail(410, 'session closed')
   if (rest === '/view' && req.method === 'GET') return res.writeHead(200, { 'content-type': 'text/html' }).end(viewPage)
+  if (rest === '/page' && req.method === 'GET') return json(res, 200, await s.page())
   if (rest === '/screenshot' && req.method === 'GET') {
     const png = await s.screenshot()
     return res.writeHead(200, { 'content-type': 'image/png' }).end(png)

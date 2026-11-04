@@ -84,6 +84,8 @@ Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}`
 
 `GET /sessions/:id/screenshot` → PNG of the newest tab.
 
+`GET /sessions/:id/page` → `{url, password}`: the newest tab once loaded, its address and whether it shows a password field, as a sign-in page does; for a client keeping a login alive, which loads a page in it and finds the session over if it shows a sign-in.
+
 `GET|PUT /sessions/:id/files/<path>` — read or write a file in the container by absolute path (`PUT` makes the directories), such as `/files/tmp/x`. Downloads land where the agent's Playwright tells Chromium: `await download.path()` gives that path in the container (`/tmp/playwright-artifacts-…/<guid>`), so fetch `GET /sessions/:id/files/tmp/playwright-artifacts-…/<guid>`; `download.saveAs()` can't work, as the file isn't where the agent's Playwright runs.
 
 `DELETE /sessions/:id` → `{state, log}`: the refreshed login (null if the browser was gone) and the whole request log; then the container is gone. A second `DELETE` is a 404.
