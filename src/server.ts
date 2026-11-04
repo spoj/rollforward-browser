@@ -67,6 +67,12 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   if (s.closing) throw fail(410, 'session closed')
   if (rest === '/view' && req.method === 'GET') return res.writeHead(200, { 'content-type': 'text/html' }).end(viewPage)
   if (rest === '/page' && req.method === 'GET') return json(res, 200, await s.page())
+  if (rest === '/hosts' && req.method === 'PUT') {
+    const { hosts } = JSON.parse((await body(req)).toString())
+    if (!Array.isArray(hosts) || !hosts.every(h => typeof h === 'string' && /^(\*\.)?[a-z0-9.-]+$/i.test(h))) throw fail(400, 'hosts: names such as sso.example.com, or *.example.com for any under it')
+    s.site.hosts = hosts
+    return json(res, 200, { hosts })
+  }
   if (rest === '/screenshot' && req.method === 'GET') {
     const png = await s.screenshot()
     return res.writeHead(200, { 'content-type': 'image/png' }).end(png)

@@ -65,14 +65,16 @@ Tests: `npm test` (needs the image).
 
 Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}` with a status: 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 503 (a new session while the service drains for an update), 500.
 
-`POST /sessions` `{site: {hosts, start_url?, headers?}, state?, ttl_s?}` → 201 `{id, cdp, view}` (paths on this service). After `ttl_s` (default 3600) the session closes on its own; its result waits for `DELETE`.
+`POST /sessions` `{site: {hosts, start_url?, headers?, public?}, state?, ttl_s?}` → 201 `{id, cdp, view}` (paths on this service). After `ttl_s` (default 3600) the session closes on its own; its result waits for `DELETE`.
 
 - `hosts`: names the browser may reach, exact (`erp.example`) or `*.example` for any name under it. Anything else gets a 403 page.
-- Internal addresses (private, loopback, link-local, CGNAT, unique-local) are reachable only through a name listed exactly: a name matched by a wildcard that resolves only to internal addresses gets a 502. IP literals must be listed exactly.
+- Internal addresses (private, loopback, CGNAT, unique-local) are reachable only through a name listed exactly, and through none for a `public` site, a person's own rather than an admin's: a name that may not reach them and resolves only to them gets a 502. No name reaches a link-local address or Azure's WireServer. IP literals must be listed exactly.
 - Each connection goes to one address, IPv4 where the host has one, with no racing of IPv4 against IPv6: a machine with no IPv6 route needs nothing set, where Node's own happy eyeballs would fail requests whenever IPv4 answered slowly.
 - `state`: a Playwright storageState (`{cookies, origins: [{origin, localStorage}]}`), loaded before the call returns. It lives only in the service's memory and the container's tmpfs.
 - `start_url`: the first tab goes there before the call returns (until the response arrives, not the load).
 - `headers`: `{name: value}`, added by the proxy to every request to `start_url`'s origin and no other, such as a token a site's sign-in needs that its pages never send. The browser never holds them, so nothing on its CDP can read them, and the log doesn't record headers.
+
+`PUT /sessions/:id/hosts` `{hosts}` → 200 `{hosts}`: the session's hosts from then on, as a person allows another a page of it was refused.
 
 `GET /sessions` → `[{id, expires, closed}]`.
 

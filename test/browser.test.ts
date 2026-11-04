@@ -146,6 +146,24 @@ test('hosts matched by a wildcard may not reach internal addresses', async () =>
   await api('DELETE', `/sessions/${body.id}`)
 })
 
+test("a person's own site reaches no internal address, not even by an exact host; and a session's hosts grow as hosts are allowed", async () => {
+  const own = await api('POST', '/sessions', { site: { ...site, start_url: undefined, public: true } })
+  let agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${own.body.cdp}`, { headers })
+  let res = await agent.contexts()[0].pages()[0].goto(`https://portal.localhost:${portal.port()}/`)
+  assert.equal(res!.status(), 502)
+  await agent.close()
+  await api('DELETE', `/sessions/${own.body.id}`)
+  const { body } = await api('POST', '/sessions', { site: { ...site, start_url: undefined } })
+  agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
+  const page = agent.contexts()[0].pages()[0], other = `https://other.localhost:${portal.port()}/`
+  assert.equal((await page.goto(other))!.status(), 403)
+  assert.deepEqual((await api('PUT', `/sessions/${body.id}/hosts`, { hosts: ['portal.localhost', 'other.localhost'] })).body, { hosts: ['portal.localhost', 'other.localhost'] })
+  assert.equal((await page.goto(other))!.status(), 200)
+  assert.equal((await api('PUT', `/sessions/${body.id}/hosts`, { hosts: ['bad host'] })).status, 400)
+  await agent.close()
+  await api('DELETE', `/sessions/${body.id}`)
+})
+
 test('malformed requests to the proxy get a 403 and are logged', async () => {
   const { body } = await api('POST', '/sessions', { site })
   const ask = async (raw: string) => {

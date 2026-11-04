@@ -5,7 +5,8 @@ import net from 'node:net'
 import dns from 'node:dns'
 import { Duplex } from 'node:stream'
 
-export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string> }
+// `public`, for a person's own site rather than one an admin set up: none of its hosts, exact ones included, reaches an internal address.
+export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string>, public?: boolean }
 export type Entry = { t: string, method: string, url: string, status: number, blocked?: string, error?: string, live?: true }
 type Target = { scheme: string, authority: string }
 
@@ -43,10 +44,9 @@ const plain = (socket: net.Socket) => {
 // CONNECT tunnels are opened locally (TLS ends here, with a key the browser is told to accept),
 // so every request is seen whole: checked against the site's hosts, then logged.
 export function startProxy(path: string, site: Site, key: { key: string, cert: string }, isLive: () => boolean, log: Entry[]) {
-  const hosts = site.hosts.map(h => h.toLowerCase())
-  const exact = new Set(hosts.filter(h => !h.startsWith('*.')))
-  const suffixes = hosts.filter(h => h.startsWith('*.')).map(h => h.slice(1))
-  const allowed = (host: string) => exact.has(host) || suffixes.some(s => host.endsWith(s))
+  // The site's hosts as they are now: a PUT adds those its person allows as the session goes (server.ts).
+  const exact = (host: string) => site.hosts.some(h => h.toLowerCase() === host)
+  const allowed = (host: string) => exact(host) || site.hosts.some(h => h.startsWith('*.') && host.endsWith(h.slice(1).toLowerCase()))
   // The site's headers, such as a token its sign-in needs that its pages never send, go only to start_url's origin, added here, so
   // the browser, and anyone on its CDP, never holds them.
   const origin = site.start_url && new URL(site.start_url).origin
@@ -58,8 +58,8 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const lookup = (host: string, _opts: dns.LookupOptions, cb: (...a: any[]) => void) =>
     dns.lookup(host, { all: true }, (err, addrs) => {
       if (err) return cb(err)
-      const ok = addrs.filter(a => !(exact.has(host) ? isNever : isInternal)(a.address, a.family))
-      if (!ok.length) return cb(new Error(`${host} resolves only to ${exact.has(host) ? 'link-local or WireServer' : 'internal'} addresses`))
+      const strict = site.public || !exact(host), ok = addrs.filter(a => !(strict ? isInternal : isNever)(a.address, a.family))
+      if (!ok.length) return cb(new Error(`${host} resolves only to ${strict ? 'internal' : 'link-local or WireServer'} addresses`))
       const one = ok.find(a => a.family === 4) ?? ok[0]
       cb(null, one.address, one.family)
     })
