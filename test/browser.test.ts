@@ -119,6 +119,21 @@ test("an agent works with the saved login on the site's hosts, and every request
   assert.equal(leftovers(), '')
 })
 
+test("a site's headers go with requests to start_url's origin alone, added by the proxy, never in the browser or the log", async () => {
+  const { body } = await api('POST', '/sessions', { site: { ...site, hosts: ['portal.localhost', 'other.localhost'], headers: { 'x-bot-token': 'jwt-1' } } })
+  const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
+  const page = agent.contexts()[0].pages()[0], seen: string[] = []
+  page.on('request', r => seen.push(JSON.stringify(r.headers())))
+  portal.tokens.length = 0
+  await page.goto(`${site.start_url}login`)
+  await page.goto(`https://other.localhost:${portal.port()}/`)
+  assert.deepEqual([...new Set(portal.tokens)], ['portal.localhost jwt-1', 'other.localhost -'])
+  assert.ok(seen.length && !seen.some(h => h.includes('jwt-1')), 'the browser never holds them')
+  await agent.close()
+  const { log } = (await api('DELETE', `/sessions/${body.id}`)).body
+  assert.ok(log.length && !JSON.stringify(log).includes('jwt-1'))
+})
+
 test('hosts matched by a wildcard may not reach internal addresses', async () => {
   const { body } = await api('POST', '/sessions', { site: { ...site, hosts: ['portal.localhost', '*.portal.localhost'] } })
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })

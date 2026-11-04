@@ -1,5 +1,6 @@
 // A fake vendor portal for tests: a sign-in form, a session cookie that expires and changes on every visit
 // to the home page, reads that are POSTs (like the ERP's web client), a write, a download, and a link to another host.
+// `tokens` has each request's host and the x-bot-token it carried, if any.
 import https from 'node:https'
 import crypto from 'node:crypto'
 import type { AddressInfo } from 'node:net'
@@ -7,11 +8,13 @@ import type { AddressInfo } from 'node:net'
 export function startPortal(tls: { key: string, cert: string }) {
   const sessions = new Map<string, { user: string, expires: number }>()
   const writes: string[] = []
+  const tokens: string[] = []
   const server = https.createServer(tls, async (req, res) => {
     const host = req.headers.host!.split(':')[0]
     const url = new URL(req.url!, `https://${req.headers.host}`)
     const body = Buffer.concat(await req.toArray()).toString()
     const sid = /(?:^|; )sid=(\w+)/.exec(req.headers.cookie ?? '')?.[1]
+    tokens.push(`${host} ${req.headers['x-bot-token'] ?? '-'}`)
     const session = sid && sessions.get(sid)
     const page = (html: string) => res.writeHead(200, { 'content-type': 'text/html' }).end(`<!doctype html><title>Portal</title>${html}`)
     const signedIn = (user: string) => {
@@ -53,5 +56,5 @@ export function startPortal(tls: { key: string, cert: string }) {
     socket.write(Buffer.from([0x81, 5, ...Buffer.from('hello')]))
   })
   server.listen(0, '::')
-  return { server, sessions, writes, port: () => (server.address() as AddressInfo).port }
+  return { server, sessions, writes, tokens, port: () => (server.address() as AddressInfo).port }
 }

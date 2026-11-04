@@ -5,7 +5,7 @@ import net from 'node:net'
 import dns from 'node:dns'
 import { Duplex } from 'node:stream'
 
-export type Site = { hosts: string[], start_url?: string }
+export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string> }
 export type Entry = { t: string, method: string, url: string, status: number, blocked?: string, error?: string, live?: true }
 type Target = { scheme: string, authority: string }
 
@@ -36,6 +36,9 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const exact = new Set(hosts.filter(h => !h.startsWith('*.')))
   const suffixes = hosts.filter(h => h.startsWith('*.')).map(h => h.slice(1))
   const allowed = (host: string) => exact.has(host) || suffixes.some(s => host.endsWith(s))
+  // The site's headers, such as a token its sign-in needs that its pages never send, go only to start_url's origin, added here, so
+  // the browser, and anyone on its CDP, never holds them.
+  const origin = site.start_url && new URL(site.start_url).origin
   const secureContext = tls.createSecureContext(key)
   // One address per connection, IPv4 where the host has one, with no racing of the two: on a machine with no IPv6 route, Node's
   // happy eyeballs falls back to IPv6 whenever IPv4 is slower than 500ms, as in a page's burst of requests, and fails.
@@ -66,7 +69,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     log.push({ t: new Date().toISOString(), method: req.method!, url: url?.href ?? req.url!, status, ...extra, ...(isLive() ? { live: true as const } : {}) })
 
   const upstreamOptions = (req: http.IncomingMessage, url: URL) => {
-    const headers = { ...req.headers, host: url.host }
+    const headers = { ...req.headers, ...(url.origin === origin && site.headers), host: url.host }
     for (const h of hopByHop) delete headers[h]
     return { method: req.method, headers, lookup, agent: agents[url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
   }
