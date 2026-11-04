@@ -26,7 +26,7 @@
 <script type="module">
 const $ = id => document.getElementById(id)
 const img = $('img'), url = $('url'), tabs = $('tabs'), driveButton = $('drive'), kb = $('kb')
-// ?drive starts the person in control, as for signing in.
+// ?drive starts the person in control, as for signing in; ?watch only watches, with no control to take.
 let ws, nextId, pending, targets, current, session, meta, driving = new URLSearchParams(location.search).has('drive'), typed = ''
 
 const send = (method, params = {}, sessionId) => new Promise(resolve => {
@@ -138,5 +138,6 @@ driveButton.onclick = () => {
   ws.close()
   connect()
 }
+driveButton.hidden = new URLSearchParams(location.search).has('watch')
 connect()
 </script>

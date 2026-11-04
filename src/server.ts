@@ -87,7 +87,42 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
 
 const server = http.createServer((req, res) => route(req, res).catch(e => json(res, e.status ?? 500, { error: e.message })))
 
-// CDP websockets go straight through to the session's browser; /view/drive marks a person at the controls.
+// What a watcher may ask of the browser: its tabs, and a screencast of one.
+const WATCH = new Set(['Target.setDiscoverTargets', 'Target.attachToTarget', 'Target.detachFromTarget', 'Page.startScreencast', 'Page.stopScreencast', 'Page.screencastFrameAck'])
+
+// A watcher's websocket frames, each read whole, never compressed: ping, pong and close go on as they came; a text frame, whole and
+// small, of a method it may ask goes on as its JSON parsed and written again, so the browser reads the method the filter did; anything
+// else, such as input, a script, or a frame unmasked, binary or in parts, ends the socket, so watching never drives.
+function watchOnly(socket: net.Socket, up: net.Socket, head: Buffer) {
+  let buf = Buffer.alloc(0)
+  const end = () => (socket.destroy(), up.destroy())
+  const take = (chunk: Buffer) => {
+    buf = Buffer.concat([buf, chunk])
+    for (;;) {
+      const n = buf[1] & 0x7f, at = n === 126 ? 4 : n === 127 ? 10 : 2
+      if (buf.length < at + 4) return
+      const len = n === 126 ? buf.readUInt16BE(2) : n === 127 ? Number(buf.readBigUInt64BE(2)) : n
+      if (!(buf[1] & 0x80) || len > 16_384) return end()
+      if (buf.length < at + 4 + len) return
+      const frame = buf.subarray(0, at + 4 + len), mask = frame.subarray(at, at + 4), data = Buffer.from(frame.subarray(at + 4).map((b, i) => b ^ mask[i % 4]))
+      buf = buf.subarray(frame.length)
+      if ((frame[0] & 0x0f) >= 8) {
+        up.write(frame)
+        continue
+      }
+      let m
+      try { m = JSON.parse(data.toString()) } catch {}
+      if (frame[0] !== 0x81 || !WATCH.has(m?.method)) return end()
+      const text = Buffer.from(JSON.stringify(m)), key = crypto.randomBytes(4)
+      up.write(Buffer.concat([Buffer.from(text.length < 126 ? [0x81, 0x80 | text.length] : [0x81, 0xfe, text.length >> 8, text.length & 255]), key, text.map((b, i) => b ^ key[i % 4])]))
+    }
+  }
+  take(head)
+  socket.on('data', take)
+}
+
+// CDP websockets go straight through to the session's browser; /view/drive marks a person at the controls, and /view/watch passes
+// only what watching asks.
 server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
   socket.on('error', () => socket.destroy())
   const [, id, rest] = new URL(req.url!, 'http://x').pathname.match(/^\/sessions\/([^/]+)(\/cdp|\/view\/watch|\/view\/drive)$/) ?? []
@@ -98,9 +133,14 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   const headers: Record<string, unknown> = { ...req.headers, host: 'localhost' }
   delete headers.authorization
   delete headers.origin
+  if (rest === '/view/watch') delete headers['sec-websocket-extensions']
   up.write(`GET ${s.wsPath} HTTP/1.1\r\n${Object.entries(headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`)
-  up.write(head)
-  socket.pipe(up).pipe(socket)
+  if (rest === '/view/watch') watchOnly(socket, up, head)
+  else {
+    up.write(head)
+    socket.pipe(up)
+  }
+  up.pipe(socket)
   if (rest === '/view/drive') {
     s.drivers++
     socket.on('close', () => s.drivers--)

@@ -222,6 +222,20 @@ test('the live view shows the browser and, once the person takes control or open
   assert.ok(closed.body.log.find((e: any) => e.method === 'POST' && e.url.endsWith('/login') && e.live))
 })
 
+test("a watcher asks only for the tabs and a screencast of one: anything else, such as a script or a CDP client's own setup, ends its socket", async () => {
+  const { body } = await api('POST', '/sessions', { site })
+  await assert.rejects(chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.view}/watch`, { headers, timeout: 5000 }))
+  const ws = new WebSocket(`ws://127.0.0.1:${port}${body.view}/watch`, { headers } as never), got: { id?: number }[] = []
+  ws.onmessage = e => got.push(JSON.parse(e.data))
+  await once(ws, 'open')
+  ws.send(JSON.stringify({ id: 1, method: 'Target.setDiscoverTargets', params: { discover: true } }))
+  while (!got.some(m => m.id === 1)) await new Promise(r => setTimeout(r, 50))
+  ws.send(JSON.stringify({ id: 2, method: 'Runtime.evaluate', params: { expression: 'location.href = "https://example.com"' } }))
+  await once(ws, 'close')
+  assert.ok(!got.some(m => m.id === 2), 'it never reached the browser')
+  await api('DELETE', `/sessions/${body.id}`)
+})
+
 test('a session past its ttl is closed and keeps its result until collected', async () => {
   const { body } = await api('POST', '/sessions', { site, state: signedIn, ttl_s: 1 })
   await new Promise(r => setTimeout(r, 2500))
