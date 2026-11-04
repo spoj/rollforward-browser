@@ -7,6 +7,7 @@ import os from 'node:os'
 import net from 'node:net'
 import { chromium } from 'playwright-core'
 import { startPortal } from './portal.ts'
+import { isInternal } from '../src/proxy.ts'
 
 const port = 8798
 const key = 'test-key'
@@ -229,4 +230,13 @@ test('an update drains the service: no session opens, and /drained answers once 
   assert.equal((await api('GET', '/drained')).status, 503, 'one is still open')
   assert.ok((await api('DELETE', `/sessions/${body.id}`)).body.log.length, 'its log is collected')
   assert.equal((await api('GET', '/drained')).status, 200)
+})
+
+test("internal addresses are the private ranges, an IPv4-mapped answer by its IPv4 part, and public IPv4 isn't one", () => {
+  for (const a of ['8.8.8.8', '184.24.154.186']) assert.equal(isInternal(a, 4), false)
+  for (const a of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '192.168.0.1', '169.254.1.1', '100.64.0.1']) assert.equal(isInternal(a, 4), true)
+  assert.equal(isInternal('::ffff:127.0.0.1', 6), true)
+  assert.equal(isInternal('::ffff:8.8.8.8', 6), false)
+  for (const a of ['::1', '::', 'fc00::1', 'fe80::1']) assert.equal(isInternal(a, 6), true)
+  assert.equal(isInternal('2a04:4e42:68::347', 6), false)
 })
