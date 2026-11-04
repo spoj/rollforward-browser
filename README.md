@@ -68,7 +68,7 @@ Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}`
 `POST /sessions` `{site: {hosts, start_url?, headers?, public?}, state?, ttl_s?}` → 201 `{id, cdp, view}` (paths on this service). After `ttl_s` (default 3600) the session closes on its own; its result waits for `DELETE`.
 
 - `hosts`: names the browser may reach, exact (`erp.example`) or `*.example` for any name under it. Anything else gets a 403 page.
-- Internal addresses (private, loopback, CGNAT, unique-local) are reachable only through a name listed exactly, and through none for a `public` site, a person's own rather than an admin's: a name that may not reach them and resolves only to them gets a 502. No name reaches a link-local address or Azure's WireServer. IP literals must be listed exactly.
+- Internal addresses (private, CGNAT, unique-local) are reachable only through a name listed exactly, as an intranet's are, and through none for a `public` site, a person's own rather than an admin's: a name that may not reach them and resolves only to them gets a 502. No name reaches a loopback or link-local address, or Azure's WireServer. IP literals must be listed exactly.
 - Each connection goes to one address, IPv4 where the host has one, with no racing of IPv4 against IPv6: a machine with no IPv6 route needs nothing set, where Node's own happy eyeballs would fail requests whenever IPv4 answered slowly.
 - `state`: a Playwright storageState (`{cookies, origins: [{origin, localStorage}]}`), loaded before the call returns. It lives only in the service's memory and the container's tmpfs.
 - `start_url`: the first tab goes there before the call returns (until the response arrives, not the load).

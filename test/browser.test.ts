@@ -31,7 +31,7 @@ before(async () => {
   await once(portal.server, 'listening')
   const origin = `https://portal.localhost:${portal.port()}`
   site = { hosts: ['portal.localhost'], start_url: `${origin}/` }
-  service = spawn('node', ['src/server.ts'], { env: { ...process.env, BROWSER_PORT: String(port), BROWSER_KEY: key, NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem` }, stdio: ['ignore', 'pipe', 'inherit'] })
+  service = spawn('node', ['--import', './test/resolve.ts', 'src/server.ts'], { env: { ...process.env, BROWSER_PORT: String(port), BROWSER_KEY: key, NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem` }, stdio: ['ignore', 'pipe', 'inherit'] })
   await Promise.race([once(service.stdout!, 'data'), once(service, 'exit').then(() => { throw new Error('service exited') })])
 })
 
@@ -290,7 +290,9 @@ test("internal addresses are the private ranges, an IPv4-mapped answer by its IP
   assert.equal(isInternal('168.63.129.16', 4), true, "Azure's WireServer")
   for (const a of ['169.254.169.254', '168.63.129.16', '0.0.0.0']) assert.equal(isNever(a, 4), true, `${a}, not even for an exact host`)
   for (const [a, f] of [['::ffff:169.254.169.254', 6], ['fe80::1', 6]] as const) assert.equal(isNever(a, f), true, a)
-  for (const a of ['10.1.2.3', '192.168.0.1', '127.0.0.1', '8.8.8.8']) assert.equal(isNever(a, 4), false, `${a}, an intranet's, this machine's or the internet's`)
+  for (const a of ['127.0.0.1', '127.1.2.3']) assert.equal(isNever(a, 4), true, `${a}, this machine's own`)
+  for (const [a, f] of [['::1', 6], ['::ffff:127.0.0.1', 6]] as const) assert.equal(isNever(a, f), true, a)
+  for (const a of ['10.1.2.3', '192.168.0.1', '8.8.8.8']) assert.equal(isNever(a, 4), false, `${a}, an intranet's or the internet's`)
   for (const a of ['::1', '::', 'fc00::1', 'fe80::1']) assert.equal(isInternal(a, 6), true)
   assert.equal(isInternal('2a04:4e42:68::347', 6), false)
 })

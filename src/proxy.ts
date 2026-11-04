@@ -11,13 +11,13 @@ export type Site = { hosts: string[], start_url?: string, headers?: Record<strin
 export type Entry = { t: string, method: string, url: string, status: number, blocked?: string, error?: string, live?: true }
 type Target = { scheme: string, authority: string }
 
-// Internal addresses, which only a site's exact hosts may be at, as an intranet's are; but none is ever a link-local address, such
-// as the cloud's metadata service, or Azure's WireServer.
+// Internal addresses, which only a site's exact hosts may be at, as an intranet's are; but none is ever this machine's own, a loopback
+// address, or a link-local one, such as the cloud's metadata service, or Azure's WireServer.
 const internal = new net.BlockList(), never = new net.BlockList()
-for (const [a, n] of [['0.0.0.0', 8], ['169.254.0.0', 16], ['168.63.129.16', 32]] as const) for (const l of [internal, never]) l.addSubnet(a, n, 'ipv4')
-for (const [a, n] of [['::', 128], ['fe80::', 10]] as const) for (const l of [internal, never]) l.addSubnet(a, n, 'ipv6')
-for (const [a, n] of [['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['172.16.0.0', 12], ['192.168.0.0', 16]] as const) internal.addSubnet(a, n, 'ipv4')
-for (const [a, n] of [['::1', 128], ['fc00::', 7]] as const) internal.addSubnet(a, n, 'ipv6')
+for (const [a, n] of [['0.0.0.0', 8], ['127.0.0.0', 8], ['169.254.0.0', 16], ['168.63.129.16', 32]] as const) for (const l of [internal, never]) l.addSubnet(a, n, 'ipv4')
+for (const [a, n] of [['::', 127], ['fe80::', 10]] as const) for (const l of [internal, never]) l.addSubnet(a, n, 'ipv6')
+for (const [a, n] of [['10.0.0.0', 8], ['100.64.0.0', 10], ['172.16.0.0', 12], ['192.168.0.0', 16]] as const) internal.addSubnet(a, n, 'ipv4')
+internal.addSubnet('fc00::', 7, 'ipv6')
 // An IPv4-mapped IPv6 answer, ::ffff:a.b.c.d, is checked as its IPv4 address. A ::ffff:0:0/96 rule can't say that: Node's BlockList
 // matches every IPv4 address against it, which made every wildcard host's IPv4 addresses internal.
 export const isInternal = (address: string, family: number, list = internal) => {
@@ -60,7 +60,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     dns.lookup(host, { all: true }, (err, addrs) => {
       if (err) return cb(err)
       const strict = site.public || !exact(host), ok = addrs.filter(a => !(strict ? isInternal : isNever)(a.address, a.family))
-      if (!ok.length) return cb(new Error(`${host} resolves only to ${strict ? 'internal' : 'link-local or WireServer'} addresses`))
+      if (!ok.length) return cb(new Error(`${host} resolves only to ${strict ? 'internal' : 'loopback, link-local or WireServer'} addresses`))
       const one = ok.find(a => a.family === 4) ?? ok[0]
       cb(null, one.address, one.family)
     })
