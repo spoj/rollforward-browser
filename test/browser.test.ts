@@ -135,6 +135,22 @@ test("a site's headers go with requests to start_url's origin alone, added by th
   assert.ok(log.length && !JSON.stringify(log).includes('jwt-1'))
 })
 
+test('pages see a browser without passkeys, in its first tab and any tab an agent opens, so a sign-in never waits on one', async () => {
+  const { body } = await api('POST', '/sessions', { site })
+  const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
+  const ctx = agent.contexts()[0]
+  for (const page of [ctx.pages()[0], await ctx.newPage()]) {
+    await page.goto(`${site.start_url}login`)
+    const seen = await page.evaluate(async () => {
+      const ask = (how: 'get' | 'create') => navigator.credentials[how]({ publicKey: {} } as any).then(() => 'answered', e => e.name)
+      return [typeof (window as any).PublicKeyCredential, await ask('get'), await ask('create')]
+    })
+    assert.deepEqual(seen, ['undefined', 'NotAllowedError', 'NotAllowedError'])
+  }
+  await agent.close()
+  await api('DELETE', `/sessions/${body.id}`)
+})
+
 test('hosts matched by a wildcard may not reach internal addresses', async () => {
   const { body } = await api('POST', '/sessions', { site: { ...site, hosts: ['portal.localhost', '*.portal.localhost'] } })
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })

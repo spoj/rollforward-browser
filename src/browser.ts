@@ -13,6 +13,20 @@ const spki = crypto.createHash('sha256').update(new crypto.X509Certificate(tlsKe
 const containerFlags = ['--network', 'none', '--userns', 'keep-id', '--read-only', '--tmpfs', '/tmp:size=2g', '--memory', '2g', '--pids-limit', '1024',
   '--cap-drop', 'all', '--security-opt', 'no-new-privileges', '--log-driver', 'none']
 
+// A passkey needs a window of the browser's own, for Windows Hello, a security key or a phone, which a headless browser never
+// shows: a page asking for one waits for good, as Microsoft's sign-in did for an account that has one. So every page, in every tab
+// and before its own scripts, sees a browser without passkeys and signs in another way, and a request for one fails at once, as one
+// a person cancels does.
+const noPasskeys = `(() => {
+  delete window.PublicKeyCredential
+  const c = navigator.credentials
+  if (!c) return
+  for (const name of ['get', 'create']) {
+    const own = c[name].bind(c)
+    c[name] = options => options && options.publicKey ? Promise.reject(new DOMException('This browser has no passkeys', 'NotAllowedError')) : own(options)
+  }
+})()`
+
 const cdpVersion = (sock: string) => new Promise<string>((resolve, reject) =>
   http.get({ socketPath: sock, path: '/json/version' }, res => {
     let body = ''
@@ -51,6 +65,7 @@ export class BrowserSession {
     }
     this.pw = await chromium.connectOverCDP(cdpUrl, { headers, noDefaults: true })
     const ctx = this.pw.contexts()[0]
+    await ctx.addInitScript(noPasskeys)
     if (state) await ctx.setStorageState(state as any)
     if (this.site.start_url) await (ctx.pages()[0] ?? await ctx.newPage()).goto(this.site.start_url, { waitUntil: 'commit' })
   }

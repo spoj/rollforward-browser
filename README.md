@@ -100,6 +100,7 @@ A `public` site's requests go over https only; any other gets a 403.
 
 - Playwright's `page.request` / `context.request` run in the agent's own process, not in the browser: they would leave from the agent's sandbox, not through this proxy. To use the page's cookies, fetch inside the page: `page.evaluate(u => fetch(u).then(r => r.text()), url)`.
 - The proxy keeps to hosts, not to reads: whatever the session's login may do on its site, the browser may do. Every request is in `log`, with `live` when a person drove it.
+- Pages see a browser without passkeys: no `PublicKeyCredential`, and `navigator.credentials.get` or `create` with `publicKey` fails at once with `NotAllowedError`, as when a person cancels. A passkey needs a window of the browser's own, for Windows Hello, a security key or a phone, which a headless browser never shows, so a page asking for one, such as Microsoft's sign-in for an account that has one, would wait for good; this way it signs in another way, such as a password or an authenticator app.
 
 ## License
 
