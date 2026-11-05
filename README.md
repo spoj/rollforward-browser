@@ -2,7 +2,7 @@
 
 Browsers that an agent's code uses for a bounded task on one website, then throws away. One client: the [rollforward](https://github.com/spoj/rollforward) server, holding the service key.
 
-Each session is a podman container with Chromium, driven over CDP (Playwright `connectOverCDP`). The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts and logs each request. Chromium's own calls, such as its updaters', autofill's and its leak check of the passwords people sign in with, are switched off (`browser/`), so a log holds only what the session's pages asked for.
+Each session is a podman container with Chromium, driven over CDP (Playwright `connectOverCDP`), with Noto fonts, Chinese, Japanese and Korean included, Liberation's and Carlito, Calibri's metric twin, so pages show, print and screenshot as written. The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts and logs each request. Chromium's own calls, such as its updaters', autofill's and its leak check of the passwords people sign in with, are switched off (`browser/`), so a log holds only what the session's pages asked for.
 
 ## Run
 
