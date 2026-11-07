@@ -109,7 +109,9 @@ test("an agent works with the saved login on the site's hosts, and every request
   assert.ok(!log.some((e: any) => e.live), 'no person drove it')
   assert.equal(find('GET', '/download').status, 200)
   assert.equal(find('GET', '/ws').status, 101)
-  assert.equal(log.find((e: any) => new URL(e.url).hostname === 'other.localhost').blocked, 'host not on the list')
+  const other = log.find((e: any) => new URL(e.url).hostname === 'other.localhost'), first = log.find((e: any) => e.url === site.start_url)
+  assert.deepEqual([other.blocked, other.dest, other.from], ['host not on the list', 'document', site.start_url], "its kind and the page it came from, as the browser sent them: another site's carries the page's origin alone")
+  assert.deepEqual([find('POST', '/report').dest, find('POST', '/report').from, first.dest, 'from' in first], ['empty', site.start_url, 'document', false], "a page's own fetch, and the first page, which no page asked for")
   assert.deepEqual([...new Set(log.filter((e: any) => e.blocked).map((e: any) => new URL(e.url).hostname))], ['other.localhost'], "only the page's own: nothing of Chromium's leaves the browser")
 
   const closed = await api('DELETE', `/sessions/${id}`)

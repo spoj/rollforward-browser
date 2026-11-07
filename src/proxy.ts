@@ -8,7 +8,7 @@ import { Duplex } from 'node:stream'
 // `public`, for a person's own site rather than one an admin set up: none of its hosts, exact ones included, reaches an internal
 // address, and it goes over https only.
 export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string>, public?: boolean }
-export type Entry = { t: string, method: string, url: string, status: number, blocked?: string, error?: string, live?: true }
+export type Entry = { t: string, method: string, url: string, status: number, dest?: string, from?: string, blocked?: string, error?: string, live?: true }
 type Target = { scheme: string, authority: string }
 
 // Internal addresses, which only a site's exact hosts may be at, as an intranet's are; but none is ever this machine's own, a loopback
@@ -78,8 +78,11 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
       : !allowed(url.hostname) ? 'host not on the list'
       : undefined
 
-  const record = (req: http.IncomingMessage, url: URL | null, status: number, extra: Partial<Entry> = {}) =>
-    log.push({ t: new Date().toISOString(), method: req.method!, url: url?.href ?? req.url!, status, ...extra, ...(isLive() ? { live: true as const } : {}) })
+  // What the browser says of each request, as it sends it: its kind (Sec-Fetch-Dest) and the page it came from (Referer).
+  const record = (req: http.IncomingMessage, url: URL | null, status: number, extra: Partial<Entry> = {}) => {
+    const dest = req.headers['sec-fetch-dest'] as string | undefined, from = req.headers.referer
+    log.push({ t: new Date().toISOString(), method: req.method!, url: url?.href ?? req.url!, status, ...(dest && { dest }), ...(from && { from }), ...extra, ...(isLive() ? { live: true as const } : {}) })
+  }
 
   const upstreamOptions = (req: http.IncomingMessage, url: URL) => {
     const headers = { ...req.headers, ...(url.origin === origin && site.headers), host: url.host }
