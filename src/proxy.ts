@@ -65,7 +65,10 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     for (const [protocol, agent] of Object.entries(agents[2])) agent.createConnection = (opts, cb) => {
       const authority = `${net.isIP(opts.host) === 6 ? `[${opts.host}]` : opts.host}:${opts.port}`
       const connect = (proxy.protocol === 'https:' ? https : http).request(proxy, { method: 'CONNECT', path: authority, headers: { host: authority, 'proxy-authorization': `Bearer ${via.token}` }, agent: false })
+      // A proxy that takes the connection and never answers would hold the request for good.
+      const timer = setTimeout(() => connect.destroy(new Error('upstream proxy CONNECT: no answer in 30s')), 30_000)
       connect.on('connect', (res, socket, head) => {
+        clearTimeout(timer)
         if (res.statusCode !== 200) {
           socket.destroy()
           cb(new Error(`upstream proxy CONNECT: ${res.statusCode}`))
@@ -74,7 +77,10 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
         if (head.length) socket.unshift(head)
         cb(null, protocol === 'https:' ? tls.connect({ ...opts, socket }) : socket)
       })
-      connect.on('error', e => cb(e))
+      connect.on('error', e => {
+        clearTimeout(timer)
+        cb(e)
+      })
       connect.end()
     }
   }
