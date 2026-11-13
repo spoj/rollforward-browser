@@ -9,10 +9,13 @@ export async function loadBlocklists() {
       return await res.text()
     }))
     const next = new Set<string>()
-    for (const list of lists) for (const line of list.split('\n')) {
-      const domain = line.split('#')[0].trim().toLowerCase().replace(/\.$/, '')
-      if (domain) next.add(domain)
+    for (const [i, list] of lists.entries()) {
+      const domains = list.split('\n').map(line => line.split('#')[0].trim().toLowerCase().replace(/\.$/, '')).filter(Boolean)
+      // An empty file, or a page of HTML where a list was, as from a captive portal or an outage, is a failed fetch.
+      if (!domains.length || !domains.every(d => /^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/.test(d))) throw new Error(`${urls[i]}: not a list of domains`)
+      for (const domain of domains) next.add(domain)
     }
+    if (blocklist && next.size < blocklist.size / 2) throw new Error(`${next.size} domains, fewer than half the ${blocklist.size} in use`)
     blocklist = next
   } catch (e) {
     console.error('loading blocklists:', e)
