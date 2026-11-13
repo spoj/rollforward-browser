@@ -46,9 +46,11 @@ const plain = (socket: net.Socket) => {
 // CONNECT tunnels are opened locally (TLS ends here, with a key the browser is told to accept),
 // so every request is seen whole: checked against the site's hosts, then logged.
 export function startProxy(path: string, site: Site, key: { key: string, cert: string }, isLive: () => boolean, log: Entry[]) {
+  const matches = (list: string[], host: string) => list.some(h => h.toLowerCase() === host || h.startsWith('*.') && host.endsWith(h.slice(1).toLowerCase()))
   // The site's hosts as they are now: a PUT adds those its person allows as the session goes (server.ts).
   const exact = (host: string) => site.hosts.some(h => h.toLowerCase() === host)
-  const allowed = (host: string) => exact(host) || site.hosts.some(h => h.startsWith('*.') && host.endsWith(h.slice(1).toLowerCase()))
+  // A trailing dot names the same host: through via, it is never resolved here.
+  const via = (host: string) => !!site.via && matches(site.via.hosts, host.replace(/\.$/, ''))
   // The site's headers, such as a token its sign-in needs that its pages never send, go only to start_url's origin, added here, so
   // the browser, and anyone on its CDP, never holds them.
   const origin = site.start_url && new URL(site.start_url).origin
@@ -95,12 +97,12 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
 
   const check = (url: URL | null) => {
     if (!url) return 'malformed request'
-    const host = url.hostname, name = host.replace(/\.$/, '')
+    const host = url.hostname
     if ((site.public || site.open) && url.protocol !== 'https:') return 'https only'
-    if (site.open && site.except?.some(h => h.toLowerCase() === name || h.startsWith('*.') && name.endsWith(h.slice(1).toLowerCase()))) return 'host not on the list'
+    if (site.open && matches(site.except ?? [], host.replace(/\.$/, ''))) return 'host not on the list'
     if (site.open && isBlocked(host)) return 'on a blocklist'
     if (net.isIP(host) || host.startsWith('[')) return exact(host) ? undefined : 'host not on the list'
-    if (!allowed(host) && !site.open) return 'host not on the list'
+    if (!matches(site.hosts, host) && !site.open) return 'host not on the list'
   }
 
   // What the browser says of each request, as it sends it: its kind (Sec-Fetch-Dest) and the page it came from (Referer).
@@ -112,8 +114,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const upstreamOptions = (req: http.IncomingMessage, url: URL) => {
     const headers = { ...req.headers, ...(url.origin === origin && site.headers), host: url.host }
     for (const h of hopByHop) delete headers[h]
-    const via = site.via?.hosts.some(h => h.toLowerCase() === url.hostname || h.startsWith('*.') && url.hostname.endsWith(h.slice(1).toLowerCase()))
-    return { method: req.method, headers, lookup, agent: agents[via ? 2 : site.public || !exact(url.hostname) ? 1 : 0][url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
+    return { method: req.method, headers, lookup, agent: agents[via(url.hostname) ? 2 : site.public || !exact(url.hostname) ? 1 : 0][url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
   }
 
   const forward = (req: http.IncomingMessage, res: http.ServerResponse) => {

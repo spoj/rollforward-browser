@@ -228,6 +228,7 @@ test('via hosts tunnel through an http or https proxy without local DNS, with a 
       const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${own.body.cdp}`, { headers })
       const tab = browser.contexts()[0].pages()[0]
       assert.equal((await tab.goto(`https://portal.via.invalid:${portal.port()}/login`))!.status(), 200, 'via works for unlisted open hosts and listed public hosts')
+      if (open) assert.equal((await tab.goto(`https://portal.via.invalid.:${portal.port()}/login`))!.status(), 200, 'a trailing dot still goes through via, never resolved here')
       for (const url of [`http://portal.via.invalid:${plainPort}/login`, 'https://denied.example/', 'https://blocked.example/']) assert.equal((await tab.goto(url))!.status(), 403)
       await browser.close()
       const result = await api('DELETE', `/sessions/${own.body.id}`)
