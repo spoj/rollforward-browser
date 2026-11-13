@@ -339,6 +339,17 @@ test('an open sign-in reaches unlisted public hosts over https, but not threats,
   for (const host of ['other.localhost', 'sub.denied.example', '8.8.8.8', '[::1]']) assert.equal(log.find((e: any) => new URL(e.url).hostname === host).blocked, 'host not on the list')
 })
 
+test("a site whose lists or headers the proxy couldn't use is a 400, never reaching the proxy, where it would end every client's sessions", async () => {
+  const via = { url: 'http://127.0.0.1:1', token: 'via-secret', hosts: [] }
+  for (const bad of [{ hosts: 'portal.localhost' }, { hosts: [1] }, { hosts: ['bücher.example'] }, { hosts: ['portal.localhost.'] }, { hosts: [], open: true, except: 'a.example' },
+    { hosts: [], via: { ...via, hosts: undefined } }, { hosts: [], via: { ...via, token: 'via-secret\r\nx: y' } }, { hosts: [], headers: { 'x-bot-token': 'a\nb' } }, { hosts: [], headers: { 'a b': 'c' } }]) {
+    const res = await api('POST', '/sessions', { site: bad })
+    assert.equal(res.status, 400, JSON.stringify(bad))
+    assert.ok(!JSON.stringify(res.body).includes('via-secret'))
+  }
+  assert.deepEqual((await api('GET', '/sessions')).body, [])
+})
+
 test('malformed requests to the proxy get a 403 and are logged', async () => {
   const { body } = await api('POST', '/sessions', { site })
   const ask = async (raw: string) => {

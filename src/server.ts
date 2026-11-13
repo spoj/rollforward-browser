@@ -34,13 +34,25 @@ const fail = (status: number, message: string) => Object.assign(new Error(messag
 const json = (res: http.ServerResponse, status: number, body: unknown) =>
   res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
 const body = async (req: http.IncomingMessage) => Buffer.concat(await req.toArray())
+const names = (list: unknown) => Array.isArray(list) && list.every(h => typeof h === 'string' && /^(\*\.)?[a-z0-9_-]+(\.[a-z0-9_-]+)*$|^\[[0-9a-f:.]+\]$/i.test(h))
 const close = (s: Session) => {
   clearTimeout(s.timer)
   return s.closing ??= s.close()
 }
 
+// A site's lists and headers are checked here, as one that the proxy can't use would end the service, every client's sessions with it.
 async function open(spec: any, client: typeof clients[number]) {
-  if (spec.site.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
+  const { site } = spec
+  if (!names(site.hosts) || !names(site.except ?? []) || site.via && !names(site.via.hosts)) throw fail(400, 'hosts, except and via.hosts: names such as sso.example.com, or *.example.com for any under it')
+  try {
+    for (const [name, value] of Object.entries({ ...site.headers, ...site.via && { 'proxy-authorization': `Bearer ${site.via.token}` } })) {
+      http.validateHeaderName(name)
+      http.validateHeaderValue(name, value)
+    }
+  } catch (e: any) {
+    throw fail(400, e.message)
+  }
+  if (site.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
   const id = crypto.randomBytes(8).toString('hex')
   const s: Session = Object.assign(new BrowserSession(id, `${runDir}/${id}`, label, spec.site), { client: client.name })
   sessions.set(id, s)
@@ -84,7 +96,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   if (rest === '/page' && req.method === 'GET') return json(res, 200, await s.page())
   if (rest === '/hosts' && req.method === 'PUT') {
     const { hosts } = JSON.parse((await body(req)).toString())
-    if (!Array.isArray(hosts) || !hosts.every(h => typeof h === 'string' && /^(\*\.)?[a-z0-9.-]+$/i.test(h))) throw fail(400, 'hosts: names such as sso.example.com, or *.example.com for any under it')
+    if (!names(hosts)) throw fail(400, 'hosts: names such as sso.example.com, or *.example.com for any under it')
     s.site.hosts = hosts
     return json(res, 200, { hosts })
   }
