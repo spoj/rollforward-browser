@@ -101,7 +101,9 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     if ((site.public || site.open) && url.protocol !== 'https:') return 'https only'
     if (site.open && matches(site.except ?? [], host.replace(/\.$/, ''))) return 'host not on the list'
     if (site.open && isBlocked(host)) return 'on a blocklist'
-    if (net.isIP(host) || host.startsWith('[')) return exact(host) ? undefined : 'host not on the list'
+    // No lookup checks an IP literal's address, as Node connects to one without any.
+    const ip = host.replace(/^\[(.*)\]$/, '$1')
+    if (net.isIP(ip)) return !exact(host) ? 'host not on the list' : !via(host) && (site.public ? isInternal : isNever)(ip, net.isIP(ip)) ? 'internal address' : undefined
     if (!matches(site.hosts, host) && !site.open) return 'host not on the list'
   }
 

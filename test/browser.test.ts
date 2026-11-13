@@ -281,6 +281,21 @@ test('hosts matched by a wildcard may not reach internal addresses', async () =>
   await api('DELETE', `/sessions/${body.id}`)
 })
 
+test('an IP literal listed exactly reaches no loopback, link-local or WireServer address, nor, for a public site, an internal one', async () => {
+  const here = Object.values(os.networkInterfaces()).flat().find(a => a!.family === 'IPv4' && !a!.internal)!.address
+  for (const [publicSite, hosts] of [[false, ['127.0.0.1', '[::1]', '169.254.169.254', '168.63.129.16']], [true, [here]]] as const) {
+    const { body } = await api('POST', '/sessions', { site: { hosts, public: publicSite } })
+    const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
+    const page = agent.contexts()[0].pages()[0]
+    for (const host of hosts) {
+      assert.equal((await page.goto(`https://${host}:${portal.port()}/login`))!.status(), 403, host)
+      assert.match(await page.textContent('body') ?? '', /internal address/)
+    }
+    await agent.close()
+    await api('DELETE', `/sessions/${body.id}`)
+  }
+})
+
 test("a person's own site reaches no internal address, not even by an exact host; and a session's hosts grow as hosts are allowed", async () => {
   for (const open of [false, true]) {
     const own = await api('POST', '/sessions', { site: { ...site, start_url: undefined, public: true, open } })
