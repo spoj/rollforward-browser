@@ -8,14 +8,21 @@ import { blocklist, isBlocked, loadBlocklists } from './blocklists.ts'
 
 const port = Number(process.env.BROWSER_PORT ?? 8797)
 const host = process.env.BROWSER_HOST ?? '127.0.0.1'
-const key = process.env.BROWSER_KEY
-if (!key) throw new Error('BROWSER_KEY is not set')
+const keys = process.env.BROWSER_KEYS ?? (process.env.BROWSER_KEY ? `default:${process.env.BROWSER_KEY}` : '')
+if (!keys.trim()) throw new Error('BROWSER_KEYS or BROWSER_KEY must be set')
+const clients = keys.trim().split(/\s+/).map(pair => {
+  const match = /^([a-z0-9-]+):(\S+)$/.exec(pair)
+  if (!match) throw new Error('BROWSER_KEYS: whitespace-separated name:key pairs, names a-z 0-9 -')
+  const [, name, key] = match
+  return { name, key, hash: crypto.hash('sha256', `Bearer ${key}`, 'buffer') }
+})
+if (new Set(clients.map(c => c.name)).size !== clients.length || new Set(clients.map(c => c.key)).size !== clients.length) throw new Error('BROWSER_KEYS: names and keys must be unique')
 const runDir = `${os.tmpdir()}/rollforward-browser-${port}`
 const label = `rollforward-browser=${port}`
 const viewPage = fs.readFileSync(new URL('view.html', import.meta.url))
 
 type Result = { state: unknown, log: unknown[] }
-type Session = BrowserSession & { expires?: number, timer?: NodeJS.Timeout, closing?: Promise<Result> }
+type Session = BrowserSession & { client: string, expires?: number, timer?: NodeJS.Timeout, closing?: Promise<Result> }
 const sessions = new Map<string, Session>()
 // An update (scripts/update.ts) drains the service before it moves the checkout: no session opens, and once every session has been
 // collected with DELETE, its request log with it, or 30 minutes have passed, GET /drained answers 200, for the update to move it and
@@ -32,13 +39,13 @@ const close = (s: Session) => {
   return s.closing ??= s.close()
 }
 
-async function open(spec: any) {
+async function open(spec: any, client: typeof clients[number]) {
   if (spec.site.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
   const id = crypto.randomBytes(8).toString('hex')
-  const s: Session = new BrowserSession(id, `${runDir}/${id}`, label, spec.site)
+  const s: Session = Object.assign(new BrowserSession(id, `${runDir}/${id}`, label, spec.site), { client: client.name })
   sessions.set(id, s)
   try {
-    await s.start(spec.state, `ws://${host}:${port}/sessions/${id}/cdp`, { authorization: `Bearer ${key}` })
+    await s.start(spec.state, `ws://${host}:${port}/sessions/${id}/cdp`, { authorization: `Bearer ${client.key}` })
   } catch (e) {
     sessions.delete(id)
     await close(s)
@@ -51,7 +58,9 @@ async function open(spec: any) {
 }
 
 async function route(req: http.IncomingMessage, res: http.ServerResponse) {
-  if (req.headers.authorization !== `Bearer ${key}`) throw fail(401, 'bad key')
+  const hash = crypto.hash('sha256', req.headers.authorization ?? '', 'buffer')
+  const client = clients.find(c => crypto.timingSafeEqual(c.hash, hash))
+  if (!client) throw fail(401, 'bad key')
   const { pathname, searchParams } = new URL(req.url!, 'http://x')
   if (pathname === '/blocked' && req.method === 'GET') {
     if (!blocklist) throw fail(503, 'blocklists not loaded yet')
@@ -59,11 +68,11 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   }
   if (pathname === '/drained' && req.method === 'GET') return json(res, drainUntil && (!sessions.size || Date.now() > drainUntil) ? 200 : 503, { open: sessions.size })
   if (pathname === '/sessions' && req.method === 'POST' && drainUntil) throw fail(503, 'updating: try again in a few minutes')
-  if (pathname === '/sessions' && req.method === 'POST') return json(res, 201, await open(JSON.parse((await body(req)).toString())))
-  if (pathname === '/sessions' && req.method === 'GET') return json(res, 200, [...sessions.values()].map(s => ({ id: s.id, expires: s.expires, closed: !!s.closing })))
+  if (pathname === '/sessions' && req.method === 'POST') return json(res, 201, await open(JSON.parse((await body(req)).toString()), client))
+  if (pathname === '/sessions' && req.method === 'GET') return json(res, 200, [...sessions.values()].filter(s => s.client === client.name).map(s => ({ id: s.id, expires: s.expires, closed: !!s.closing })))
   const [, id, rest] = pathname.match(/^\/sessions\/([^/]+)(.*)$/) ?? []
   const s = sessions.get(id)
-  if (!s) throw fail(404, 'no such session')
+  if (!s || s.client !== client.name) throw fail(404, 'no such session')
   if (rest === '' && req.method === 'DELETE') {
     const result = await close(s)
     sessions.delete(id)
@@ -140,7 +149,9 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   socket.on('error', () => socket.destroy())
   const [, id, rest] = new URL(req.url!, 'http://x').pathname.match(/^\/sessions\/([^/]+)(\/cdp|\/view\/watch|\/view\/drive)$/) ?? []
   const s = sessions.get(id)
-  if (req.headers.authorization !== `Bearer ${key}` || !s || s.closing) return socket.end('HTTP/1.1 404 Not Found\r\nconnection: close\r\n\r\n')
+  const hash = crypto.hash('sha256', req.headers.authorization ?? '', 'buffer')
+  const client = clients.find(c => crypto.timingSafeEqual(c.hash, hash))
+  if (!client || !s || s.client !== client.name || s.closing) return socket.end('HTTP/1.1 404 Not Found\r\nconnection: close\r\n\r\n')
   const up = net.connect(s.cdpSocket)
   up.on('error', () => socket.destroy())
   const headers: Record<string, unknown> = { ...req.headers, host: 'localhost' }

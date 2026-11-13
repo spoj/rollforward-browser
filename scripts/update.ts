@@ -4,7 +4,7 @@
 // that takes; otherwise the running image stays. Its packages are fetched first too, so a failure there, as without the network,
 // changes nothing, and the next tick tries again. If the service doesn't answer after the move, code and image go back, and that
 // release isn't tried again; if going back fails too, the service restarts as the checkout is, never left drained.
-//   node scripts/update.ts      (BROWSER_KEY, and BROWSER_PORT if not 8797, from the service's environment file)
+//   node scripts/update.ts      (BROWSER_KEYS or BROWSER_KEY, and BROWSER_PORT if not 8797, from the service's environment file)
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
@@ -13,7 +13,8 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
 const repo = 'spoj/rollforward-browser', image = 'ghcr.io/spoj/rollforward-browser'
-const health = `http://127.0.0.1:${process.env.BROWSER_PORT ?? 8797}/sessions`, auth = { authorization: `Bearer ${process.env.BROWSER_KEY}` }
+const key = process.env.BROWSER_KEYS?.trim().split(/\s+/)[0].replace(/^[^:]+:/, '') ?? process.env.BROWSER_KEY
+const health = `http://127.0.0.1:${process.env.BROWSER_PORT ?? 8797}/sessions`, auth = { authorization: `Bearer ${key}` }
 const app = join(dirname(fileURLToPath(import.meta.url)), '..'), state = join(homedir(), '.local', 'state', 'rollforward-browser-update.json')
 const sh = (cmd: string, ...args: string[]) => execFileSync(cmd, args, { cwd: app, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).trim()
 async function github(path: string) {

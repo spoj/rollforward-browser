@@ -1,6 +1,6 @@
 # rollforward-browser
 
-Browsers for an agent's bounded task on one website or a person's open sign-in, then thrown away. One client: the [rollforward](https://github.com/spoj/rollforward) server, holding the service key.
+Browsers for an agent's bounded task on one website or a person's open sign-in, then thrown away. Shared by [rollforward](https://github.com/spoj/rollforward) servers, each holding its own client key and seeing only its own sessions.
 
 Each session is a podman container with Chromium, driven over CDP (Playwright `connectOverCDP`), with Noto fonts, Chinese, Japanese and Korean included, Liberation's and Carlito, Calibri's metric twin, so pages show, print and screenshot as written. The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts (or public hosts for an open sign-in session) and logs each request. Chromium's own calls, such as its updaters', autofill's and its leak check of the passwords people sign in with, are switched off (`browser/`), so a log holds only what the session's pages asked for.
 
@@ -14,7 +14,9 @@ Needs Node 26 and rootless podman (tested with 6.1).
 
 Where the image can't be built, as on a host that can't reach Debian's mirrors, pull the one each tag publishes and give it the name the service runs: `podman pull ghcr.io/spoj/rollforward-browser:TAG && podman tag ghcr.io/spoj/rollforward-browser:TAG rollforward-browser`.
 
-It listens on `BROWSER_HOST` (default 127.0.0.1), port `BROWSER_PORT` (default 8797). The key is the one secret its client holds: rollforward's `RF_BROWSER_KEY`, with `RF_BROWSER_URL` its address. `curl -H "authorization: Bearer $BROWSER_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files) are removed at start. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
+It listens on `BROWSER_HOST` (default 127.0.0.1), port `BROWSER_PORT` (default 8797). Each client's key is rollforward's `RF_BROWSER_KEY`, with `RF_BROWSER_URL` its address. `curl -H "authorization: Bearer $BROWSER_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files) are removed at start. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
+
+`BROWSER_KEYS` is a whitespace-separated list of `name:key` pairs, such as `accounts:SECRET1 support:SECRET2`. Names use `a-z`, `0-9`, `-`; names and keys must be unique. When set, it replaces `BROWSER_KEY`; `BROWSER_KEY` alone is one client named `default`, unchanged for existing deployments. Keys are compared in constant time. The updater uses the first key.
 
 `BROWSER_BLOCKLISTS` is a whitespace-separated list of URLs of text files, one domain per line (`#` comments and blank lines skipped). The default is [HaGeZi's threat intelligence list](https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt). Lists are fetched at startup and every 24 hours, kept only in memory; a failed fetch keeps the previous combined set, and with none yet is tried again each minute. A domain covers its subdomains, case-insensitively, with a trailing dot ignored.
 
@@ -30,7 +32,7 @@ Run it as a user of its own, next to rollforward's: CDP is close to code executi
     [Install]
     WantedBy=default.target
 
-with `BROWSER_KEY=...` in `~/.config/rollforward-browser.env`, then `systemctl --user enable --now rollforward-browser`. `ExecStart` names Node 26 where it is, such as `/opt/node-v26/bin/node` beside an older system node.
+with `BROWSER_KEY=...` (or `BROWSER_KEYS="accounts:... support:..."`) in `~/.config/rollforward-browser.env`, then `systemctl --user enable --now rollforward-browser`. `ExecStart` names Node 26 where it is, such as `/opt/node-v26/bin/node` beside an older system node.
 
 **Updates come by themselves.** `scripts/update.ts` moves the checkout to the newest GitHub Release once every check on its commit has passed. CI makes one from each tag whose tests pass, after pushing its image; a tag with a `Manual:` line in its message makes a prerelease, which the updater stops before, for a person to deploy by hand. If the release changed `browser/`, the updater pulls its image first, however long that takes, and switches code and image together; otherwise the running image stays, so a new Chromium comes only with a change to `browser/`. Its packages are fetched first too, into npm's cache, so a failure there, as without the network, changes nothing and the next tick tries again. It drains the service first: on SIGUSR2 the service opens no session, and once every open one has been collected, its request log with it, or 30 minutes have passed, `GET /drained` answers 200. Then it moves code and image and restarts the service; if the service doesn't answer, code and image go back, and that release isn't tried again, and if going back fails too, the service restarts as the checkout is. A checkout on no release tag, as after a person's fix by hand, stops updates until one is checked out again. It asks GitHub without a token, so every 15 minutes, as a timer of the same user:
 
@@ -65,7 +67,7 @@ Tests: `npm test` (needs the image).
 
 ## API
 
-Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}` with a status: 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 503 (the blocklists aren't loaded yet, or a new session while the service drains for an update), 500.
+Every request carries `Authorization: Bearer <client-key>`. Sessions belong to the client that opened them; another client's session is a 404 on every session route and websocket, even after its ttl. `/blocked` and `/drained` are shared, available to every client. Errors are `{error}` with a status: 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 503 (the blocklists aren't loaded yet, or a new session while the service drains for an update), 500.
 
 `POST /sessions` `{site: {hosts, start_url?, headers?, public?, open?, except?}, state?, ttl_s?}` → 201 `{id, cdp, view}` (paths on this service). After `ttl_s` (default 3600) the session closes on its own; its result waits for `DELETE`.
 
@@ -84,7 +86,7 @@ A `public` or `open` site's requests go over https only; any other gets a 403 (`
 
 `GET /blocked?host=a.example&host=b.example` → 200 `{"a.example": true, "b.example": false}`: whether each host or a parent domain is on a blocklist. Before the first successful load it answers 503 `{error: "blocklists not loaded yet"}`; ordinary sessions are unaffected.
 
-`GET /sessions` → `[{id, expires, closed}]`.
+`GET /sessions` → `[{id, expires, closed}]`: only this client's sessions, including those past their ttl until collected. A client may collect these at startup without disturbing another's.
 
 `GET /sessions/:id/cdp` — websocket: CDP of the whole browser, for `chromium.connectOverCDP(url, {headers})`. Use `browser.contexts()[0]` (the saved login is there).
 
@@ -100,7 +102,7 @@ A `public` or `open` site's requests go over https only; any other gets a 403 (`
 
 `DELETE /sessions/:id` → `{state, log}`: the refreshed login (null if the browser was gone) and the whole request log; then the container is gone. A second `DELETE` is a 404.
 
-`GET /drained` → 200 once the service, sent SIGUSR2, has had every session collected or drained for 30 minutes; 503 before, with `{open}`, the sessions not yet collected.
+`GET /drained` → 200 once the service, sent SIGUSR2, has had every session collected or drained for 30 minutes; 503 before, with `{open}`, the total sessions not yet collected across all clients.
 
 ## Notes for clients
 
