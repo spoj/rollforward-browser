@@ -4,6 +4,8 @@ import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
 import fs from 'node:fs'
 import http from 'node:http'
+import https from 'node:https'
+import dns from 'node:dns/promises'
 import os from 'node:os'
 import net from 'node:net'
 import { chromium } from 'playwright-core'
@@ -28,7 +30,7 @@ let site: { hosts: string[], start_url: string }
 before(async () => {
   openssl('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=test-ca', '-days', '1', '-keyout', 'ca.key', '-out', 'ca.pem')
   openssl('req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=portal.localhost', '-keyout', 'portal.key', '-out', 'portal.csr')
-  fs.writeFileSync(`${tmp}/san`, 'subjectAltName=DNS:portal.localhost,DNS:other.localhost,DNS:sub.portal.localhost,DNS:public.example\n')
+  fs.writeFileSync(`${tmp}/san`, 'subjectAltName=DNS:portal.localhost,DNS:other.localhost,DNS:sub.portal.localhost,DNS:public.example,DNS:portal.via.invalid,DNS:sub.branch.via.invalid,IP:127.0.0.1\n')
   openssl('x509', '-req', '-in', 'portal.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-days', '1', '-extfile', 'san', '-out', 'portal.pem')
   portal = startPortal({ key: fs.readFileSync(`${tmp}/portal.key`, 'utf8'), cert: fs.readFileSync(`${tmp}/portal.pem`, 'utf8') })
   await once(portal.server, 'listening')
@@ -162,6 +164,93 @@ test("a site's headers go with requests to start_url's origin alone, added by th
   await agent.close()
   const { log } = (await api('DELETE', `/sessions/${body.id}`)).body
   assert.ok(log.length && !JSON.stringify(log).includes('jwt-1'))
+})
+
+test('via hosts tunnel through an http or https proxy without local DNS, with a bearer token held only by the service; other hosts stay direct', async t => {
+  await assert.rejects(dns.lookup('portal.via.invalid'), { code: 'ENOTFOUND' })
+  const plain = http.createServer(portal.server.listeners('request')[0] as http.RequestListener).listen(0, '127.0.0.1')
+  plain.on('upgrade', portal.server.listeners('upgrade')[0] as any)
+  t.after(() => plain.close())
+  await once(plain, 'listening')
+  const plainPort = (plain.address() as net.AddressInfo).port
+  for (const secure of [false, true]) {
+    const token = `via-secret-${secure}`, asked: string[] = [], sockets = new Set<net.Socket>()
+    const proxy = secure ? https.createServer({ key: fs.readFileSync(`${tmp}/portal.key`), cert: fs.readFileSync(`${tmp}/portal.pem`) }) : http.createServer()
+    proxy.on('connection', socket => {
+      sockets.add(socket)
+      socket.on('close', () => sockets.delete(socket))
+    })
+    proxy.on('connect', (req, socket, head) => {
+      asked.push(req.url!)
+      if (req.headers['proxy-authorization'] !== `Bearer ${token}`) return socket.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n')
+      const up = net.connect(Number(new URL(`http://${req.url}`).port), '127.0.0.1', () => {
+        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+        up.write(head)
+        socket.pipe(up).pipe(socket)
+      })
+      socket.on('error', () => up.destroy())
+      socket.on('close', () => up.destroy())
+      up.on('error', () => socket.destroy())
+    })
+    proxy.listen(0, '127.0.0.1')
+    await once(proxy, 'listening')
+    t.after(() => proxy.close())
+    const via = { url: `${secure ? 'https' : 'http'}://127.0.0.1:${(proxy.address() as net.AddressInfo).port}`, token, hosts: ['PORTAL.via.invalid', '*.BRANCH.via.invalid', 'denied.example', 'blocked.example'] }
+    const opened = await api('POST', '/sessions', { site: { hosts: ['*.via.invalid', 'other.localhost'], via } })
+    assert.equal(opened.status, 201)
+    const { id, cdp, view } = opened.body
+    const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${cdp}`, { headers })
+    const page = agent.contexts()[0].pages()[0], seen: string[] = []
+    page.on('request', r => seen.push(JSON.stringify(r.headers())))
+    for (const host of ['portal.via.invalid', 'sub.branch.via.invalid']) {
+      assert.equal((await page.goto(`https://${host}:${portal.port()}/login`))!.status(), 200)
+      assert.ok(asked.includes(`${host}:${portal.port()}`))
+    }
+    assert.equal(await page.evaluate(() => new Promise(resolve => { new WebSocket(`wss://${location.host}/ws`).onmessage = e => resolve(e.data) })), 'hello')
+    assert.equal((await page.goto(`http://portal.via.invalid:${plainPort}/login`))!.status(), 200)
+    assert.equal(await page.evaluate(() => new Promise(resolve => { new WebSocket(`ws://${location.host}/ws`).onmessage = e => resolve(e.data) })), 'hello')
+    assert.ok(asked.includes(`portal.via.invalid:${plainPort}`))
+    const before = asked.length
+    assert.equal((await page.goto(`https://other.localhost:${portal.port()}/`))!.status(), 200)
+    assert.equal(asked.length, before, 'non-via hosts stay direct')
+    assert.equal((await api('PUT', `/sessions/${id}/hosts`, { hosts: ['other.localhost'] })).status, 200)
+    assert.equal((await page.goto(`https://portal.via.invalid:${portal.port()}/login`))!.status(), 403, 'a via route grants no host permission, even on a pooled connection')
+    assert.equal(asked.length, before)
+    assert.ok(!seen.join('').includes(token))
+    for (const path of ['/sessions', '/drained', '/blocked?host=portal.via.invalid', `${view}`, `/sessions/${id}/log`, `/sessions/${id}/page`]) assert.ok(!JSON.stringify((await api('GET', path)).body).includes(token), path)
+    await agent.close()
+    const closed = await api('DELETE', `/sessions/${id}`)
+    assert.ok(closed.body.log.some((e: any) => e.status === 101))
+    assert.ok(!JSON.stringify([opened, closed]).includes(token))
+
+    for (const [open, publicSite] of [[true, false], [false, true]]) {
+      const own = await api('POST', '/sessions', { site: { hosts: publicSite ? ['*.via.invalid'] : [], open, public: publicSite, except: ['denied.example'], via } })
+      const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${own.body.cdp}`, { headers })
+      const tab = browser.contexts()[0].pages()[0]
+      assert.equal((await tab.goto(`https://portal.via.invalid:${portal.port()}/login`))!.status(), 200, 'via works for unlisted open hosts and listed public hosts')
+      for (const url of [`http://portal.via.invalid:${plainPort}/login`, 'https://denied.example/', 'https://blocked.example/']) assert.equal((await tab.goto(url))!.status(), 403)
+      await browser.close()
+      const result = await api('DELETE', `/sessions/${own.body.id}`)
+      assert.ok(!JSON.stringify([own, result]).includes(token))
+    }
+
+    const wrong = await api('POST', '/sessions', { site: { hosts: ['portal.via.invalid'], via: { ...via, token: 'wrong-secret' } } })
+    const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${wrong.body.cdp}`, { headers })
+    assert.equal((await browser.contexts()[0].pages()[0].goto(`https://portal.via.invalid:${portal.port()}/login`))!.status(), 502)
+    await browser.close()
+    const result = await api('DELETE', `/sessions/${wrong.body.id}`)
+    assert.match(result.body.log.find((e: any) => e.status === 502).error, /upstream proxy CONNECT: 407/)
+    assert.ok(!JSON.stringify([wrong, result]).includes('wrong-secret'))
+    proxy.close()
+    for (const socket of sockets) socket.destroy()
+    const down = await api('POST', '/sessions', { site: { hosts: ['portal.via.invalid'], via } })
+    const last = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${down.body.cdp}`, { headers })
+    assert.equal((await last.contexts()[0].pages()[0].goto(`https://portal.via.invalid:${portal.port()}/login`))!.status(), 502)
+    await last.close()
+    const failed = await api('DELETE', `/sessions/${down.body.id}`)
+    assert.match(failed.body.log.find((e: any) => e.status === 502).error, /ECONNREFUSED/)
+    assert.ok(!JSON.stringify([down, failed]).includes(token))
+  }
 })
 
 test('pages see a browser without passkeys, in its first tab and any tab an agent opens, so a sign-in never waits on one', async () => {

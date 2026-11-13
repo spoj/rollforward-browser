@@ -6,9 +6,9 @@ import dns from 'node:dns'
 import { Duplex } from 'node:stream'
 import { isBlocked } from './blocklists.ts'
 
-// `public`, for a person's own site rather than one an admin set up: none of its hosts, exact ones included, reaches an internal
-// address, and it goes over https only.
-export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string>, public?: boolean, open?: boolean, except?: string[] }
+// `public`, for a person's own site rather than one an admin set up: no direct connection, exact hosts included, reaches an
+// internal address, and it goes over https only.
+export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string>, public?: boolean, open?: boolean, except?: string[], via?: { url: string, token: string, hosts: string[] } }
 export type Entry = { t: string, method: string, url: string, status: number, dest?: string, from?: string, blocked?: string, error?: string, live?: true }
 type Target = { scheme: string, authority: string }
 
@@ -53,10 +53,29 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   // the browser, and anyone on its CDP, never holds them.
   const origin = site.start_url && new URL(site.start_url).origin
   const secureContext = tls.createSecureContext(key)
-  // One address per connection, IPv4 where the host has one, with no racing of the two: on a machine with no IPv6 route, Node's
+  // One address per direct connection, IPv4 where the host has one, with no racing of the two: on a machine with no IPv6 route, Node's
   // happy eyeballs falls back to IPv6 whenever IPv4 is slower than 500ms, as in a page's burst of requests, and fails.
   // Separate pools: removing an exact host with PUT must not reuse its intranet connection for a public-only name.
-  const agents = [0, 1].map(() => ({ 'http:': new http.Agent({ keepAlive: true, autoSelectFamily: false }), 'https:': new https.Agent({ keepAlive: true, autoSelectFamily: false }) }))
+  const agents = [0, 1, 2].map(() => ({ 'http:': new http.Agent({ keepAlive: true, autoSelectFamily: false }), 'https:': new https.Agent({ keepAlive: true, autoSelectFamily: false }) }))
+  if (site.via) {
+    const via = site.via, proxy = new URL(via.url)
+    if (proxy.protocol !== 'http:' && proxy.protocol !== 'https:') throw new Error('via.url: http://host:port or https://host:port')
+    for (const [protocol, agent] of Object.entries(agents[2])) agent.createConnection = (opts, cb) => {
+      const authority = `${net.isIP(opts.host) === 6 ? `[${opts.host}]` : opts.host}:${opts.port}`
+      const connect = (proxy.protocol === 'https:' ? https : http).request(proxy, { method: 'CONNECT', path: authority, headers: { host: authority, 'proxy-authorization': `Bearer ${via.token}` }, agent: false })
+      connect.on('connect', (res, socket, head) => {
+        if (res.statusCode !== 200) {
+          socket.destroy()
+          cb(new Error(`upstream proxy CONNECT: ${res.statusCode}`))
+          return
+        }
+        if (head.length) socket.unshift(head)
+        cb(null, protocol === 'https:' ? tls.connect({ ...opts, socket }) : socket)
+      })
+      connect.on('error', e => cb(e))
+      connect.end()
+    }
+  }
 
   const lookup = (host: string, _opts: dns.LookupOptions, cb: (...a: any[]) => void) =>
     dns.lookup(host, { all: true }, (err, addrs) => {
@@ -93,7 +112,8 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const upstreamOptions = (req: http.IncomingMessage, url: URL) => {
     const headers = { ...req.headers, ...(url.origin === origin && site.headers), host: url.host }
     for (const h of hopByHop) delete headers[h]
-    return { method: req.method, headers, lookup, agent: agents[site.public || !exact(url.hostname) ? 1 : 0][url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
+    const via = site.via?.hosts.some(h => h.toLowerCase() === url.hostname || h.startsWith('*.') && url.hostname.endsWith(h.slice(1).toLowerCase()))
+    return { method: req.method, headers, lookup, agent: agents[via ? 2 : site.public || !exact(url.hostname) ? 1 : 0][url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
   }
 
   const forward = (req: http.IncomingMessage, res: http.ServerResponse) => {
