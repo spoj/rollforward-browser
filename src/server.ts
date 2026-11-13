@@ -4,6 +4,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import { BrowserSession, podman } from './browser.ts'
+import { blocklist, isBlocked, loadBlocklists } from './blocklists.ts'
 
 const port = Number(process.env.BROWSER_PORT ?? 8797)
 const host = process.env.BROWSER_HOST ?? '127.0.0.1'
@@ -50,7 +51,11 @@ async function open(spec: any) {
 
 async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   if (req.headers.authorization !== `Bearer ${key}`) throw fail(401, 'bad key')
-  const { pathname } = new URL(req.url!, 'http://x')
+  const { pathname, searchParams } = new URL(req.url!, 'http://x')
+  if (pathname === '/blocked' && req.method === 'GET') {
+    if (!blocklist) throw fail(503, 'blocklists not loaded yet')
+    return json(res, 200, Object.fromEntries(searchParams.getAll('host').map(host => [host, isBlocked(host)])))
+  }
   if (pathname === '/drained' && req.method === 'GET') return json(res, drainUntil && (!sessions.size || Date.now() > drainUntil) ? 200 : 503, { open: sessions.size })
   if (pathname === '/sessions' && req.method === 'POST' && drainUntil) throw fail(503, 'updating: try again in a few minutes')
   if (pathname === '/sessions' && req.method === 'POST') return json(res, 201, await open(JSON.parse((await body(req)).toString())))
@@ -154,6 +159,8 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   }
 })
 
+void loadBlocklists()
+setInterval(loadBlocklists, 24 * 60 * 60_000)
 await podman(['rm', '-f', '-t', '0', '--filter', `label=${label}`])
 fs.rmSync(runDir, { recursive: true, force: true })
 fs.mkdirSync(runDir, { mode: 0o700 })

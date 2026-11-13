@@ -16,6 +16,8 @@ Where the image can't be built, as on a host that can't reach Debian's mirrors, 
 
 It listens on `BROWSER_HOST` (default 127.0.0.1), port `BROWSER_PORT` (default 8797). The key is the one secret its client holds: rollforward's `RF_BROWSER_KEY`, with `RF_BROWSER_URL` its address. `curl -H "authorization: Bearer $BROWSER_KEY" http://127.0.0.1:8797/sessions` answers `[]` when it's up. Leftovers of an earlier run on the same port (containers, runtime files) are removed at start. `NODE_EXTRA_CA_CERTS` adds CAs the proxy trusts upstream (an ERP with an internal CA).
 
+`BROWSER_BLOCKLISTS` is a whitespace-separated list of URLs of text files, one domain per line (`#` comments and blank lines skipped). The default is [HaGeZi's threat intelligence list](https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt). Lists are fetched at startup and every 24 hours, kept only in memory; a failed fetch keeps the previous combined set. A domain covers its subdomains, case-insensitively, with a trailing dot ignored.
+
 Run it as a user of its own, next to rollforward's: CDP is close to code execution in the container, whose user is the service's user (`--userns keep-id`). As a systemd user service of that user, with lingering on (`loginctl enable-linger USER`):
 
     # ~/.config/systemd/user/rollforward-browser.service
@@ -77,6 +79,8 @@ Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}`
 `PUT /sessions/:id/hosts` `{hosts}` → 200 `{hosts}`: the session's hosts from then on, as a person allows another a page of it was refused. `POST /sessions/:id/reload` loads the newest tab again.
 
 A `public` site's requests go over https only; any other gets a 403.
+
+`GET /blocked?host=a.example&host=b.example` → 200 `{"a.example": true, "b.example": false}`: whether each host or a parent domain is on a blocklist. Before the first successful load it answers 503 `{error: "blocklists not loaded yet"}`; ordinary sessions are unaffected.
 
 `GET /sessions` → `[{id, expires, closed}]`.
 

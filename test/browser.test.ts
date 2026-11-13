@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import net from 'node:net'
 import { chromium } from 'playwright-core'
@@ -20,6 +21,8 @@ const tmp = fs.mkdtempSync(`${os.tmpdir()}/rollforward-browser-test-`)
 const openssl = (...args: string[]) => execFileSync('openssl', args, { cwd: tmp, stdio: 'ignore' })
 let portal: ReturnType<typeof startPortal>
 let service: ChildProcess
+let lists: http.Server
+let releaseLists: () => void
 let site: { hosts: string[], start_url: string }
 
 before(async () => {
@@ -31,19 +34,42 @@ before(async () => {
   await once(portal.server, 'listening')
   const origin = `https://portal.localhost:${portal.port()}`
   site = { hosts: ['portal.localhost'], start_url: `${origin}/` }
-  service = spawn('node', ['--import', './test/resolve.ts', 'src/server.ts'], { env: { ...process.env, BROWSER_PORT: String(port), BROWSER_KEY: key, NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem` }, stdio: ['ignore', 'pipe', 'inherit'] })
+  const ready = new Promise<void>(r => releaseLists = r)
+  lists = http.createServer(async (_req, res) => {
+    await ready
+    res.end('# test threats\n\nblocked.example\n')
+  }).listen(0, '127.0.0.1')
+  await once(lists, 'listening')
+  const listUrl = `http://127.0.0.1:${(lists.address() as net.AddressInfo).port}/`
+  service = spawn('node', ['--import', './test/resolve.ts', 'src/server.ts'], { env: { ...process.env, BROWSER_PORT: String(port), BROWSER_KEY: key, BROWSER_BLOCKLISTS: listUrl, NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem` }, stdio: ['ignore', 'pipe', 'inherit'] })
   await Promise.race([once(service.stdout!, 'data'), once(service, 'exit').then(() => { throw new Error('service exited') })])
 })
 
 after(() => {
   service.kill()
   portal.server.close()
+  lists.close()
   fs.rmSync(tmp, { recursive: true })
 })
 
 const leftovers = () => execFileSync('podman', ['ps', '-a', '-q', '--filter', `label=rollforward-browser=${port}`]).toString().trim() + fs.readdirSync(`${os.tmpdir()}/rollforward-browser-${port}`).join(' ')
 
 let signedIn: any
+
+test('blocklists load without delaying ordinary sessions, then /blocked checks a domain and its parents', async () => {
+  const waiting = await api('GET', '/blocked?host=blocked.example')
+  assert.deepEqual(waiting, { status: 503, body: { error: 'blocklists not loaded yet' } })
+  const ordinary = await api('POST', '/sessions', { site })
+  assert.equal(ordinary.status, 201)
+  await api('DELETE', `/sessions/${ordinary.body.id}`)
+  releaseLists()
+  let result
+  do {
+    await new Promise(r => setTimeout(r, 20))
+    result = await api('GET', '/blocked?host=blocked.example&host=sub.blocked.example&host=other.example&host=notblocked.example&host=BLOCKED.EXAMPLE.')
+  } while (result.status === 503)
+  assert.deepEqual(result, { status: 200, body: { 'blocked.example': true, 'sub.blocked.example': true, 'other.example': false, 'notblocked.example': false, 'BLOCKED.EXAMPLE.': true } })
+})
 
 test('a person signs in through the live view; closing returns the login', async () => {
   const opened = await api('POST', '/sessions', { site })
