@@ -16,6 +16,8 @@ export async function loadBlocklists() {
     blocklist = next
   } catch (e) {
     console.error('loading blocklists:', e)
+    // With none yet, open sessions are refused: try again in a minute, not a day.
+    if (!blocklist) setTimeout(loadBlocklists, 60_000).unref()
   }
 }
 
