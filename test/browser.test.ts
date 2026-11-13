@@ -28,7 +28,7 @@ let site: { hosts: string[], start_url: string }
 before(async () => {
   openssl('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=test-ca', '-days', '1', '-keyout', 'ca.key', '-out', 'ca.pem')
   openssl('req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=portal.localhost', '-keyout', 'portal.key', '-out', 'portal.csr')
-  fs.writeFileSync(`${tmp}/san`, 'subjectAltName=DNS:portal.localhost,DNS:other.localhost,DNS:sub.portal.localhost\n')
+  fs.writeFileSync(`${tmp}/san`, 'subjectAltName=DNS:portal.localhost,DNS:other.localhost,DNS:sub.portal.localhost,DNS:public.example\n')
   openssl('x509', '-req', '-in', 'portal.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-days', '1', '-extfile', 'san', '-out', 'portal.pem')
   portal = startPortal({ key: fs.readFileSync(`${tmp}/portal.key`, 'utf8'), cert: fs.readFileSync(`${tmp}/portal.pem`, 'utf8') })
   await once(portal.server, 'listening')
@@ -37,7 +37,7 @@ before(async () => {
   const ready = new Promise<void>(r => releaseLists = r)
   lists = http.createServer(async (_req, res) => {
     await ready
-    res.end('# test threats\n\nblocked.example\n')
+    res.end('# test threats\n\nblocked.example\nother.localhost\n')
   }).listen(0, '127.0.0.1')
   await once(lists, 'listening')
   const listUrl = `http://127.0.0.1:${(lists.address() as net.AddressInfo).port}/`
@@ -59,6 +59,7 @@ let signedIn: any
 test('blocklists load without delaying ordinary sessions, then /blocked checks a domain and its parents', async () => {
   const waiting = await api('GET', '/blocked?host=blocked.example')
   assert.deepEqual(waiting, { status: 503, body: { error: 'blocklists not loaded yet' } })
+  assert.deepEqual(await api('POST', '/sessions', { site: { ...site, open: true } }), waiting)
   const ordinary = await api('POST', '/sessions', { site })
   assert.equal(ordinary.status, 201)
   await api('DELETE', `/sessions/${ordinary.body.id}`)
@@ -149,7 +150,7 @@ test("an agent works with the saved login on the site's hosts, and every request
 })
 
 test("a site's headers go with requests to start_url's origin alone, added by the proxy, never in the browser or the log", async () => {
-  const { body } = await api('POST', '/sessions', { site: { ...site, hosts: ['portal.localhost', 'other.localhost'], headers: { 'x-bot-token': 'jwt-1' } } })
+  const { body } = await api('POST', '/sessions', { site: { ...site, hosts: ['portal.localhost', 'other.localhost'], except: ['other.localhost'], headers: { 'x-bot-token': 'jwt-1' } } })
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
   const page = agent.contexts()[0].pages()[0], seen: string[] = []
   page.on('request', r => seen.push(JSON.stringify(r.headers())))
@@ -191,14 +192,16 @@ test('hosts matched by a wildcard may not reach internal addresses', async () =>
 })
 
 test("a person's own site reaches no internal address, not even by an exact host; and a session's hosts grow as hosts are allowed", async () => {
-  const own = await api('POST', '/sessions', { site: { ...site, start_url: undefined, public: true } })
-  let agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${own.body.cdp}`, { headers })
-  let res = await agent.contexts()[0].pages()[0].goto(`https://portal.localhost:${portal.port()}/`)
-  assert.equal(res!.status(), 502)
-  await agent.close()
-  await api('DELETE', `/sessions/${own.body.id}`)
+  for (const open of [false, true]) {
+    const own = await api('POST', '/sessions', { site: { ...site, start_url: undefined, public: true, open } })
+    const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${own.body.cdp}`, { headers })
+    const res = await agent.contexts()[0].pages()[0].goto(`https://portal.localhost:${portal.port()}/`)
+    assert.equal(res!.status(), 502)
+    await agent.close()
+    await api('DELETE', `/sessions/${own.body.id}`)
+  }
   const { body } = await api('POST', '/sessions', { site: { ...site, start_url: undefined } })
-  agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
+  const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${body.cdp}`, { headers })
   const page = agent.contexts()[0].pages()[0], other = `https://other.localhost:${portal.port()}/`
   assert.equal((await page.goto(other))!.status(), 403)
   assert.deepEqual((await api('PUT', `/sessions/${body.id}/hosts`, { hosts: ['portal.localhost', 'other.localhost'] })).body, { hosts: ['portal.localhost', 'other.localhost'] })
@@ -209,6 +212,42 @@ test("a person's own site reaches no internal address, not even by an exact host
   assert.equal((await api('PUT', `/sessions/${body.id}/hosts`, { hosts: ['bad host'] })).status, 400)
   await agent.close()
   await api('DELETE', `/sessions/${body.id}`)
+})
+
+test('an open sign-in reaches unlisted public hosts over https, but not threats, exceptions, IP literals or unlisted internal hosts', async () => {
+  const opened = await api('POST', '/sessions', { site: { ...site, open: true, hosts: ['portal.localhost', 'blocked.example', 'other.localhost', 'sub.denied.example'], except: ['OTHER.localhost', '*.denied.example', '*.public.example'] }, ttl_s: 60 })
+  assert.equal(opened.status, 201, 'an exact host of a non-public site keeps its intranet access')
+  const { id, cdp } = opened.body
+  const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${cdp}`, { headers })
+  const page = agent.contexts()[0].pages()[0]
+  assert.equal((await page.goto(`https://public.example:${portal.port()}/login`))!.status(), 200)
+  for (const [url, reason] of [
+    [`http://public.example:${portal.port()}/login`, 'https only'],
+    ['https://blocked.example/', 'on a blocklist'],
+    ['https://sub.blocked.example/', 'on a blocklist'],
+    ['https://BLOCKED.EXAMPLE./', 'on a blocklist'],
+    [`https://other.localhost:${portal.port()}/`, 'host not on the list'],
+    ['https://sub.denied.example/', 'host not on the list'],
+    ['https://sub.denied.example./', 'host not on the list'],
+    ['https://8.8.8.8/', 'host not on the list'],
+    ['https://[::1]/', 'host not on the list'],
+  ]) {
+    assert.equal((await page.goto(url))!.status(), 403, url)
+    assert.match(await page.textContent('body') ?? '', new RegExp(reason))
+  }
+  assert.equal((await page.goto(`https://sub.portal.localhost:${portal.port()}/`))!.status(), 502)
+  assert.match(await page.textContent('body') ?? '', /resolves only to internal addresses/)
+  assert.equal((await api('PUT', `/sessions/${id}/hosts`, { hosts: ['other.localhost', 'sub.portal.localhost'] })).status, 200)
+  assert.equal((await page.goto(`https://sub.portal.localhost:${portal.port()}/login`))!.status(), 200, 'an exact host added with PUT keeps its intranet access')
+  assert.equal((await page.goto(`https://other.localhost:${portal.port()}/`))!.status(), 403, 'PUT cannot override except')
+  assert.equal((await api('PUT', `/sessions/${id}/hosts`, { hosts: [] })).status, 200)
+  assert.equal((await page.goto(`https://sub.portal.localhost:${portal.port()}/login?removed`))!.status(), 502, 'removing an exact host cannot reuse its intranet connection')
+  await agent.close()
+  const { log } = (await api('DELETE', `/sessions/${id}`)).body
+  assert.ok(log.some((e: any) => e.url.startsWith('https://public.example:') && e.status === 200))
+  assert.equal(log.find((e: any) => e.url.startsWith('http://public.example:')).blocked, 'https only')
+  for (const host of ['blocked.example', 'sub.blocked.example']) assert.equal(log.find((e: any) => new URL(e.url).hostname === host).blocked, 'on a blocklist')
+  for (const host of ['other.localhost', 'sub.denied.example', '8.8.8.8', '[::1]']) assert.equal(log.find((e: any) => new URL(e.url).hostname === host).blocked, 'host not on the list')
 })
 
 test('malformed requests to the proxy get a 403 and are logged', async () => {

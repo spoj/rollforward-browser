@@ -4,10 +4,11 @@ import tls from 'node:tls'
 import net from 'node:net'
 import dns from 'node:dns'
 import { Duplex } from 'node:stream'
+import { isBlocked } from './blocklists.ts'
 
 // `public`, for a person's own site rather than one an admin set up: none of its hosts, exact ones included, reaches an internal
 // address, and it goes over https only.
-export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string>, public?: boolean }
+export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string>, public?: boolean, open?: boolean, except?: string[] }
 export type Entry = { t: string, method: string, url: string, status: number, dest?: string, from?: string, blocked?: string, error?: string, live?: true }
 type Target = { scheme: string, authority: string }
 
@@ -54,7 +55,8 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const secureContext = tls.createSecureContext(key)
   // One address per connection, IPv4 where the host has one, with no racing of the two: on a machine with no IPv6 route, Node's
   // happy eyeballs falls back to IPv6 whenever IPv4 is slower than 500ms, as in a page's burst of requests, and fails.
-  const agents = { 'http:': new http.Agent({ keepAlive: true, autoSelectFamily: false }), 'https:': new https.Agent({ keepAlive: true, autoSelectFamily: false }) }
+  // Separate pools: removing an exact host with PUT must not reuse its intranet connection for a public-only name.
+  const agents = [0, 1].map(() => ({ 'http:': new http.Agent({ keepAlive: true, autoSelectFamily: false }), 'https:': new https.Agent({ keepAlive: true, autoSelectFamily: false }) }))
 
   const lookup = (host: string, _opts: dns.LookupOptions, cb: (...a: any[]) => void) =>
     dns.lookup(host, { all: true }, (err, addrs) => {
@@ -72,11 +74,15 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     return URL.parse(t ? `${t.scheme}://${t.authority}${req.url}` : req.url!)
   }
 
-  const check = (req: http.IncomingMessage, url: URL | null) =>
-    !url ? 'malformed request'
-      : site.public && url.protocol !== 'https:' ? 'https only'
-      : !allowed(url.hostname) ? 'host not on the list'
-      : undefined
+  const check = (url: URL | null) => {
+    if (!url) return 'malformed request'
+    const host = url.hostname, name = host.replace(/\.$/, '')
+    if ((site.public || site.open) && url.protocol !== 'https:') return 'https only'
+    if (site.open && site.except?.some(h => h.toLowerCase() === name || h.startsWith('*.') && name.endsWith(h.slice(1).toLowerCase()))) return 'host not on the list'
+    if (site.open && isBlocked(host)) return 'on a blocklist'
+    if (net.isIP(host) || host.startsWith('[')) return exact(host) ? undefined : 'host not on the list'
+    if (!allowed(host) && !site.open) return 'host not on the list'
+  }
 
   // What the browser says of each request, as it sends it: its kind (Sec-Fetch-Dest) and the page it came from (Referer).
   const record = (req: http.IncomingMessage, url: URL | null, status: number, extra: Partial<Entry> = {}) => {
@@ -87,12 +93,12 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const upstreamOptions = (req: http.IncomingMessage, url: URL) => {
     const headers = { ...req.headers, ...(url.origin === origin && site.headers), host: url.host }
     for (const h of hopByHop) delete headers[h]
-    return { method: req.method, headers, lookup, agent: agents[url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
+    return { method: req.method, headers, lookup, agent: agents[site.public || !exact(url.hostname) ? 1 : 0][url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
   }
 
   const forward = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const url = urlOf(req)
-    const blocked = check(req, url)
+    const blocked = check(url)
     if (blocked) {
       record(req, url, 403, { blocked })
       res.writeHead(403, { 'content-type': 'text/plain' }).end(`rollforward-browser: ${blocked}: ${req.method} ${url?.href ?? req.url}\n`)
@@ -116,7 +122,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const forwardUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
     socket.on('error', () => socket.destroy())
     const url = urlOf(req)
-    const blocked = check(req, url)
+    const blocked = check(url)
     if (blocked) {
       record(req, url, 403, { blocked })
       socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n')
@@ -162,7 +168,7 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     }
     head.length ? start(head) : socket.once('data', start)
   })
-  outer.on('close', () => Object.values(agents).forEach(a => a.destroy()))
+  outer.on('close', () => agents.forEach(pool => Object.values(pool).forEach(a => a.destroy())))
   outer.listen(path)
   return outer
 }

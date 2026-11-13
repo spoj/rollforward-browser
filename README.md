@@ -1,8 +1,8 @@
 # rollforward-browser
 
-Browsers that an agent's code uses for a bounded task on one website, then throws away. One client: the [rollforward](https://github.com/spoj/rollforward) server, holding the service key.
+Browsers for an agent's bounded task on one website or a person's open sign-in, then thrown away. One client: the [rollforward](https://github.com/spoj/rollforward) server, holding the service key.
 
-Each session is a podman container with Chromium, driven over CDP (Playwright `connectOverCDP`), with Noto fonts, Chinese, Japanese and Korean included, Liberation's and Carlito, Calibri's metric twin, so pages show, print and screenshot as written. The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts and logs each request. Chromium's own calls, such as its updaters', autofill's and its leak check of the passwords people sign in with, are switched off (`browser/`), so a log holds only what the session's pages asked for.
+Each session is a podman container with Chromium, driven over CDP (Playwright `connectOverCDP`), with Noto fonts, Chinese, Japanese and Korean included, Liberation's and Carlito, Calibri's metric twin, so pages show, print and screenshot as written. The container has no network (`--network none`), its own read-only image, and its home and profile in memory (`/tmp`, tmpfs). Its only way out is a proxy in this service, reached over a unix socket: the proxy ends TLS itself (the browser accepts exactly this service's key), so it sees every request whole, keeps to the site's hosts (or public hosts for an open sign-in session) and logs each request. Chromium's own calls, such as its updaters', autofill's and its leak check of the passwords people sign in with, are switched off (`browser/`), so a log holds only what the session's pages asked for.
 
 ## Run
 
@@ -65,11 +65,13 @@ Tests: `npm test` (needs the image).
 
 ## API
 
-Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}` with a status: 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 503 (a new session while the service drains for an update), 500.
+Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}` with a status: 401, 404 (no such session, route or file), 410 (the session's ttl ran out), 503 (the blocklists aren't loaded yet, or a new session while the service drains for an update), 500.
 
-`POST /sessions` `{site: {hosts, start_url?, headers?, public?}, state?, ttl_s?}` → 201 `{id, cdp, view}` (paths on this service). After `ttl_s` (default 3600) the session closes on its own; its result waits for `DELETE`.
+`POST /sessions` `{site: {hosts, start_url?, headers?, public?, open?, except?}, state?, ttl_s?}` → 201 `{id, cdp, view}` (paths on this service). After `ttl_s` (default 3600) the session closes on its own; its result waits for `DELETE`.
 
-- `hosts`: names the browser may reach, exact (`erp.example`) or `*.example` for any name under it. Anything else gets a 403 page.
+- `hosts`: names the browser may reach, exact (`erp.example`) or `*.example` for any name under it, not the domain itself. Anything else gets a 403 page unless `open` is true. Send `hosts: []` for an open session with no explicitly allowed hosts.
+- `open: true`: a person's sign-in may reach unlisted names at public addresses, over https only, without allowing each SSO or CDN host by hand. Every request, even to a listed host, is refused with a 403 if the host or a parent domain is on a blocklist (`blocked: "on a blocklist"`). Before the first successful blocklist load, opening such a session answers 503 `{error: "blocklists not loaded yet"}`. The client should set a short `ttl_s` for a sign-in; the default is unchanged.
+- `except`: exact names or `*.example` patterns an open session must not reach (403, `blocked: "host not on the list"`), even if listed in `hosts` or later added with `PUT`. Matching is case-insensitive and ignores a trailing dot on the requested host. `except` is checked before blocklists; neither applies to non-open sessions. Listed hosts bypass neither restriction nor the https requirement; exact hosts of a non-`public` open site keep their existing intranet access.
 - Internal addresses (private, CGNAT, unique-local) are reachable only through a name listed exactly, as an intranet's are, and through none for a `public` site, a person's own rather than an admin's: a name that may not reach them and resolves only to them gets a 502. No name reaches a loopback or link-local address, or Azure's WireServer. IP literals must be listed exactly.
 - Each connection goes to one address, IPv4 where the host has one, with no racing of IPv4 against IPv6: a machine with no IPv6 route needs nothing set, where Node's own happy eyeballs would fail requests whenever IPv4 answered slowly.
 - `state`: a Playwright storageState (`{cookies, origins: [{origin, localStorage}]}`), loaded before the call returns. It lives only in the service's memory and the container's tmpfs.
@@ -78,7 +80,7 @@ Every request carries `Authorization: Bearer $BROWSER_KEY`. Errors are `{error}`
 
 `PUT /sessions/:id/hosts` `{hosts}` → 200 `{hosts}`: the session's hosts from then on, as a person allows another a page of it was refused. `POST /sessions/:id/reload` loads the newest tab again.
 
-A `public` site's requests go over https only; any other gets a 403.
+A `public` or `open` site's requests go over https only; any other gets a 403 (`blocked: "https only"`). IP literals are never allowed just by `open`: they must be in `hosts` exactly.
 
 `GET /blocked?host=a.example&host=b.example` → 200 `{"a.example": true, "b.example": false}`: whether each host or a parent domain is on a blocklist. Before the first successful load it answers 503 `{error: "blocklists not loaded yet"}`; ordinary sessions are unaffected.
 
@@ -103,7 +105,7 @@ A `public` site's requests go over https only; any other gets a 403.
 ## Notes for clients
 
 - Playwright's `page.request` / `context.request` run in the agent's own process, not in the browser: they would leave from the agent's sandbox, not through this proxy. To use the page's cookies, fetch inside the page: `page.evaluate(u => fetch(u).then(r => r.text()), url)`.
-- The proxy keeps to hosts, not to reads: whatever the session's login may do on its site, the browser may do. Every request is in `log`, with `live` when a person drove it.
+- The proxy keeps to the site's host policy, not to reads: whatever the session's login may do on its site, the browser may do. Every request is in `log`, with `live` when a person drove it.
 - Pages see a browser without passkeys: no `PublicKeyCredential`, and `navigator.credentials.get` or `create` with `publicKey` fails at once with `NotAllowedError`, as when a person cancels. A passkey needs a window of the browser's own, for Windows Hello, a security key or a phone, which a headless browser never shows, so a page asking for one, such as Microsoft's sign-in for an account that has one, would wait for good; this way it signs in another way, such as a password or an authenticator app.
 
 ## License

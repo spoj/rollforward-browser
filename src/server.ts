@@ -33,6 +33,7 @@ const close = (s: Session) => {
 }
 
 async function open(spec: any) {
+  if (spec.site.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
   const id = crypto.randomBytes(8).toString('hex')
   const s: Session = new BrowserSession(id, `${runDir}/${id}`, label, spec.site)
   sessions.set(id, s)
