@@ -3,6 +3,7 @@ import net from 'node:net'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
+import { domainToASCII } from 'node:url'
 import { BrowserSession, podman } from './browser.ts'
 import { blocklist, isBlocked, loadBlocklists } from './blocklists.ts'
 
@@ -76,7 +77,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   const { pathname, searchParams } = new URL(req.url!, 'http://x')
   if (pathname === '/blocked' && req.method === 'GET') {
     if (!blocklist) throw fail(503, 'blocklists not loaded yet')
-    return json(res, 200, Object.fromEntries(searchParams.getAll('host').map(host => [host, isBlocked(host)])))
+    return json(res, 200, Object.fromEntries(searchParams.getAll('host').map(host => [host, isBlocked(domainToASCII(host))])))
   }
   if (pathname === '/drained' && req.method === 'GET') return json(res, drainUntil && (!sessions.size || Date.now() > drainUntil) ? 200 : 503, { open: sessions.size })
   if (pathname === '/sessions' && req.method === 'POST' && drainUntil) throw fail(503, 'updating: try again in a few minutes')

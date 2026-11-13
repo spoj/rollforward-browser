@@ -39,7 +39,7 @@ before(async () => {
   const ready = new Promise<void>(r => releaseLists = r)
   lists = http.createServer(async (_req, res) => {
     await ready
-    res.end('# test threats\n\nblocked.example\nother.localhost\n')
+    res.end('# test threats\n\nblocked.example\nother.localhost\nxn--bcher-kva.example\n')
   }).listen(0, '127.0.0.1')
   await once(lists, 'listening')
   const listUrl = `http://127.0.0.1:${(lists.address() as net.AddressInfo).port}/`
@@ -58,7 +58,7 @@ const leftovers = () => execFileSync('podman', ['ps', '-a', '-q', '--filter', `l
 
 let signedIn: any
 
-test('blocklists load without delaying ordinary sessions, then /blocked checks a domain and its parents', async () => {
+test('blocklists load without delaying ordinary sessions, then /blocked checks a domain and its parents, an IDN as the proxy sees it', async () => {
   const waiting = await api('GET', '/blocked?host=blocked.example')
   assert.deepEqual(waiting, { status: 503, body: { error: 'blocklists not loaded yet' } })
   assert.deepEqual(await api('POST', '/sessions', { site: { ...site, open: true } }), waiting)
@@ -69,9 +69,9 @@ test('blocklists load without delaying ordinary sessions, then /blocked checks a
   let result
   do {
     await new Promise(r => setTimeout(r, 20))
-    result = await api('GET', '/blocked?host=blocked.example&host=sub.blocked.example&host=other.example&host=notblocked.example&host=BLOCKED.EXAMPLE.')
+    result = await api('GET', '/blocked?host=blocked.example&host=sub.blocked.example&host=other.example&host=notblocked.example&host=BLOCKED.EXAMPLE.&host=sub.bücher.example')
   } while (result.status === 503)
-  assert.deepEqual(result, { status: 200, body: { 'blocked.example': true, 'sub.blocked.example': true, 'other.example': false, 'notblocked.example': false, 'BLOCKED.EXAMPLE.': true } })
+  assert.deepEqual(result, { status: 200, body: { 'blocked.example': true, 'sub.blocked.example': true, 'other.example': false, 'notblocked.example': false, 'BLOCKED.EXAMPLE.': true, 'sub.bücher.example': true } })
 })
 
 test('a person signs in through the live view; closing returns the login', async () => {

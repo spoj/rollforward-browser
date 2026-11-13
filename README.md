@@ -85,7 +85,7 @@ Every request carries `Authorization: Bearer <client-key>`. Sessions belong to t
 
 A `public` or `open` site's requests go over https only; any other gets a 403 (`blocked: "https only"`). IP literals are never allowed just by `open`: they must be in `hosts` exactly.
 
-`GET /blocked?host=a.example&host=b.example` → 200 `{"a.example": true, "b.example": false}`: whether each host or a parent domain is on a blocklist. Before the first successful load it answers 503 `{error: "blocklists not loaded yet"}`; ordinary sessions are unaffected.
+`GET /blocked?host=a.example&host=b.example` → 200 `{"a.example": true, "b.example": false}`: whether each host or a parent domain is on a blocklist, an IDN by its punycode, as the proxy sees it. Before the first successful load it answers 503 `{error: "blocklists not loaded yet"}`; ordinary sessions are unaffected.
 
 `GET /sessions` → `[{id, expires, closed}]`: only this client's sessions, including those past their ttl until collected. A client may collect these at startup without disturbing another's.
 
