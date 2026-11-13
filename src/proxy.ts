@@ -85,10 +85,10 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
     }
   }
 
-  const lookup = (host: string, _opts: dns.LookupOptions, cb: (...a: any[]) => void) =>
+  const lookup = (strict: boolean) => (host: string, _opts: dns.LookupOptions, cb: (...a: any[]) => void) =>
     dns.lookup(host, { all: true }, (err, addrs) => {
       if (err) return cb(err)
-      const strict = site.public || !exact(host), ok = addrs.filter(a => !(strict ? isInternal : isNever)(a.address, a.family))
+      const ok = addrs.filter(a => !(strict ? isInternal : isNever)(a.address, a.family))
       if (!ok.length) return cb(new Error(`${host} resolves only to ${strict ? 'internal' : 'loopback, link-local or WireServer'} addresses`))
       const one = ok.find(a => a.family === 4) ?? ok[0]
       cb(null, one.address, one.family)
@@ -122,7 +122,9 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
   const upstreamOptions = (req: http.IncomingMessage, url: URL) => {
     const headers = { ...req.headers, ...(url.origin === origin && site.headers), host: url.host }
     for (const h of hopByHop) delete headers[h]
-    return { method: req.method, headers, lookup, agent: agents[via(url.hostname) ? 2 : site.public || !exact(url.hostname) ? 1 : 0][url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
+    // Decided once, so a PUT while the name resolves can't leave an intranet connection in the pool of names that may not have one.
+    const strict = !!site.public || !exact(url.hostname)
+    return { method: req.method, headers, lookup: lookup(strict), agent: agents[via(url.hostname) ? 2 : strict ? 1 : 0][url.protocol as 'http:'], servername: net.isIP(url.hostname) ? undefined : url.hostname }
   }
 
   const forward = (req: http.IncomingMessage, res: http.ServerResponse) => {
