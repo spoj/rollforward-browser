@@ -35,7 +35,7 @@ const fail = (status: number, message: string) => Object.assign(new Error(messag
 const json = (res: http.ServerResponse, status: number, body: unknown) =>
   res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
 const body = async (req: http.IncomingMessage) => Buffer.concat(await req.toArray())
-const names = (list: unknown) => Array.isArray(list) && list.every(h => typeof h === 'string' && /^(\*\.)?[a-z0-9_-]+(\.[a-z0-9_-]+)*$|^\[[0-9a-f:.]+\]$/i.test(h))
+const names = (list: unknown) => Array.isArray(list) && list.every(h => typeof h === 'string' && /^(\*\.)?[a-z0-9_.-]+$|^\[[0-9a-f:.]+\]$/i.test(h))
 const close = (s: Session) => {
   clearTimeout(s.timer)
   return s.closing ??= s.close()
