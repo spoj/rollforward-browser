@@ -18,6 +18,14 @@ test('each client sees, uses and collects only its own sessions, including close
   await Promise.race([once(service.stdout!, 'data'), once(service, 'exit').then(() => { throw new Error('service exited') })])
   assert.equal((await api('ignored', 'GET', '/sessions')).status, 401)
   assert.equal((await api('bad', 'GET', '/sessions')).status, 401)
+  for (const raw of [
+    'GET //: HTTP/1.1\r\nhost: localhost\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n',
+    `GET //: HTTP/1.1\r\nhost: localhost\r\nconnection: upgrade\r\nupgrade: websocket\r\nauthorization: Bearer ${keys[0]}\r\n\r\n`,
+  ]) {
+    const socket = net.connect(port, '127.0.0.1')
+    socket.write(raw)
+    assert.match(Buffer.concat(await socket.toArray()).toString(), /^HTTP\/1\.1 404 Not Found/)
+  }
   const opened = await Promise.all(keys.map(key => api(key, 'POST', '/sessions', { site: { hosts: [] } })))
   for (const result of opened) assert.equal(result.status, 201)
   for (const [i, key] of keys.entries()) {

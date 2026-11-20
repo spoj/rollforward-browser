@@ -74,7 +74,9 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   const hash = crypto.hash('sha256', req.headers.authorization ?? '', 'buffer')
   const client = clients.find(c => crypto.timingSafeEqual(c.hash, hash))
   if (!client) throw fail(401, 'bad key')
-  const { pathname, searchParams } = new URL(req.url!, 'http://x')
+  const url = URL.parse(req.url!, 'http://x')
+  if (!url) throw fail(400, 'invalid url')
+  const { pathname, searchParams } = url
   if (pathname === '/blocked' && req.method === 'GET') {
     if (!blocklist) throw fail(503, 'blocklists not loaded yet')
     return json(res, 200, Object.fromEntries(searchParams.getAll('host').map(host => [host, isBlocked(domainToASCII(host))])))
@@ -120,7 +122,8 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   throw fail(404, 'no such route')
 }
 
-const server = http.createServer((req, res) => route(req, res).catch(e => json(res, e.status ?? 500, { error: e.message })))
+const server = http.createServer((req, res) => route(req, res).catch(e =>
+  res.headersSent || res.destroyed ? res.destroy() : json(res, e.status ?? 500, { error: e.message })))
 
 // What a watcher may ask of the browser: its tabs, and a screencast of one.
 const WATCH = new Set(['Target.setDiscoverTargets', 'Target.attachToTarget', 'Target.detachFromTarget', 'Page.startScreencast', 'Page.stopScreencast', 'Page.screencastFrameAck'])
@@ -134,6 +137,7 @@ function watchOnly(socket: net.Socket, up: net.Socket, head: Buffer) {
   const take = (chunk: Buffer) => {
     buf = Buffer.concat([buf, chunk])
     for (;;) {
+      if (buf.length < 2) return
       const n = buf[1] & 0x7f, at = n === 126 ? 4 : n === 127 ? 10 : 2
       if (buf.length < at + 4) return
       const len = n === 126 ? buf.readUInt16BE(2) : n === 127 ? Number(buf.readBigUInt64BE(2)) : n
@@ -160,13 +164,15 @@ function watchOnly(socket: net.Socket, up: net.Socket, head: Buffer) {
 // only what watching asks.
 server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
   socket.on('error', () => socket.destroy())
-  const [, id, rest] = new URL(req.url!, 'http://x').pathname.match(/^\/sessions\/([^/]+)(\/cdp|\/view\/watch|\/view\/drive)$/) ?? []
-  const s = sessions.get(id)
   const hash = crypto.hash('sha256', req.headers.authorization ?? '', 'buffer')
   const client = clients.find(c => crypto.timingSafeEqual(c.hash, hash))
+  const url = client ? URL.parse(req.url!, 'http://x') : null
+  const [, id, rest] = url?.pathname.match(/^\/sessions\/([^/]+)(\/cdp|\/view\/watch|\/view\/drive)$/) ?? []
+  const s = id ? sessions.get(id) : undefined
   if (!client || !s || s.client !== client.name || s.closing) return socket.end('HTTP/1.1 404 Not Found\r\nconnection: close\r\n\r\n')
   const up = net.connect(s.cdpSocket)
   up.on('error', () => socket.destroy())
+  socket.on('close', () => up.destroy())
   const headers: Record<string, unknown> = { ...req.headers, host: 'localhost' }
   delete headers.authorization
   delete headers.origin
