@@ -911,38 +911,57 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Page.navigate' || rawMethod === 'Target.createTarget') {
       capture = true
       const rawUrl = typeof params.url === 'string' ? params.url : ''
+      const stripControls = (s: string) => s.replace(/[\u0000-\u001f]+/g, '')
+      const extractCanonicalAuthority = (rawTarget: string, parsedHost: string): { canonical: boolean; rawAuthority: string } => {
+        const m = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]+)(?:[/?#]|$)/i.exec(rawTarget)
+        if (!m) return { canonical: false, rawAuthority: '' }
+        const auth = m[1]
+        const at = auth.lastIndexOf('@')
+        const hostPort = at >= 0 ? auth.slice(at + 1) : auth
+        const rawHost = hostPort.startsWith('[')
+          ? hostPort.slice(0, hostPort.indexOf(']') + 1)
+          : hostPort.split(':')[0]
+        return {
+          canonical: rawHost.length > 0 && rawHost.toLowerCase() === parsedHost.toLowerCase(),
+          rawAuthority: auth,
+        }
+      }
+
       // Linear O(N) C0/space trim + WHATWG C0/tab/newline strip (exact original case preserved!)
       let uStart = 0
       let uEnd = rawUrl.length
       while (uStart < uEnd && rawUrl.charCodeAt(uStart) <= 0x20) uStart++
       while (uEnd > uStart && rawUrl.charCodeAt(uEnd - 1) <= 0x20) uEnd--
       const trimmedUrl = rawUrl.slice(uStart, uEnd)
-      const strippedUrl = trimmedUrl.replace(/[\u0000-\u001f]+/g, '')
+      const strippedUrl = stripControls(trimmedUrl)
 
-      // Unified pre-lowercasing vault check on BOTH complete original rawUrl AND control-stripped strippedUrl
-      const rawHitCount = vault ? vault.scrub(rawUrl).count : 0
-      const strippedHitCount = vault && strippedUrl !== rawUrl ? vault.scrub(strippedUrl).count : 0
-      const preHitCount = Math.max(rawHitCount, strippedHitCount)
+      // Unified pre-lowercasing vault check on complete rawUrl + distinct hits revealed by control stripping
+      const rawScrub = vault ? vault.scrub(rawUrl) : { text: rawUrl, count: 0 }
+      const strippedAfterRaw = vault ? vault.scrub(stripControls(rawScrub.text)) : { text: strippedUrl, count: 0 }
+      const strippedOnlyCount = vault && strippedUrl !== rawUrl ? vault.scrub(strippedUrl).count : 0
+      const preHitCount = Math.max(rawScrub.count + strippedAfterRaw.count, strippedOnlyCount)
 
       let navUrl: string
       let extra: Record<string, unknown> = {}
-      let finalScrubNeeded = true
 
       if (/^https?:/i.test(strippedUrl)) {
         const scheme = /^https:/i.test(strippedUrl) ? 'https:' : 'http:'
+        const parsed = URL.parse(strippedUrl)
         const san = sanitizeUrl(strippedUrl, { projection: this.opts.projection, vault })
-        let authVaultHit = false
-        if (vault && preHitCount > 0) {
-          const strippedAuth = /^https?:\/\/([^/?#\\]*)/i.exec(strippedUrl)
-          const rawAuth = /^https?:\/\/([^/?#\\]*)/i.exec(trimmedUrl)
-          if (!strippedAuth || vault.scrub(strippedAuth[1]).count > 0 || (rawAuth && vault.scrub(rawAuth[1]).count > 0)) {
-            authVaultHit = true
-          }
-        }
-        if (preHitCount > 0 && (authVaultHit || san.vaultRedactions < preHitCount)) {
+        const parsedHost = parsed?.hostname ?? ''
+        const canonStripped = parsed ? extractCanonicalAuthority(strippedUrl, parsedHost) : { canonical: false, rawAuthority: '' }
+        const canonTrimmed = parsed ? extractCanonicalAuthority(trimmedUrl, parsedHost) : { canonical: false, rawAuthority: '' }
+        const canonicalHostMatch = canonStripped.canonical && canonTrimmed.canonical
+        const hostVaultHit = Boolean(
+          vault && (
+            (parsedHost && vault.scrub(parsedHost).count > 0) ||
+            (canonStripped.rawAuthority && vault.scrub(canonStripped.rawAuthority).count > 0) ||
+            (canonTrimmed.rawAuthority && vault.scrub(canonTrimmed.rawAuthority).count > 0)
+          ),
+        )
+        if (hostVaultHit || (preHitCount > 0 && (!canonicalHostMatch || san.vaultRedactions < preHitCount))) {
           navUrl = `${scheme}//[REDACTED]`
-          vaultRedactions += Math.max(san.vaultRedactions, preHitCount)
-          finalScrubNeeded = false
+          vaultRedactions += Math.max(san.vaultRedactions, preHitCount, hostVaultHit ? 1 : 0)
         } else {
           navUrl = san.url
           vaultRedactions += san.vaultRedactions
@@ -955,15 +974,12 @@ export class CdpSessionTap {
           const scheme = /^vbscript:/i.test(strippedUrl) ? 'vbscript' : 'javascript'
           navUrl = `${scheme}:[REDACTED]`
           extra = { exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
-          finalScrubNeeded = false
         } else if (/^about:(?:blank|srcdoc)$/i.test(strippedUrl)) {
           navUrl = preHitCount > 0 ? 'about:[REDACTED]' : strippedUrl.toLowerCase()
-          if (preHitCount > 0) finalScrubNeeded = false
         } else if (/^data:/i.test(strippedUrl)) {
           severity = 'high'
           if (preHitCount > 0) {
             navUrl = `data:[REDACTED];len=${Buffer.byteLength(rawUrl, 'utf8')}`
-            finalScrubNeeded = false
           } else {
             const comma = strippedUrl.indexOf(',')
             const rawMeta = (comma >= 0 ? strippedUrl.slice(5, comma) : strippedUrl.slice(5)).split(';')[0].trim()
@@ -973,7 +989,6 @@ export class CdpSessionTap {
         } else if (/^blob:/i.test(strippedUrl)) {
           if (preHitCount > 0) {
             navUrl = 'blob:[REDACTED]'
-            finalScrubNeeded = false
           } else {
             const rawInner = strippedUrl.slice(5)
             const inner = URL.parse(rawInner)
@@ -986,21 +1001,9 @@ export class CdpSessionTap {
               if (originScrub.count > 0) {
                 vaultRedactions += originScrub.count
                 navUrl = 'blob:[REDACTED]'
-                finalScrubNeeded = false
               } else {
-                // Require canonical scheme://[userinfo@]host[:port] followed by /, ?, #, or end (rejects `\` like http:\host or app.example\item)
-                const canon = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]+)(?:[/?#]|$)/i.exec(rawInner)
-                let hostMatches = false
-                if (canon) {
-                  const auth = canon[1]
-                  const at = auth.lastIndexOf('@')
-                  const hostPort = at >= 0 ? auth.slice(at + 1) : auth
-                  const rawHost = hostPort.startsWith('[')
-                    ? hostPort.slice(0, hostPort.indexOf(']') + 1)
-                    : hostPort.split(':')[0]
-                  hostMatches = rawHost.length > 0 && rawHost.toLowerCase() === inner.hostname.toLowerCase()
-                }
-                navUrl = hostMatches ? `blob:${inner.origin}` : 'blob:[REDACTED]'
+                const canon = extractCanonicalAuthority(rawInner, inner.hostname)
+                navUrl = canon.canonical ? `blob:${inner.origin}` : 'blob:[REDACTED]'
               }
             }
           }
@@ -1010,18 +1013,20 @@ export class CdpSessionTap {
           const SAFE_KNOWN_SCHEMES = new Set(['file', 'mailto', 'tel', 'ftp', 'ws', 'wss', 'chrome', 'edge', 'about'])
           if (preHitCount > 0) {
             navUrl = SAFE_KNOWN_SCHEMES.has(rawScheme) ? `${rawScheme}:[REDACTED]` : '[REDACTED]'
-            finalScrubNeeded = false
           } else {
             navUrl = `${rawScheme}:[REDACTED]`
           }
           extra = { len: Buffer.byteLength(rawUrl, 'utf8') }
         }
       }
-      if (vault && finalScrubNeeded) {
-        const sc = vault.scrub(navUrl)
-        if (sc.count > 0) {
-          vaultRedactions += sc.count
-          navUrl = sc.text
+      // Unconditional single exit gate: NO emitted summary can ever contain a vault value after normalization/lowercasing!
+      if (vault) {
+        const finalCheck = vault.scrub(navUrl)
+        if (finalCheck.count > 0) {
+          vaultRedactions += finalCheck.count
+          navUrl = navUrl.endsWith(':[REDACTED]') || navUrl.endsWith('//[REDACTED]')
+            ? '[REDACTED]'
+            : finalCheck.text
         }
       }
       summary = { url: navUrl, ...extra }
