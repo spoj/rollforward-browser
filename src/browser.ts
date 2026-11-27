@@ -2,12 +2,66 @@ import { execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
-import type { Server } from 'node:net'
 import { chromium, type Browser, type Page } from 'playwright-core'
-import { startProxy, type Entry, type Site } from './proxy.ts'
+import { CdpSessionTap, type CdpEntry } from './cdp-tap.ts'
+import {
+  InFlightBudgetTracker,
+  startProxy,
+  toLegacyLog,
+  type AuditV2Config,
+  type LogRecord,
+  type PolicyHookConfig,
+  type ProxyServer,
+  type Site,
+  type V2Entry,
+} from './proxy.ts'
+import { SecretVault, sanitizeUrl, scrubText } from './redact.ts'
 
-export type AuditShot = { seq: number, at: string, url: string, jpeg: Buffer }
-const MAX_SHOTS = 60, SHOT_SETTLE_MS = 600, SHOT_MIN_INTERVAL_MS = 2500
+export type ShotTrigger = 'nav' | 'load' | 'write' | 'download' | 'tab' | 'file-upload'
+
+export type AuditShot = {
+  seq: number
+  at: string
+  url: string
+  trigger: ShotTrigger
+  httpCursor: number
+  cdpCursor: number
+  jpeg: Buffer
+}
+
+export type HudEvent = {
+  n: number
+  t: string
+  kind: 'http' | 'cdp' | 'live_start' | 'live_end'
+  method?: string
+  status?: number
+  blocked?: string
+  isWrite?: boolean
+  severity?: 'high'
+  detail: string
+}
+
+export type SealSnapshot = {
+  sealed: true
+  state: unknown
+  logCursor: number
+  cdpCursor: number
+  shotCursor: number
+  gaps: {
+    droppedGets: number
+    droppedCdp: number
+    droppedShots: number
+    refusedFull: number
+  }
+}
+
+const MAX_SHOTS = 60
+const SHOT_SETTLE_MS = 500
+const SHOT_MIN_INTERVAL_MS = 1_500
+const SHOT_BG_WRITE_INTERVAL_MS = 10_000
+const MAX_SHOTS_PAGE_BYTES = 8 * 1024 * 1024
+const LIVE_COOLDOWN_MS = 5_000
+const MAX_HUD_EVENTS = 100
 
 const pem = execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=rollforward-browser', '-days', '3650', '-keyout', '-', '-out', '-'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString()
 const tlsKey = { key: pem.slice(0, pem.indexOf('-----BEGIN CERTIFICATE')), cert: pem.slice(pem.indexOf('-----BEGIN CERTIFICATE')) }
@@ -36,53 +90,208 @@ const cdpVersion = (sock: string) => new Promise<string>((resolve, reject) =>
     res.on('data', c => body += c).on('end', () => resolve(new URL(JSON.parse(body).webSocketDebuggerUrl).pathname))
   }).on('error', reject))
 
+export type BrowserSessionOptions = {
+  auditV2?: AuditV2Config
+  inFlightTracker?: InFlightBudgetTracker
+  clientId?: string
+  policyHook?: PolicyHookConfig
+}
+
 export class BrowserSession {
-  log: Entry[] = []
+  log: LogRecord[] = []
   shots: AuditShot[] = []
   shotSeq = 0
+  shotsDropped = 0
   drivers = 0
   driverGen = 0
+  lastDriverEndedAt = 0
+  siteConfigRev = 0
   wsPath = ''
-  proxy?: Server
+  proxy?: ProxyServer
   pw?: Browser
   id: string
   dir: string
   label: string
   site: Site
   audit: boolean
+  auditV2?: AuditV2Config
   cdpSocket: string
   container: string
+  internalNonce: string
+  vault: SecretVault
+  cdpTap?: CdpSessionTap
+  sealedAt?: number
+
+  private opts: BrowserSessionOptions
   private lastShotAt = 0
   private lastJpeg?: Buffer
   private shotTimer?: NodeJS.Timeout
   private shotPage?: Page
+  private shotTrigger: ShotTrigger = 'nav'
   private shotGen = 0
   private frameGen = 0
   private taintedPages = new WeakSet<Page>()
-  private pwCheck?: Promise<{ blocked: boolean, sig: string }>
+  private pwCheck?: Promise<{ blocked: boolean; sig: string }>
   private capturing = false
   private pendingShot = false
   private stopped = false
+  private sealPromise?: Promise<SealSnapshot>
+  private sealedSnapshot?: SealSnapshot
+  private stateBytes = 0
 
-  constructor(id: string, dir: string, label: string, site: Site, audit = false) {
+  // B1 Activity HUD ring buffer (100 entries)
+  private hudEvents: HudEvent[] = []
+  private hudCursor = 0
+  private hudDropped = 0
+  private hudWriteCount = 0
+  private hudBlockedCount = 0
+
+  constructor(id: string, dir: string, label: string, site: Site, audit = false, opts: BrowserSessionOptions = {}) {
     this.id = id
     this.dir = dir
     this.label = label
     this.site = site
     this.audit = audit
+    this.auditV2 = opts.auditV2
+    this.opts = opts
     this.cdpSocket = `${dir}/cdp.sock`
     this.container = `rollforward-browser-${id}`
+    this.internalNonce = crypto.randomBytes(16).toString('hex')
+    this.vault = new SecretVault()
+
+    if (site.headers) {
+      for (const val of Object.values(site.headers)) {
+        this.vault.addTrustedHeader(val)
+      }
+    }
+
+    if (this.auditV2 && this.auditV2.cdp !== false) {
+      this.cdpTap = new CdpSessionTap({
+        projection: this.auditV2.projection ?? 'semantic',
+        vault: this.vault,
+        isLive: () => this.isLiveOrCooldown(),
+        onEvent: e => this.recordHudCdp(e),
+        onFileUpload: () => this.scheduleShot(undefined, 'file-upload'),
+      })
+    }
+  }
+
+  isLiveOrCooldown(): boolean {
+    return this.drivers > 0 || (this.lastDriverEndedAt > 0 && Date.now() - this.lastDriverEndedAt < LIVE_COOLDOWN_MS)
+  }
+
+  verifyInternalNonce(headerVal: string | string[] | undefined): boolean {
+    if (typeof headerVal !== 'string') return false
+    const a = Buffer.from(headerVal, 'utf8')
+    const b = Buffer.from(this.internalNonce, 'utf8')
+    return a.length === b.length && crypto.timingSafeEqual(a, b)
+  }
+
+  private pushHudEvent(ev: Omit<HudEvent, 'n'>) {
+    if (!this.auditV2 || this.auditV2.hud === false) return
+    const item: HudEvent = { n: ++this.hudCursor, ...ev }
+    this.hudEvents.push(item)
+    if (this.hudEvents.length > MAX_HUD_EVENTS) {
+      this.hudEvents.shift()
+      this.hudDropped++
+    }
+  }
+
+  private recordHudHttp(rec: LogRecord) {
+    if (!this.auditV2 || this.auditV2.hud === false) return
+    const r = rec as any
+    if (r.rec === '_summary' || r.rec === 'http_end') return
+    // Suppress live-period details at insertion (§4)
+    if (this.drivers > 0 || r.live) return
+    const e = rec as V2Entry
+    if (e.isWrite) this.hudWriteCount++
+    if (e.blocked) this.hudBlockedCount++
+    const rawDetail = e.authority ? `${e.authority}${e.path}` : e.path || '/'
+    const detail = scrubText(rawDetail.slice(0, 160), this.vault).text
+    this.pushHudEvent({
+      t: e.t,
+      kind: 'http',
+      method: e.effectiveMethod ?? e.method,
+      status: e.status,
+      ...(e.blocked && { blocked: e.blocked }),
+      ...(e.isWrite && { isWrite: true }),
+      detail,
+    })
+  }
+
+  private recordHudCdp(entry: CdpEntry) {
+    if (!this.auditV2 || this.auditV2.hud === false) return
+    if (this.drivers > 0 || entry.live) return
+    let hostPath = ''
+    if (typeof entry.summary?.url === 'string') {
+      const parsed = URL.parse(entry.summary.url)
+      if (parsed) {
+        const san = sanitizeUrl(parsed, { projection: 'semantic', vault: this.vault })
+        hostPath = ` ${san.authority}${san.path}`
+      }
+    }
+    const detail = scrubText(`${entry.method}${hostPath}`.slice(0, 160), this.vault).text
+    this.pushHudEvent({
+      t: entry.t,
+      kind: 'cdp',
+      method: entry.method,
+      ...(entry.severity && { severity: entry.severity }),
+      detail,
+    })
+  }
+
+  getActivity(after: number) {
+    const oldestCursor = this.hudEvents.length ? this.hudEvents[0].n : this.hudCursor
+    const events = this.hudEvents.filter(e => e.n > after)
+    const nextCursor = events.length ? events[events.length - 1].n : Math.max(after, oldestCursor)
+    return {
+      live: this.drivers > 0,
+      oldestCursor,
+      nextCursor,
+      dropped: this.hudDropped,
+      writeCount: this.hudWriteCount,
+      blockedCount: this.hudBlockedCount,
+      events,
+    }
   }
 
   async start(state: unknown, cdpUrl: string, headers: Record<string, string>) {
+    if (state) this.vault.ingestStorageState(state)
     fs.mkdirSync(this.dir, { mode: 0o700 })
-    this.proxy = startProxy(`${this.dir}/proxy.sock`, this.site, tlsKey, () => this.drivers > 0, this.log, this.audit ? () => this.scheduleShot() : undefined, () => this.driverGen)
+    const proxyOpts = this.auditV2 || this.opts.policyHook
+      ? {
+          sessionId: this.id,
+          clientId: this.opts.clientId ?? 'default',
+          auditV2: this.auditV2,
+          vault: this.vault,
+          policyHook: this.opts.policyHook,
+          getSiteConfigRev: () => this.siteConfigRev,
+          getCdpCursor: () => this.cdpTap?.currentCursor ?? 0,
+          isLiveOrCooldown: () => this.isLiveOrCooldown(),
+          onEntry: (entry: LogRecord) => this.recordHudHttp(entry),
+          onWriteDetail: this.audit ? ({ dest }: { dest?: string }) => this.scheduleShot(undefined, 'write', dest === 'empty') : undefined,
+          inFlightTracker: this.opts.inFlightTracker,
+        }
+      : undefined
+    this.proxy = startProxy(
+      `${this.dir}/proxy.sock`,
+      this.site,
+      tlsKey,
+      () => this.drivers > 0,
+      this.log,
+      this.audit ? () => this.scheduleShot(undefined, 'write', false) : undefined,
+      () => this.driverGen,
+      proxyOpts,
+    )
     await podman(['run', '-d', '--rm', '--name', this.container, '--label', this.label, ...containerFlags, '-v', `${this.dir}:/run/rollforward-browser`, 'rollforward-browser', spki])
     for (let i = 0; !this.wsPath; i++) {
       this.wsPath = await cdpVersion(this.cdpSocket).catch(e => { if (i === 100) throw e; return '' })
       if (!this.wsPath) await new Promise(r => setTimeout(r, 100))
     }
-    this.pw = await chromium.connectOverCDP(cdpUrl, { headers, noDefaults: true })
+    this.pw = await chromium.connectOverCDP(cdpUrl, {
+      headers: { ...headers, 'x-rf-internal': this.internalNonce },
+      noDefaults: true,
+    })
     const ctx = this.pw.contexts()[0]
     await ctx.addInitScript(noPasskeys)
     if (state) await ctx.setStorageState(state as any)
@@ -90,14 +299,20 @@ export class BrowserSession {
       const watch = (p: Page) => {
         p.on('frameattached', () => { this.frameGen++ })
         p.on('framedetached', () => { this.frameGen++ })
-        p.on('framenavigated', () => { this.frameGen++; this.scheduleShot(p) })
-        p.on('load', () => { if (this.drivers === 0) this.taintedPages.delete(p) })
-        p.on('download', () => this.scheduleShot(p))
+        p.on('framenavigated', f => {
+          this.frameGen++
+          if (f === p.mainFrame()) this.scheduleShot(p, 'nav')
+        })
+        p.on('load', () => {
+          if (this.drivers === 0) this.taintedPages.delete(p)
+          this.scheduleShot(p, 'load')
+        })
+        p.on('download', () => this.scheduleShot(p, 'download'))
       }
       ctx.on('page', p => {
         if (this.drivers > 0) this.taintedPages.add(p)
         watch(p)
-        this.scheduleShot(p)
+        this.scheduleShot(p, 'tab')
       })
       for (const p of ctx.pages()) watch(p)
     }
@@ -109,6 +324,7 @@ export class BrowserSession {
   }
 
   onDriverStart() {
+    const wasIdle = this.drivers === 0
     this.drivers++
     this.driverGen++
     this.taintOpenPages()
@@ -116,20 +332,29 @@ export class BrowserSession {
     this.shotTimer = undefined
     this.shotPage = undefined
     this.pendingShot = false
+    if (wasIdle) {
+      this.pushHudEvent({ t: new Date().toISOString(), kind: 'live_start', detail: 'Human took control' })
+    }
   }
 
   onDriverEnd() {
     this.taintOpenPages()
     this.drivers = Math.max(0, this.drivers - 1)
     this.driverGen++
+    this.lastDriverEndedAt = Date.now()
+    if (this.drivers === 0) {
+      this.pushHudEvent({ t: new Date().toISOString(), kind: 'live_end', detail: 'Control returned' })
+    }
   }
 
-  private scheduleShot(page?: Page) {
+  private scheduleShot(page?: Page, trigger: ShotTrigger = 'nav', bgWrite = false) {
     if (!this.audit || this.stopped || this.drivers > 0) return
     if (page) this.shotPage = page
+    this.shotTrigger = trigger
     this.shotGen = this.driverGen
     if (this.shotTimer) return
-    const delay = Math.max(SHOT_SETTLE_MS, SHOT_MIN_INTERVAL_MS - (Date.now() - this.lastShotAt))
+    const minInterval = bgWrite ? SHOT_BG_WRITE_INTERVAL_MS : SHOT_MIN_INTERVAL_MS
+    const delay = Math.max(SHOT_SETTLE_MS, minInterval - (Date.now() - this.lastShotAt))
     this.shotTimer = setTimeout(() => {
       this.shotTimer = undefined
       void this.captureAudit()
@@ -138,7 +363,7 @@ export class BrowserSession {
   }
 
   // Fail closed: blocked if any frame (including open shadow roots) has a visible password field, any DOM/attribute mutation occurs during capture, throws, stalls past 1s, or a prior check is still stalled.
-  private async hasVisiblePassword(p: Page, arm = false): Promise<{ blocked: boolean, sig: string }> {
+  private async hasVisiblePassword(p: Page, arm = false): Promise<{ blocked: boolean; sig: string }> {
     if (this.pwCheck) return { blocked: true, sig: '' }
     const run = Promise.all(p.frames().map(f => f.evaluate((doArm: boolean) => {
       const w = globalThis as Record<string, any>
@@ -190,7 +415,7 @@ export class BrowserSession {
     let t: NodeJS.Timeout | undefined
     return Promise.race([
       run,
-      new Promise<{ blocked: boolean, sig: string }>(r => { t = setTimeout(() => r({ blocked: true, sig: '' }), 1000); t.unref?.() }),
+      new Promise<{ blocked: boolean; sig: string }>(r => { t = setTimeout(() => r({ blocked: true, sig: '' }), 1000); t.unref?.() }),
     ]).finally(() => clearTimeout(t))
   }
 
@@ -200,6 +425,7 @@ export class BrowserSession {
     this.capturing = true
     try {
       const gen = this.shotGen
+      const trigger = this.shotTrigger
       const pages = this.pw.contexts()[0]?.pages() ?? []
       const p = (this.shotPage && !this.shotPage.isClosed() && pages.includes(this.shotPage)) ? this.shotPage : pages.at(-1)
       this.shotPage = undefined
@@ -217,34 +443,139 @@ export class BrowserSession {
       this.lastShotAt = Date.now()
       if (this.lastJpeg?.equals(jpeg)) return
       this.lastJpeg = jpeg
-      this.shots.push({ seq: ++this.shotSeq, at: new Date().toISOString(), url: urlBefore, jpeg })
-      if (this.shots.length > MAX_SHOTS) this.shots.shift()
+      const sanUrl = this.auditV2 ? sanitizeUrl(urlBefore, { projection: this.auditV2.projection ?? 'semantic', vault: this.vault }).url : urlBefore
+      this.shots.push({
+        seq: ++this.shotSeq,
+        at: new Date().toISOString(),
+        url: sanUrl,
+        trigger,
+        httpCursor: this.proxy?.controller.getCurrentCursor() ?? 0,
+        cdpCursor: this.cdpTap?.currentCursor ?? 0,
+        jpeg,
+      })
+      if (this.shots.length > MAX_SHOTS) {
+        this.shots.shift()
+        this.shotsDropped++
+      }
     } catch {
       // Best-effort audit capture must never affect the browser session.
     } finally {
       this.capturing = false
       if (this.pendingShot && !this.stopped && this.drivers === 0) {
         this.pendingShot = false
-        this.scheduleShot()
+        this.scheduleShot(undefined, this.shotTrigger)
       }
     }
   }
 
-  // The browser may be gone (crashed, or closed by the agent's code): then there is no state to return.
-  async close() {
+  getShotsV2(after: number) {
+    const oldestSeq = this.shots.length ? this.shots[0].seq : this.shotSeq
+    const items: Array<{ seq: number; at: string; url: string; trigger: ShotTrigger; httpCursor: number; cdpCursor: number; jpeg: string }> = []
+    let pageBytes = 0
+    let lastIdx = -1
+
+    for (let i = 0; i < this.shots.length; i++) {
+      const s = this.shots[i]
+      if (s.seq <= after) continue
+      const b64 = s.jpeg.toString('base64')
+      const entryBytes = b64.length + 256
+      if (items.length > 0 && pageBytes + entryBytes > MAX_SHOTS_PAGE_BYTES) break
+      items.push({
+        seq: s.seq,
+        at: s.at,
+        url: s.url,
+        trigger: s.trigger,
+        httpCursor: s.httpCursor,
+        cdpCursor: s.cdpCursor,
+        jpeg: b64,
+      })
+      pageBytes += entryBytes
+      lastIdx = i
+    }
+
+    const hasMore = lastIdx >= 0 && lastIdx < this.shots.length - 1
+    const nextSeq = items.length > 0 ? items[items.length - 1].seq : Math.max(after, oldestSeq)
+    return {
+      oldestSeq,
+      nextSeq,
+      hasMore,
+      dropped: this.shotsDropped,
+      items,
+    }
+  }
+
+  getRetainedBytes(): number {
+    let total = this.proxy?.controller.getRetainedBytes() ?? 0
+    total += this.cdpTap?.getRetainedBytes() ?? 0
+    for (const s of this.shots) total += s.jpeg.length
+    total += this.stateBytes
+    return total
+  }
+
+  // Idempotent seal: freezes proxy, Chromium, state, and final cursors while retaining logs/shots for draining until DELETE/GC.
+  seal(): Promise<SealSnapshot> {
+    return (this.sealPromise ??= this.doSeal())
+  }
+
+  private async doSeal(): Promise<SealSnapshot> {
     this.stopped = true
+    this.sealedAt = Date.now()
     clearTimeout(this.shotTimer)
     this.shotTimer = undefined
+
+    let state: unknown = null
     try {
-      return { state: this.pw?.isConnected() ? await this.pw.contexts()[0].storageState() : null, log: this.log }
-    } finally {
-      this.shots = []
-      this.lastJpeg = undefined
-      await this.pw?.close()
-      await podman(['rm', '-f', '-i', '-t', '0', this.container])
+      // Stop new proxy traffic immediately
       this.proxy?.close()
+      this.proxy?.closeAllConnections?.()
+      state = this.pw?.isConnected() ? await this.pw.contexts()[0].storageState().catch(() => null) : null
+    } finally {
+      await this.pw?.close().catch(() => {})
+      await podman(['rm', '-f', '-i', '-t', '0', this.container]).catch(() => {})
       fs.rmSync(this.dir, { recursive: true, force: true })
     }
+
+    const pSnap = this.proxy?.controller.finalizeAtSeal() ?? { logCursor: 0, droppedGets: 0, refusedFull: 0 }
+    const cSnap = this.cdpTap?.seal() ?? { cdpCursor: 0, droppedCdp: 0 }
+
+    if (state) {
+      try { this.stateBytes = Buffer.byteLength(JSON.stringify(state)) } catch {}
+    }
+
+    this.sealedSnapshot = {
+      sealed: true,
+      state,
+      logCursor: pSnap.logCursor,
+      cdpCursor: cSnap.cdpCursor,
+      shotCursor: this.shotSeq,
+      gaps: {
+        droppedGets: pSnap.droppedGets,
+        droppedCdp: cSnap.droppedCdp,
+        droppedShots: this.shotsDropped,
+        refusedFull: pSnap.refusedFull,
+      },
+    }
+    return this.sealedSnapshot
+  }
+
+  reclaim() {
+    this.proxy?.controller.clear()
+    this.cdpTap?.clear()
+    this.log.length = 0
+    this.shots = []
+    this.lastJpeg = undefined
+    this.hudEvents = []
+    this.vault.clear()
+    this.stateBytes = 0
+    if (this.sealedSnapshot) this.sealedSnapshot.state = null
+  }
+
+  // Legacy close: seal + return legacy allowlisted { state, log } + reclaim memory.
+  async close() {
+    const snap = await this.seal()
+    const result = { state: snap.state, log: toLegacyLog(this.log) }
+    this.reclaim()
+    return result
   }
 
   async screenshot() {

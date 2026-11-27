@@ -115,3 +115,91 @@ test('failed attach on multiple transient popups cascades back to surviving tab 
   assert.equal(sent.at(-1).method, 'Target.attachToTarget')
   assert.equal(sent.at(-1).params.targetId, 't1', 'cascades back to surviving tab t1')
 })
+
+test('Live View HUD polls /view/activity with textContent-only DOM, suppresses on ?drive and live control, and stops permanently on 404', async () => {
+  assert.ok(!script.includes('innerHTML') && !script.includes('insertAdjacentHTML'), 'view.html script never uses innerHTML')
+
+  const makeHudBoot = (search: string, responses: Array<{ status: number; body?: any }>) => {
+    const fetched: string[] = []
+    const createdRows: any[] = []
+    let timerCb: (() => void) | null = null
+    let timerCleared = false
+    const hudClasses = new Set<string>()
+    const elements: Record<string, any> = {
+      img: { src: '', getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) },
+      url: { value: '', disabled: false },
+      tabs: { replaceChildren() {} },
+      drive: { textContent: '', hidden: false, onclick: null },
+      kb: { value: '', focus() {}, blur() {} },
+      hud: { hidden: true, classList: { toggle: (c: string, on: boolean) => on ? hudClasses.add(c) : hudClasses.delete(c) } },
+      'hud-bar': { onclick: null },
+      'hud-summary': { textContent: '' },
+      'hud-counts': { textContent: '' },
+      'hud-toggle': { textContent: 'Expand' },
+      'hud-list': { replaceChildren: (...rows: any[]) => { createdRows.length = 0; createdRows.push(...rows) } },
+    }
+    class FakeWS {
+      onopen?: () => void
+      onclose?: () => void
+      onmessage?: (e: { data: string }) => void
+      send() {}
+      close() {}
+    }
+    const ctx = vm.createContext({
+      document: {
+        title: '',
+        activeElement: null,
+        body: { classList: { toggle() {} } },
+        getElementById: (id: string) => elements[id],
+        createElement: () => ({ textContent: '', title: '', className: '', onclick: null }),
+      },
+      location: { href: `http://localhost/sessions/s1/view${search}`, search },
+      URL, URLSearchParams, WebSocket: FakeWS,
+      fetch: async (u: string) => {
+        fetched.push(u)
+        const next = responses.shift() ?? { status: 200, body: { live: false, nextCursor: 1, writeCount: 0, blockedCount: 0, dropped: 0, events: [] } }
+        return { status: next.status, ok: next.status >= 200 && next.status < 300, json: async () => next.body }
+      },
+      setTimeout: (fn: () => void) => { timerCb = fn; return 1 },
+      clearTimeout: () => { timerCleared = true; timerCb = null },
+    })
+    vm.runInContext(script, ctx)
+    const flush = () => new Promise(r => setImmediate(r))
+    return { elements, fetched, createdRows, hudClasses, flush, tick: () => { const f = timerCb; timerCb = null; f?.() }, wasCleared: () => timerCleared }
+  }
+
+  // 1. ?drive suppresses HUD completely (zero fetches)
+  const driveHud = makeHudBoot('?drive', [])
+  await driveHud.flush()
+  assert.equal(driveHud.fetched.length, 0)
+  assert.equal(driveHud.elements.hud.hidden, true)
+
+  // 2. Watching polls /view/activity, renders textContent-only rows, expands/collapses, hides while driving
+  const watchHud = makeHudBoot('?watch', [
+    { status: 200, body: { live: false, nextCursor: 2, writeCount: 1, blockedCount: 0, dropped: 0, events: [{ n: 2, t: '2026-11-27T12:00:00Z', kind: 'http', method: 'POST', status: 200, isWrite: true, detail: 'erp.example/api/<script>' }] } },
+  ])
+  await watchHud.flush()
+  await watchHud.flush()
+  assert.equal(watchHud.fetched.length, 1)
+  assert.match(watchHud.fetched[0], /\/sessions\/s1\/view\/activity\?after=0$/)
+  assert.equal(watchHud.elements.hud.hidden, false)
+  assert.equal(watchHud.createdRows.length, 1)
+  assert.match(watchHud.createdRows[0].textContent, /POST 200 erp\.example\/api\/<script>/)
+  watchHud.elements['hud-bar'].onclick()
+  assert.equal(watchHud.hudClasses.has('open'), true)
+  assert.equal(watchHud.elements['hud-toggle'].textContent, 'Collapse')
+  // Taking control hides HUD and clears timer
+  watchHud.elements.drive.onclick()
+  assert.equal(watchHud.elements.hud.hidden, true)
+  assert.equal(watchHud.wasCleared(), true)
+
+  // 3. 404 stops HUD permanently
+  const errHud = makeHudBoot('', [{ status: 404 }])
+  await errHud.flush()
+  await errHud.flush()
+  assert.equal(errHud.fetched.length, 1)
+  assert.equal(errHud.elements.hud.hidden, true)
+  errHud.tick()
+  await errHud.flush()
+  assert.equal(errHud.fetched.length, 1, 'never polls again after 404')
+})

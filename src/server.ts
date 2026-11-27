@@ -4,11 +4,19 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import { domainToASCII } from 'node:url'
-import { BrowserSession, podman } from './browser.ts'
+import { BrowserSession, podman, type SealSnapshot } from './browser.ts'
 import { blocklist, isBlocked, loadBlocklists } from './blocklists.ts'
+import { createDriveVaultTap } from './cdp-tap.ts'
+import { InFlightBudgetTracker, toLegacyLog, type AuditV2Config } from './proxy.ts'
 
+const VERSION = '0.3.0'
 const port = Number(process.env.BROWSER_PORT ?? 8797)
 const host = process.env.BROWSER_HOST ?? '127.0.0.1'
+const auditV2Enabled = process.env.BROWSER_AUDIT_V2 !== '0'
+const postTtlGcMs = Number(process.env.BROWSER_POST_TTL_GC_MS ?? 25 * 60_000)
+const maxClientRetainedBytes = Number(process.env.BROWSER_MAX_CLIENT_BYTES ?? 64 * 1024 * 1024)
+const maxProcessRetainedBytes = Number(process.env.BROWSER_MAX_PROCESS_BYTES ?? 256 * 1024 * 1024)
+
 const keys = process.env.BROWSER_KEYS ?? (process.env.BROWSER_KEY ? `default:${process.env.BROWSER_KEY}` : '')
 if (!keys.trim()) throw new Error('BROWSER_KEYS or BROWSER_KEY must be set')
 const clients = keys.trim().split(/\s+/).map(pair => {
@@ -21,10 +29,17 @@ if (new Set(clients.map(c => c.name)).size !== clients.length || new Set(clients
 const runDir = `${os.tmpdir()}/rollforward-browser-${port}`
 const label = `rollforward-browser=${port}`
 const viewPage = fs.readFileSync(new URL('view.html', import.meta.url))
+const inFlightTracker = new InFlightBudgetTracker()
 
-type Result = { state: unknown, log: unknown[] }
-type Session = BrowserSession & { client: string, expires?: number, timer?: NodeJS.Timeout, closing?: Promise<Result> }
+type Session = BrowserSession & {
+  client: string
+  expires?: number
+  timer?: NodeJS.Timeout
+  gcTimer?: NodeJS.Timeout
+  closing?: Promise<SealSnapshot>
+}
 const sessions = new Map<string, Session>()
+
 // An update (scripts/update.ts) drains the service before it moves the checkout: no session opens, and once every session has been
 // collected with DELETE, its request log with it, or 30 minutes have passed, GET /drained answers 200, for the update to move it and
 // restart the service.
@@ -32,19 +47,85 @@ let drainUntil = 0
 process.on('SIGUSR2', () => { drainUntil ||= Date.now() + 30 * 60_000 })
 
 const fail = (status: number, message: string) => Object.assign(new Error(message), { status })
-const json = (res: http.ServerResponse, status: number, body: unknown) =>
-  res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+const json = (res: http.ServerResponse, status: number, body: unknown, extraHeaders?: Record<string, string>) =>
+  res.writeHead(status, { 'content-type': 'application/json', ...extraHeaders }).end(JSON.stringify(body))
 const body = async (req: http.IncomingMessage) => Buffer.concat(await req.toArray())
 const names = (list: unknown) => Array.isArray(list) && list.every(h => typeof h === 'string' && /^(\*\.)?[a-z0-9_.-]+$|^\[[0-9a-f:.]+\]$/i.test(h))
-const close = (s: Session) => {
+
+const sealSession = (s: Session, scheduleGc = false): Promise<SealSnapshot> => {
   clearTimeout(s.timer)
-  return s.closing ??= s.close()
+  if (!s.closing) {
+    s.closing = s.seal()
+  }
+  if (scheduleGc && !s.gcTimer) {
+    s.gcTimer = setTimeout(() => {
+      s.reclaim()
+      sessions.delete(s.id)
+    }, postTtlGcMs)
+    s.gcTimer.unref?.()
+  }
+  return s.closing
+}
+
+function validateAuditV2(raw: unknown): AuditV2Config | undefined {
+  if (raw === undefined || raw === null) return undefined
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw fail(400, 'auditV2 must be an object')
+  const cfg = raw as Record<string, unknown>
+  if (cfg.v !== 2) throw fail(400, 'auditV2.v must be 2')
+  if (cfg.projection !== undefined && cfg.projection !== 'semantic' && cfg.projection !== 'semantic+samples') {
+    throw fail(400, 'auditV2.projection must be "semantic" or "semantic+samples"')
+  }
+  if (cfg.cdp !== undefined && typeof cfg.cdp !== 'boolean') throw fail(400, 'auditV2.cdp must be boolean')
+  if (cfg.hud !== undefined && typeof cfg.hud !== 'boolean') throw fail(400, 'auditV2.hud must be boolean')
+  if (!auditV2Enabled) return undefined
+  return {
+    v: 2,
+    projection: (cfg.projection as AuditV2Config['projection']) ?? 'semantic',
+    cdp: (cfg.cdp as boolean | undefined) ?? true,
+    hud: (cfg.hud as boolean | undefined) ?? true,
+    ...(cfg.intent && typeof cfg.intent === 'object' ? { intent: cfg.intent as AuditV2Config['intent'] } : {}),
+  }
+}
+
+function enforceRetainedMemoryCeiling(clientName: string) {
+  const usage = () => {
+    let clientBytes = 0
+    let processBytes = 0
+    for (const s of sessions.values()) {
+      const b = s.getRetainedBytes()
+      processBytes += b
+      if (s.client === clientName) clientBytes += b
+    }
+    return { clientBytes, processBytes }
+  }
+
+  let { clientBytes, processBytes } = usage()
+  if (clientBytes < maxClientRetainedBytes && processBytes < maxProcessRetainedBytes) return
+
+  // GC oldest sealed/TTL sessions first (client's own first if client cap hit, then any sealed if process cap hit)
+  const sealed = [...sessions.values()]
+    .filter(s => s.closing)
+    .sort((a, b) => (a.sealedAt ?? 0) - (b.sealedAt ?? 0))
+
+  for (const s of sealed) {
+    if (clientBytes < maxClientRetainedBytes && processBytes < maxProcessRetainedBytes) break
+    if (clientBytes >= maxClientRetainedBytes && s.client !== clientName && processBytes < maxProcessRetainedBytes) continue
+    clearTimeout(s.gcTimer)
+    s.reclaim()
+    sessions.delete(s.id)
+    ;({ clientBytes, processBytes } = usage())
+  }
+
+  if (clientBytes >= maxClientRetainedBytes || processBytes >= maxProcessRetainedBytes) {
+    throw fail(503, 'memory budget exceeded')
+  }
 }
 
 // A site's lists and headers are checked here, as one that the proxy can't use would end the service, every client's sessions with it.
 async function open(spec: any, client: typeof clients[number]) {
   const { site } = spec
-  if (!names(site.hosts) || !names(site.except ?? []) || site.via && !names(site.via.hosts)) throw fail(400, 'hosts, except and via.hosts: names such as sso.example.com, or *.example.com for any under it')
+  if (!site || !names(site.hosts) || !names(site.except ?? []) || site.via && !names(site.via.hosts)) throw fail(400, 'hosts, except and via.hosts: names such as sso.example.com, or *.example.com for any under it')
+  const auditV2 = validateAuditV2(spec.auditV2)
   try {
     for (const [name, value] of Object.entries({ ...site.headers, ...site.via && { 'proxy-authorization': `Bearer ${site.via.token}` } })) {
       http.validateHeaderName(name)
@@ -54,20 +135,43 @@ async function open(spec: any, client: typeof clients[number]) {
     throw fail(400, e.message)
   }
   if (site.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
+  enforceRetainedMemoryCeiling(client.name)
+
   const id = crypto.randomBytes(8).toString('hex')
-  const s: Session = Object.assign(new BrowserSession(id, `${runDir}/${id}`, label, spec.site, spec.audit === true), { client: client.name })
+  const s: Session = Object.assign(
+    new BrowserSession(id, `${runDir}/${id}`, label, spec.site, spec.audit === true, {
+      auditV2,
+      inFlightTracker,
+      clientId: client.name,
+    }),
+    { client: client.name },
+  )
   sessions.set(id, s)
   try {
     await s.start(spec.state, `ws://${host}:${port}/sessions/${id}/cdp`, { authorization: `Bearer ${client.key}` })
   } catch (e) {
     sessions.delete(id)
-    await close(s)
+    await sealSession(s)
+    s.reclaim()
     throw e
   }
   const ttl = (spec.ttl_s ?? 3600) * 1000
   s.expires = Date.now() + ttl
-  s.timer = setTimeout(() => close(s).catch(e => console.error(`closing ${id}:`, e)), ttl)
-  return { id, cdp: `/sessions/${id}/cdp`, view: `/sessions/${id}/view`, ...(s.audit && { shots: `/sessions/${id}/shots` }) }
+  s.timer = setTimeout(() => {
+    sealSession(s, true).catch(e => console.error(`sealing ${id}:`, e))
+  }, ttl)
+  return {
+    id,
+    cdp: `/sessions/${id}/cdp`,
+    view: `/sessions/${id}/view`,
+    ...(s.audit && { shots: `/sessions/${id}/shots` }),
+    ...(s.auditV2 && {
+      seal: `/sessions/${id}/seal`,
+      logV2: `/sessions/${id}/log`,
+      cdpLog: `/sessions/${id}/cdp-log`,
+      activity: `/sessions/${id}/view/activity`,
+    }),
+  }
 }
 
 async function route(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -77,6 +181,9 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   const url = URL.parse(req.url!, 'http://x')
   if (!url) throw fail(400, 'invalid url')
   const { pathname, searchParams } = url
+  if (pathname === '/capabilities' && req.method === 'GET') {
+    return json(res, 200, { version: VERSION, auditV2: auditV2Enabled ? 2 : 0, seal: true, activity: true })
+  }
   if (pathname === '/blocked' && req.method === 'GET') {
     if (!blocklist) throw fail(503, 'blocklists not loaded yet')
     return json(res, 200, Object.fromEntries(searchParams.getAll('host').map(host => [host, isBlocked(domainToASCII(host))])))
@@ -88,30 +195,74 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   const [, id, rest] = pathname.match(/^\/sessions\/([^/]+)(.*)$/) ?? []
   const s = sessions.get(id)
   if (!s || s.client !== client.name) throw fail(404, 'no such session')
+
+  // ---- Routes ABOVE `if (s.closing)` so sealed & TTL-expired sessions remain drainable (§2.1.1) ----
   if (rest === '' && req.method === 'DELETE') {
-    const result = await close(s)
+    clearTimeout(s.gcTimer)
+    if (searchParams.get('sealed') === '1') {
+      await sealSession(s)
+      s.reclaim()
+      sessions.delete(id)
+      return json(res, 200, { deleted: true })
+    }
+    const snap = await sealSession(s)
+    const result = { state: snap.state, log: toLegacyLog(s.log) }
+    s.reclaim()
     sessions.delete(id)
     return json(res, 200, result)
   }
-  if (rest === '/log' && req.method === 'GET') return json(res, 200, s.log)
+
+  if (rest === '/seal' && req.method === 'POST') {
+    const snap = await sealSession(s)
+    return json(res, 200, snap)
+  }
+
+  if (rest === '/log' && req.method === 'GET') {
+    if (s.auditV2 && (searchParams.has('after') || searchParams.get('v') === '2')) {
+      const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
+      const limit = Math.min(500, Math.max(1, Number(searchParams.get('limit') ?? '500') || 500))
+      return json(res, 200, s.proxy!.controller.getLogPage(after, limit))
+    }
+    return json(res, 200, toLegacyLog(s.log))
+  }
+
+  if (rest === '/cdp-log' && req.method === 'GET') {
+    if (!s.cdpTap) throw fail(404, 'cdp log not enabled')
+    const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
+    const limit = Math.min(500, Math.max(1, Number(searchParams.get('limit') ?? '500') || 500))
+    return json(res, 200, s.cdpTap.getPage(after, limit))
+  }
+
+  if (rest === '/shots' && req.method === 'GET') {
+    const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
+    if (s.auditV2 || searchParams.get('v') === '2') {
+      return json(res, 200, s.getShotsV2(after))
+    }
+    const items = s.shots.filter(x => x.seq > after).slice(0, 20)
+    return json(res, 200, items.map(x => ({ seq: x.seq, at: x.at, url: x.url, jpeg: x.jpeg.toString('base64') })))
+  }
+
+  // ---- Active-session-only routes ----
   if (s.closing) throw fail(410, 'session closed')
+
   if (rest === '/view' && req.method === 'GET') return res.writeHead(200, { 'content-type': 'text/html' }).end(viewPage)
+  if (rest === '/view/activity' && req.method === 'GET') {
+    if (!s.auditV2 || s.auditV2.hud === false) throw fail(404, 'activity hud not enabled')
+    const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
+    return json(res, 200, s.getActivity(after), { 'cache-control': 'no-store' })
+  }
   if (rest === '/page' && req.method === 'GET') return json(res, 200, await s.page())
   if (rest === '/hosts' && req.method === 'PUT') {
     const { hosts } = JSON.parse((await body(req)).toString())
     if (!names(hosts)) throw fail(400, 'hosts: names such as sso.example.com, or *.example.com for any under it')
     s.site.hosts = hosts
+    s.siteConfigRev++
     return json(res, 200, { hosts })
   }
   if (rest === '/reload' && req.method === 'POST') return (await s.reload(), json(res, 200, {}))
   if (rest === '/screenshot' && req.method === 'GET') {
     const png = await s.screenshot()
     return res.writeHead(200, { 'content-type': 'image/png' }).end(png)
-  }
-  if (rest === '/shots' && req.method === 'GET') {
-    const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
-    const items = s.shots.filter(x => x.seq > after).slice(0, 20)
-    return json(res, 200, items.map(x => ({ seq: x.seq, at: x.at, url: x.url, jpeg: x.jpeg.toString('base64') })))
   }
   if (rest.startsWith('/files/')) {
     const path = decodeURIComponent(rest.slice('/files'.length))
@@ -175,19 +326,47 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   const [, id, rest] = url?.pathname.match(/^\/sessions\/([^/]+)(\/cdp|\/view\/watch|\/view\/drive)$/) ?? []
   const s = id ? sessions.get(id) : undefined
   if (!client || !s || s.client !== client.name || s.closing) return socket.end('HTTP/1.1 404 Not Found\r\nconnection: close\r\n\r\n')
+
+  const isInternalPw = rest === '/cdp' && s.verifyInternalNonce(req.headers['x-rf-internal'])
+  const tapExternalCdp = rest === '/cdp' && !isInternalPw && Boolean(s.cdpTap)
+  const tapDriveVault = rest === '/view/drive'
+
   const up = net.connect(s.cdpSocket)
   up.on('error', () => socket.destroy())
   socket.on('close', () => up.destroy())
+
   const headers: Record<string, unknown> = { ...req.headers, host: 'localhost' }
   delete headers.authorization
   delete headers.origin
-  if (rest === '/view/watch') delete headers['sec-websocket-extensions']
+  // Strip ALL x-rf-* headers before forwarding to Chromium (§3.1.1)
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase().startsWith('x-rf-')) delete headers[k]
+  }
+  // Strip sec-websocket-extensions on /view/watch, /view/drive, and tapped external /cdp (§3.1.2)
+  if (rest === '/view/watch' || tapDriveVault || tapExternalCdp) {
+    delete headers['sec-websocket-extensions']
+  }
+
   up.write(`GET ${s.wsPath} HTTP/1.1\r\n${Object.entries(headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`)
-  if (rest === '/view/watch') watchOnly(socket, up, head)
-  else {
+
+  if (rest === '/view/watch') {
+    watchOnly(socket, up, head)
+  } else {
+    const tap = tapExternalCdp
+      ? s.cdpTap!.attachConnection()
+      : tapDriveVault
+        ? createDriveVaultTap(s.vault)
+        : undefined
+    // Passive zero-mutation attachment: feed head before up.write(head), then pipe, then observe socket data (§3.1.3)
+    if (tap && head.length) tap.feed(head)
     up.write(head)
     socket.pipe(up)
+    if (tap) {
+      socket.on('data', (c: Buffer) => tap.feed(c))
+      socket.on('close', () => tap.close())
+    }
   }
+
   up.pipe(socket)
   if (rest === '/view/drive') {
     s.onDriverStart()
