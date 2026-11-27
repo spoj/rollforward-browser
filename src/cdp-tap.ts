@@ -230,14 +230,18 @@ export class WsFrameParser {
     if (!this.frameIsControl && this.frameFin) {
       const msg: ParsedWsMessage = {
         opcode: this.msgOpcode,
-        head: Buffer.from(this.msgHead.subarray(0, this.msgHeadLen)),
-        tail: Buffer.from(this.msgTail),
+        head: this.msgHead.subarray(0, this.msgHeadLen),
+        tail: this.msgTail,
         totalBytes: this.msgTotalBytes,
         truncated: this.msgTotalBytes > MAX_MSG_HEAD,
         sha256: this.msgHash!.digest('hex'),
       }
-      this.resetMsg()
-      this.onMessage(msg)
+      // Keep parser charge active while synchronous consumer reads msg, then release cleanly!
+      try {
+        this.onMessage(msg)
+      } finally {
+        this.resetMsg()
+      }
     }
     this.state = 'hdr2'
     this.hdrPos = 0

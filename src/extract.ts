@@ -153,9 +153,10 @@ function decompressSingleLayer(
       const need = Math.min(c.length, maxBytes - outBytes)
       if (need > 0) {
         if (outBytes + need > outBuf.length) {
-          const nextCap = Math.min(maxBytes, Math.max(4096, outBuf.length * 2, outBytes + need))
-          const delta = nextCap - outBuf.length
-          if (charger && !charger.tryAcquire(delta)) {
+          const oldLen = outBuf.length
+          const nextCap = Math.min(maxBytes, Math.max(4096, oldLen * 2, outBytes + need))
+          // Charge full replacement allocation before allocating so peak concurrent memory stays within budget!
+          if (charger && !charger.tryAcquire(nextCap)) {
             stream.destroy()
             releaseAll()
             finish({
@@ -170,10 +171,13 @@ function decompressSingleLayer(
             })
             return
           }
-          if (charger) charged += delta
           const next = Buffer.allocUnsafe(nextCap)
           if (outBytes > 0) outBuf.copy(next, 0, 0, outBytes)
           outBuf = next
+          if (charger) {
+            if (oldLen > 0) charger.release(oldLen)
+            charged = nextCap
+          }
         }
         c.copy(outBuf, outBytes, 0, need)
         outBytes += need
@@ -298,15 +302,25 @@ export async function decompressPrefix(
 }
 
 const SAFE_MIME_RE = /^[a-z0-9!#$&^_.+-]{1,40}\/[a-z0-9!#$&^_.+-]{1,64}$/
+const STANDARD_MIME_TYPES = new Set(['application', 'audio', 'font', 'image', 'message', 'model', 'multipart', 'text', 'video'])
 
 export function normalizeContentType(header: string | undefined, vault?: SecretVault): string | undefined {
   if (!header) return undefined
-  const essence = header.split(';')[0].trim().toLowerCase()
-  if (!essence) return undefined
-  if (vault && vault.scrub(essence).count > 0) return 'application/octet-stream'
+  const rawEssence = header.split(';')[0].trim()
+  if (!rawEssence) return undefined
+  const essence = rawEssence.toLowerCase()
+  // Scrub original-case essence BEFORE lowercasing so mixed-case vault secrets never leak in lowercase!
+  if (vault && (vault.scrub(rawEssence).count > 0 || vault.scrub(essence).count > 0)) {
+    return 'application/octet-stream'
+  }
   if (!SAFE_MIME_RE.test(essence)) return 'application/octet-stream'
+  const slashIdx = rawEssence.indexOf('/')
+  const rawSub = slashIdx >= 0 ? rawEssence.slice(slashIdx + 1) : ''
   const [type, subtype] = essence.split('/')
-  if (isSensitiveValue(subtype) || isDataLikeKey(subtype)) return `${type}/<redacted>`
+  if (!STANDARD_MIME_TYPES.has(type)) return 'application/octet-stream'
+  if (isSensitiveValue(rawSub) || isSensitiveValue(subtype) || isDataLikeKey(rawSub) || isDataLikeKey(subtype)) {
+    return `${type}/<redacted>`
+  }
   return essence
 }
 

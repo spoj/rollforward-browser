@@ -277,7 +277,7 @@ const ALLOWED_FETCH_DESTS = new Set([
 ])
 
 const MAX_ENTRY_BYTES = 12 * 1024
-const MINIMAL_RESERVE_BYTES = 768
+const MINIMAL_RESERVE_BYTES = 1024
 const TAIL_RESERVE_BYTES = 64 * 1024
 const MAX_PAGE_BYTES = 4 * 1024 * 1024
 const MAX_COLLAPSE_BUCKETS = 64
@@ -522,7 +522,7 @@ function toMinimalCappedEntry(e: V2Entry): V2Entry {
     msgMax = Math.max(8, Math.floor(msgMax / 2))
     if (attempt >= 3) authMax = Math.max(48, Math.floor(authMax * 0.6))
   }
-  const authority = truncateUtf8HeadTail(e.authority || '', 48)
+  const authority = truncateUtf8HeadTail(e.authority || '', 255)
   const originPath = authority ? `${e.scheme}://${authority}/` : '/'
   return {
     n: e.n,
@@ -548,6 +548,8 @@ function toMinimalCappedEntry(e: V2Entry): V2Entry {
     completeness: { transport: e.completeness.transport, decode: e.completeness.decode, extract: 'none' },
     actions: [],
     status: e.status,
+    ...(e.blocked !== undefined && { blocked: truncateUtf8HeadTail(e.blocked, 32) }),
+    ...(e.error !== undefined && { error: truncateUtf8HeadTail(e.error, 32) }),
     dispatch: e.dispatch,
     logCapped: true,
   }
@@ -1777,7 +1779,7 @@ export function startProxy(
         liveAtStart, genAtStart, arrival, hasBody: totalReqBytes > 0,
         httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
       })
-      if (budgetHit && !built.safe.reqOmitted && built.safe.isWrite) {
+      if (budgetHit && built.safe.isWrite && (!built.safe.reqOmitted || built.safe.reqOmitted === 'policy-profile')) {
         built.safe.reqOmitted = 'budget'
       }
       return built
@@ -2022,8 +2024,9 @@ export function startProxy(
       headerMs = Math.round(performance.now() - startMs)
       status = r.statusCode ?? 0
       stateRef.status = status
-      resType = normalizeContentType(r.headers['content-type'], vault)
+      // Ingest Set-Cookie BEFORE projecting response Content-Type so newly issued tokens are scrubbed!
       try { vault?.ingestSetCookie(r.headers['set-cookie']) } catch {}
+      resType = normalizeContentType(r.headers['content-type'], vault)
 
       const headers = { ...r.headers }
       for (const h of hopByHop) delete headers[h]
