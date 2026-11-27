@@ -423,12 +423,56 @@ const isAsciiLower = (c: number) => c >= 97 && c <= 122
 const isAsciiDigit = (c: number) => c >= 48 && c <= 57
 const isAsciiAlnum = (c: number) => isAsciiUpper(c) || isAsciiLower(c) || isAsciiDigit(c)
 
+function tokenizeAsciiLinear(s: string): string[] {
+  const tokens: string[] = []
+  const len = s.length
+  let tokStart = -1
+  for (let i = 0; i < len; i++) {
+    const c = s.charCodeAt(i)
+    if (!isAsciiAlnum(c)) {
+      if (tokStart >= 0) {
+        tokens.push(s.slice(tokStart, i).toLowerCase())
+        tokStart = -1
+      }
+      continue
+    }
+    if (tokStart < 0) {
+      tokStart = i
+      continue
+    }
+    if (isAsciiUpper(c)) {
+      const prev = s.charCodeAt(i - 1)
+      if (
+        isAsciiLower(prev) ||
+        isAsciiDigit(prev) ||
+        (isAsciiUpper(prev) && i + 1 < len && isAsciiLower(s.charCodeAt(i + 1)))
+      ) {
+        tokens.push(s.slice(tokStart, i).toLowerCase())
+        tokStart = i
+      }
+    }
+  }
+  if (tokStart >= 0) {
+    tokens.push(s.slice(tokStart).toLowerCase())
+  }
+  return tokens
+}
+
+function hasNonAsciiChar(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) >= 0x80) return true
+  }
+  return false
+}
+
 // Single-pass O(N) identifier tokenizer (ASCII camelCase/acronym boundaries + Unicode case folding, e.g. U+212A -> 'k').
 export function tokenizeKey(key: string): string[] {
+  if (!hasNonAsciiChar(key)) return tokenizeAsciiLinear(key)
   const tokens: string[] = []
   const len = key.length
   let cur = ''
   let asciiStart = -1
+  let lastFoldedCode = -1
   const flushAscii = (end: number) => {
     if (asciiStart >= 0) {
       cur += key.slice(asciiStart, end).toLowerCase()
@@ -441,6 +485,7 @@ export function tokenizeKey(key: string): string[] {
       tokens.push(cur)
       cur = ''
     }
+    lastFoldedCode = -1
   }
 
   for (let i = 0; i < len; i++) {
@@ -450,8 +495,8 @@ export function tokenizeKey(key: string): string[] {
         flushToken(i)
         continue
       }
-      if (isAsciiUpper(c) && (asciiStart >= 0 || cur.length > 0) && i > 0) {
-        const prev = key.charCodeAt(i - 1)
+      if (isAsciiUpper(c) && (asciiStart >= 0 || cur.length > 0)) {
+        const prev = asciiStart >= 0 ? key.charCodeAt(i - 1) : lastFoldedCode
         if (
           isAsciiLower(prev) ||
           isAsciiDigit(prev) ||
@@ -461,6 +506,7 @@ export function tokenizeKey(key: string): string[] {
         }
       }
       if (asciiStart < 0) asciiStart = i
+      lastFoldedCode = c
     } else {
       flushAscii(i)
       const folded = key[i].toLowerCase()
@@ -468,9 +514,11 @@ export function tokenizeKey(key: string): string[] {
         const fc = folded.charCodeAt(j)
         if (isAsciiLower(fc) || isAsciiDigit(fc)) {
           cur += folded[j]
+          lastFoldedCode = fc
         } else if (cur.length > 0) {
           tokens.push(cur)
           cur = ''
+          lastFoldedCode = -1
         }
       }
     }
@@ -479,15 +527,7 @@ export function tokenizeKey(key: string): string[] {
   return tokens
 }
 
-export function isSensitiveContainerKey(key: string): boolean {
-  const lower = key.toLowerCase()
-  if (SENSITIVE_CONTAINERS.has(lower)) return true
-  const tokens = tokenizeKey(key)
-  return tokens.length === 1 && SENSITIVE_CONTAINERS.has(tokens[0])
-}
-
-export function isSensitiveKey(key: string): boolean {
-  const tokens = tokenizeKey(key)
+function isSensitiveTokens(tokens: string[]): boolean {
   if (!tokens.length) return false
   if (tokens.length === 1 && ENTIRE_KEY_ONLY.has(tokens[0])) return true
   const last = tokens[tokens.length - 1]
@@ -500,6 +540,30 @@ export function isSensitiveKey(key: string): boolean {
   }
   if (tokens.some(t => UNAMBIGUOUS_TOKENS.has(t))) return true
   return false
+}
+
+export function isSensitiveContainerKey(key: string): boolean {
+  const lower = key.toLowerCase()
+  if (SENSITIVE_CONTAINERS.has(lower)) return true
+  const tokens = tokenizeKey(key)
+  if (tokens.length === 1 && SENSITIVE_CONTAINERS.has(tokens[0])) return true
+  if (hasNonAsciiChar(key)) {
+    const raw = tokenizeAsciiLinear(key)
+    if (raw.length === 1 && SENSITIVE_CONTAINERS.has(raw[0])) return true
+    const folded = tokenizeAsciiLinear(lower)
+    if (folded.length === 1 && SENSITIVE_CONTAINERS.has(folded[0])) return true
+  }
+  return false
+}
+
+export function isSensitiveKey(key: string): boolean {
+  if (!hasNonAsciiChar(key)) return isSensitiveTokens(tokenizeAsciiLinear(key))
+  // Dual-pass union for non-ASCII keys: catches both ASCII-boundary tokens (e.g. U+212A + Password) and Unicode-folded tokens (e.g. U+212A + ey/EY)
+  return (
+    isSensitiveTokens(tokenizeKey(key)) ||
+    isSensitiveTokens(tokenizeAsciiLinear(key)) ||
+    isSensitiveTokens(tokenizeAsciiLinear(key.toLowerCase()))
+  )
 }
 
 export function isSensitiveValue(s: string): boolean {

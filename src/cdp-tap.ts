@@ -920,76 +920,79 @@ export class CdpSessionTap {
       const schemeProbe = strippedUrl.replace(/[\u0000-\u001f]+/g, '')
       let navUrl: string
       let extra: Record<string, unknown> = {}
-      if (/^(?:javascript|vbscript):/i.test(schemeProbe)) {
-        severity = 'high'
-        const scheme = /^vbscript:/i.test(schemeProbe) ? 'vbscript' : 'javascript'
-        navUrl = `${scheme}:[REDACTED]`
-        extra = { exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
-      } else if (/^about:(?:blank|srcdoc)$/i.test(schemeProbe)) {
-        navUrl = schemeProbe.toLowerCase()
-      } else if (/^data:/i.test(schemeProbe)) {
-        severity = 'high'
-        const comma = schemeProbe.indexOf(',')
-        const rawMeta = (comma >= 0 ? schemeProbe.slice(5, comma) : schemeProbe.slice(5)).split(';')[0].trim()
-        let safeMime = /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(rawMeta) ? rawMeta : 'unknown'
-        if (vault) {
-          const sm = vault.scrub(safeMime)
-          if (sm.count > 0) {
-            vaultRedactions += sm.count
-            safeMime = sm.text
-          }
-        }
-        safeMime = safeMime.includes('[REDACTED:vault]') ? safeMime : safeMime.toLowerCase()
-        navUrl = `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}`
-      } else if (/^blob:/i.test(schemeProbe)) {
-        const rawInner = schemeProbe.slice(5)
-        const rawScrub = vault ? vault.scrub(rawInner) : { count: 0, text: rawInner }
-        if (rawScrub.count > 0) {
-          vaultRedactions += rawScrub.count
-          navUrl = 'blob:[REDACTED]'
-        } else {
-          const inner = URL.parse(rawInner)
-          if (!inner) {
-            navUrl = 'blob:[REDACTED]'
-          } else if (inner.origin === 'null') {
-            navUrl = 'blob:null'
-          } else {
-            const originScrub = vault ? vault.scrub(inner.origin) : { count: 0, text: inner.origin }
-            if (originScrub.count > 0) {
-              vaultRedactions += originScrub.count
-              navUrl = 'blob:[REDACTED]'
-            } else {
-              // Require canonical scheme://[userinfo@]host[:port] matching inner.hostname; fail closed on weird spellings (e.g. http:\host)
-              const canon = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]+)/i.exec(rawInner)
-              let hostMatches = false
-              if (canon) {
-                const auth = canon[1]
-                const at = auth.lastIndexOf('@')
-                const hostPort = at >= 0 ? auth.slice(at + 1) : auth
-                const rawHost = hostPort.startsWith('[')
-                  ? hostPort.slice(0, hostPort.indexOf(']') + 1)
-                  : hostPort.split(':')[0]
-                hostMatches = rawHost.length > 0 && rawHost.toLowerCase() === inner.hostname.toLowerCase()
-              }
-              navUrl = hostMatches ? `blob:${inner.origin}` : 'blob:[REDACTED]'
-            }
-          }
-        }
-      } else if (/^https?:/i.test(schemeProbe)) {
+      if (/^https?:/i.test(schemeProbe)) {
         navUrl = scrubUrlField(strippedUrl)
       } else {
-        const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(schemeProbe)
-        let rawScheme = schemeMatch ? schemeMatch[1] : 'unknown'
-        if (vault) {
-          const ss = vault.scrub(rawScheme)
-          if (ss.count > 0) {
-            vaultRedactions += ss.count
-            rawScheme = ss.text
+        // Check vault on the COMPLETE original rawUrl FIRST (before trimming, control-stripping, slicing, or lowercasing!)
+        const fullVaultHits = vault ? vault.scrub(rawUrl).count : 0
+        if (fullVaultHits > 0) vaultRedactions += fullVaultHits
+
+        if (/^(?:javascript|vbscript):/i.test(schemeProbe)) {
+          severity = 'high'
+          const scheme = /^vbscript:/i.test(schemeProbe) ? 'vbscript' : 'javascript'
+          navUrl = `${scheme}:[REDACTED]`
+          extra = { exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
+        } else if (/^about:(?:blank|srcdoc)$/i.test(schemeProbe)) {
+          navUrl = fullVaultHits > 0 ? 'about:[REDACTED]' : schemeProbe.toLowerCase()
+        } else if (/^data:/i.test(schemeProbe)) {
+          severity = 'high'
+          if (fullVaultHits > 0) {
+            navUrl = `data:[REDACTED];len=${Buffer.byteLength(rawUrl, 'utf8')}`
+          } else {
+            const comma = schemeProbe.indexOf(',')
+            const rawMeta = (comma >= 0 ? schemeProbe.slice(5, comma) : schemeProbe.slice(5)).split(';')[0].trim()
+            const safeMime = /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(rawMeta) ? rawMeta.toLowerCase() : 'unknown'
+            navUrl = `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}`
           }
+        } else if (/^blob:/i.test(schemeProbe)) {
+          if (fullVaultHits > 0) {
+            navUrl = 'blob:[REDACTED]'
+          } else {
+            const rawInner = schemeProbe.slice(5)
+            const rawScrub = vault ? vault.scrub(rawInner) : { count: 0, text: rawInner }
+            if (rawScrub.count > 0) {
+              vaultRedactions += rawScrub.count
+              navUrl = 'blob:[REDACTED]'
+            } else {
+              const inner = URL.parse(rawInner)
+              if (!inner) {
+                navUrl = 'blob:[REDACTED]'
+              } else if (inner.origin === 'null') {
+                navUrl = 'blob:null'
+              } else {
+                const originScrub = vault ? vault.scrub(inner.origin) : { count: 0, text: inner.origin }
+                if (originScrub.count > 0) {
+                  vaultRedactions += originScrub.count
+                  navUrl = 'blob:[REDACTED]'
+                } else {
+                  // Require canonical scheme://[userinfo@]host[:port] followed by /, ?, #, or end (rejects `\` like http:\host or app.example\item)
+                  const canon = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]+)(?:[/?#]|$)/i.exec(rawInner)
+                  let hostMatches = false
+                  if (canon) {
+                    const auth = canon[1]
+                    const at = auth.lastIndexOf('@')
+                    const hostPort = at >= 0 ? auth.slice(at + 1) : auth
+                    const rawHost = hostPort.startsWith('[')
+                      ? hostPort.slice(0, hostPort.indexOf(']') + 1)
+                      : hostPort.split(':')[0]
+                    hostMatches = rawHost.length > 0 && rawHost.toLowerCase() === inner.hostname.toLowerCase()
+                  }
+                  navUrl = hostMatches ? `blob:${inner.origin}` : 'blob:[REDACTED]'
+                }
+              }
+            }
+          }
+        } else {
+          const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(schemeProbe)
+          const rawScheme = schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown'
+          const SAFE_KNOWN_SCHEMES = new Set(['file', 'mailto', 'tel', 'ftp', 'ws', 'wss', 'chrome', 'edge'])
+          if (fullVaultHits > 0) {
+            navUrl = SAFE_KNOWN_SCHEMES.has(rawScheme) ? `${rawScheme}:[REDACTED]` : '[REDACTED]'
+          } else {
+            navUrl = `${rawScheme}:[REDACTED]`
+          }
+          extra = { len: Buffer.byteLength(rawUrl, 'utf8') }
         }
-        const finalScheme = rawScheme.includes('[REDACTED:vault]') ? rawScheme : rawScheme.toLowerCase()
-        navUrl = `${finalScheme}:[REDACTED]`
-        extra = { len: Buffer.byteLength(rawUrl, 'utf8') }
       }
       if (vault) {
         const sc = vault.scrub(navUrl)
