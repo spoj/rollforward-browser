@@ -27,7 +27,7 @@
 const $ = id => document.getElementById(id)
 const img = $('img'), url = $('url'), tabs = $('tabs'), driveButton = $('drive'), kb = $('kb')
 // ?drive starts the person in control, as for signing in; ?watch only watches, with no control to take.
-let ws, nextId, pending, targets, current, session, meta, driving = new URLSearchParams(location.search).has('drive'), typed = ''
+let ws, nextId, pending, targets, current, session, meta, pinned = false, showGen = 0, driving = new URLSearchParams(location.search).has('drive'), typed = ''
 
 const send = (method, params = {}, sessionId) => new Promise(resolve => {
   const id = nextId++
@@ -36,7 +36,7 @@ const send = (method, params = {}, sessionId) => new Promise(resolve => {
 })
 
 function connect() {
-  nextId = 1, pending = new Map(), targets = new Map(), current = session = null
+  nextId = 1, pending = new Map(), targets = new Map(), current = session = null, pinned = false, showGen++
   ws = new WebSocket(new URL(driving ? 'view/drive' : 'view/watch', location.href).href.replace(/^http/, 'ws'))
   ws.onopen = () => send('Target.setDiscoverTargets', { discover: true })
   ws.onclose = () => document.title = 'Live view (disconnected)'
@@ -46,12 +46,17 @@ function connect() {
     if (m.method === 'Target.targetCreated' || m.method === 'Target.targetInfoChanged') {
       const t = m.params.targetInfo
       if (t.type !== 'page') return
+      const isNew = m.method === 'Target.targetCreated' && !targets.has(t.targetId)
       targets.set(t.targetId, t)
-      if (!current) show(t.targetId)
+      if (!current || (isNew && !driving && !pinned)) show(t.targetId)
       render()
     }
     if (m.method === 'Target.targetDestroyed' && targets.delete(m.params.targetId)) {
-      if (current === m.params.targetId) current = null, targets.size && show(targets.keys().next().value)
+      if (current === m.params.targetId) {
+        current = null, pinned = false
+        const next = [...targets.keys()].at(-1)
+        if (next) show(next)
+      }
       render()
     }
     if (m.method === 'Page.screencastFrame' && m.sessionId === session) {
@@ -66,22 +71,43 @@ function connect() {
   url.disabled = !driving
 }
 
-async function show(targetId) {
-  if (session) send('Target.detachFromTarget', { sessionId: session })
+async function show(targetId, tried = new Set()) {
+  const gen = ++showGen
+  const prev = session
+  session = null
+  if (prev) send('Target.detachFromTarget', { sessionId: prev })
   current = targetId
-  session = (await send('Target.attachToTarget', { targetId, flatten: true })).sessionId
+  render()
+  const attached = await send('Target.attachToTarget', { targetId, flatten: true })
+  if (gen !== showGen) {
+    if (attached?.sessionId) send('Target.detachFromTarget', { sessionId: attached.sessionId })
+    return
+  }
+  if (!attached?.sessionId) {
+    if (current === targetId) {
+      current = null
+      tried.add(targetId)
+      const next = [...targets.keys()].filter(id => !tried.has(id)).at(-1)
+      if (next) return show(next, tried)
+    }
+    render()
+    return
+  }
+  session = attached.sessionId
   await send('Page.startScreencast', { format: 'jpeg', quality: 70 }, session)
+  if (gen !== showGen) return
   document.title = driving ? 'Live view (you have control)' : 'Live view (watching)'
   render()
 }
 
 function render() {
+  const ids = [...targets.keys()], newest = ids.at(-1)
   tabs.replaceChildren(...[...targets.values()].map(t => {
     const b = document.createElement('button')
     b.textContent = (t.title || t.url).slice(0, 24)
     b.title = t.url
     b.className = t.targetId === current ? 'on' : ''
-    b.onclick = () => show(t.targetId)
+    b.onclick = () => { pinned = t.targetId !== newest; show(t.targetId) }
     return b
   }))
   if (document.activeElement !== url) url.value = targets.get(current)?.url ?? ''

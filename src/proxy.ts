@@ -45,7 +45,7 @@ const plain = (socket: net.Socket) => {
 // One proxy per browser session, on a unix socket only that session's container can reach.
 // CONNECT tunnels are opened locally (TLS ends here, with a key the browser is told to accept),
 // so every request is seen whole: checked against the site's hosts, then logged.
-export function startProxy(path: string, site: Site, key: { key: string, cert: string }, isLive: () => boolean, log: Entry[]) {
+export function startProxy(path: string, site: Site, key: { key: string, cert: string }, isLive: () => boolean, log: Entry[], onWrite?: () => void, liveGen?: () => number) {
   const matches = (list: string[], host: string) => list.some(h => h.toLowerCase() === host || h.startsWith('*.') && host.endsWith(h.slice(1).toLowerCase()))
   // The site's hosts as they are now: a PUT adds those its person allows as the session goes (server.ts).
   const exact = (host: string) => site.hosts.some(h => h.toLowerCase() === host)
@@ -135,8 +135,10 @@ export function startProxy(path: string, site: Site, key: { key: string, cert: s
       res.writeHead(403, { 'content-type': 'text/plain' }).end(`rollforward-browser: ${blocked}: ${req.method} ${url?.href ?? req.url}\n`)
       return
     }
+    const liveAtStart = isLive(), genAtStart = liveGen?.()
     const up = (url!.protocol === 'https:' ? https : http).request(url, upstreamOptions(req, url), r => {
       record(req, url, r.statusCode!)
+      if (onWrite && !liveAtStart && !['GET', 'HEAD', 'OPTIONS'].includes(req.method!)) r.on('end', () => { if (!isLive() && liveGen?.() === genAtStart) onWrite() })
       const headers = { ...r.headers }
       for (const h of hopByHop) delete headers[h]
       res.writeHead(r.statusCode!, headers)

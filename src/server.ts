@@ -55,7 +55,7 @@ async function open(spec: any, client: typeof clients[number]) {
   }
   if (site.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
   const id = crypto.randomBytes(8).toString('hex')
-  const s: Session = Object.assign(new BrowserSession(id, `${runDir}/${id}`, label, spec.site), { client: client.name })
+  const s: Session = Object.assign(new BrowserSession(id, `${runDir}/${id}`, label, spec.site, spec.audit === true), { client: client.name })
   sessions.set(id, s)
   try {
     await s.start(spec.state, `ws://${host}:${port}/sessions/${id}/cdp`, { authorization: `Bearer ${client.key}` })
@@ -67,7 +67,7 @@ async function open(spec: any, client: typeof clients[number]) {
   const ttl = (spec.ttl_s ?? 3600) * 1000
   s.expires = Date.now() + ttl
   s.timer = setTimeout(() => close(s).catch(e => console.error(`closing ${id}:`, e)), ttl)
-  return { id, cdp: `/sessions/${id}/cdp`, view: `/sessions/${id}/view` }
+  return { id, cdp: `/sessions/${id}/cdp`, view: `/sessions/${id}/view`, ...(s.audit && { shots: `/sessions/${id}/shots` }) }
 }
 
 async function route(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -107,6 +107,11 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   if (rest === '/screenshot' && req.method === 'GET') {
     const png = await s.screenshot()
     return res.writeHead(200, { 'content-type': 'image/png' }).end(png)
+  }
+  if (rest === '/shots' && req.method === 'GET') {
+    const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
+    const items = s.shots.filter(x => x.seq > after).slice(0, 20)
+    return json(res, 200, items.map(x => ({ seq: x.seq, at: x.at, url: x.url, jpeg: x.jpeg.toString('base64') })))
   }
   if (rest.startsWith('/files/')) {
     const path = decodeURIComponent(rest.slice('/files'.length))
@@ -185,8 +190,8 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   }
   up.pipe(socket)
   if (rest === '/view/drive') {
-    s.drivers++
-    socket.on('close', () => s.drivers--)
+    s.onDriverStart()
+    socket.on('close', () => s.onDriverEnd())
   }
 })
 

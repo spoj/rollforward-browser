@@ -464,7 +464,67 @@ test('a session past its ttl is closed and keeps its result until collected', as
   assert.equal(leftovers(), '')
   const closed = await api('DELETE', `/sessions/${body.id}`)
   assert.ok(closed.body.state.cookies.length)
+  signedIn = closed.body.state
   assert.equal((await api('DELETE', `/sessions/${body.id}`)).status, 404)
+})
+
+test('audit: true captures best-effort JPEGs on new tabs/navigations/writes, skipping password pages and active drivers', async () => {
+  const opened = await api('POST', '/sessions', { site, audit: true })
+  assert.equal(opened.status, 201)
+  const { id, cdp, shots, view } = opened.body
+  assert.equal(shots, `/sessions/${id}/shots`)
+
+  const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${cdp}`, { headers })
+  try {
+    const ctx = agent.contexts()[0]
+    const page0 = ctx.pages()[0]
+    await page0.waitForURL(/\/login$/)
+    // Sign in on tab 0 (password field visible during /login must not produce a shot before redirect)
+    await page0.fill('#user', 'ann')
+    await page0.fill('#password', 'secret')
+    await page0.click('button')
+    await page0.waitForSelector('text=Welcome ann')
+
+    // Open a 2nd tab (like e1_query.py), navigate & POST, then close the 2nd tab
+    const tab = await ctx.newPage()
+    await tab.goto(site.start_url)
+    await tab.waitForSelector('text=Welcome ann')
+    await tab.evaluate(() => fetch('/update', { method: 'POST', body: 'amount=9' }).then(r => r.status))
+
+    let got: any[] = []
+    for (let i = 0; i < 20 && !got.length; i++) {
+      await new Promise(r => setTimeout(r, 250))
+      got = (await api('GET', `${shots}?after=0`)).body
+    }
+    assert.ok(got.length >= 1, 'captured at least one audit JPEG from the session')
+    assert.ok(got.every(s => !s.url.endsWith('/login')), 'never captured the /login password page')
+    assert.ok(Buffer.from(got[0].jpeg, 'base64').subarray(0, 2).equals(Buffer.from([0xff, 0xd8])), 'valid JPEG header')
+    const lastSeq = got.at(-1).seq
+    assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body, [], 'cursor after= returns only newer shots')
+
+    // Password page must not be captured (fail closed)
+    await tab.setContent('<form><input type="password" value="secret" style="width:100px;height:20px"></form>')
+    await tab.evaluate(() => fetch('/update', { method: 'POST', body: 'p=1' }))
+    await new Promise(r => setTimeout(r, 3200))
+    assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body, [], 'visible password field skipped')
+
+    // Driving over view/drive must not be captured
+    const driver = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${view}/drive`, { headers })
+    try {
+      await tab.setContent('<h1>Driver typing</h1>')
+      await tab.evaluate(() => fetch('/update', { method: 'POST', body: 'd=1' }))
+      await new Promise(r => setTimeout(r, 3200))
+      assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body, [], 'active driver skipped')
+    } finally {
+      await driver.close()
+    }
+    await tab.close()
+  } finally {
+    await agent.close()
+    const closed = await api('DELETE', `/sessions/${id}`)
+    assert.equal(closed.status, 200)
+  }
+  assert.equal(leftovers(), '')
 })
 
 // Last: a drained service opens no more sessions.
