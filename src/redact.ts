@@ -385,15 +385,15 @@ export class SecretVault {
 
 export function normalizePathForAuth(rawPath: string): string {
   // Split on '/' BEFORE percent-decoding so %2F inside a matrix parameter (e.g. /formservice;x=%2Flogin) stays in-segment.
-  // For WebLogic matrix parameter ending in `=` immediately before `/` (e.g. /jderest/v2/formservice;x=/login per §6.2),
-  // treat the following segment as the matrix value while preserving genuine routing segments after ordinary matrix params (/app;v=1/login).
+  // Preserve genuine routing segments after empty matrix params (/app;v=/login -> /app/login), while keeping WebLogic E1
+  // AIS `/formservice;x=/login` scoped cleanly to `/formservice` per §6.2.
   const rawSegs = rawPath.split('/')
   const parts: string[] = []
   for (let i = 0; i < rawSegs.length; i++) {
     const raw = rawSegs[i]
     if (!raw) continue
-    const swallowsNext = /;[^;=]+=$/.test(raw)
     const preStrip = raw.split(';')[0]
+    const swallowsNext = preStrip.toLowerCase() === 'formservice' && /;[^;=]+=$/.test(raw)
     if (swallowsNext) i++
     const decoded = safeDecodeURIComponent(preStrip)
     for (const sub of decoded.split('/')) {
@@ -818,27 +818,46 @@ export function redactFormBody(raw: string, vault?: SecretVault): { text: string
     if (!pair) return pair
     const eq = pair.indexOf('=')
     if (eq < 0) {
-      if (!vault) return pair
-      const s = vault.scrub(pair)
-      vaultRedactions += s.count
-      return s.text
+      const decP = safeDecodeURIComponent(pair.replace(/\+/g, ' '))
+      if (vault) {
+        const sp1 = vault.scrub(pair)
+        const sp2 = vault.scrub(decP)
+        if (sp1.count > 0 || sp2.count > 0) {
+          vaultRedactions += Math.max(sp1.count, sp2.count)
+          return '[REDACTED:vault]'
+        }
+      }
+      if (isSensitiveValue(decP)) return '[REDACTED]'
+      return pair
     }
     const rawK = pair.slice(0, eq)
     const rawV = pair.slice(eq + 1)
     const decK = safeDecodeURIComponent(rawK.replace(/\+/g, ' '))
     const decV = safeDecodeURIComponent(rawV.replace(/\+/g, ' '))
+    let outK = rawK
+    if (vault) {
+      const sk1 = vault.scrub(rawK)
+      const sk2 = vault.scrub(decK)
+      if (sk1.count > 0 || sk2.count > 0) {
+        vaultRedactions += Math.max(sk1.count, sk2.count)
+        outK = '[REDACTED:vault]'
+      }
+    }
+    if (outK === rawK && isSensitiveValue(decK)) {
+      outK = '[REDACTED]'
+    }
     if (vault) {
       const sv1 = vault.scrub(rawV)
       const sv2 = vault.scrub(decV)
       if (sv1.count > 0 || sv2.count > 0) {
         vaultRedactions += Math.max(sv1.count, sv2.count)
-        return `${rawK}=[REDACTED:vault]`
+        return `${outK}=[REDACTED:vault]`
       }
     }
     if (isSensitiveKey(decK) || isSensitiveValue(decV)) {
-      return `${rawK}=[REDACTED]`
+      return `${outK}=[REDACTED]`
     }
-    return pair
+    return `${outK}=${rawV}`
   })
   return { text: parts.join('&'), vaultRedactions }
 }

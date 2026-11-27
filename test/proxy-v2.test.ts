@@ -351,12 +351,13 @@ test('vault scrubs errors and Referer headers without crashing', async t => {
   assert.ok(entry.from!.includes('[REDACTED:vault]'))
 })
 
-test('P2-5 finalizeAtSeal records in-flight POST as dispatch: unknown and increments incompleteAtSeal', async t => {
-  const { sockPath, upPort, setHandler, proxy, log } = await setupHarness(t)
+test('P2-5 finalizeAtSeal records in-flight POST as dispatch: unknown, preserves bodyShape, and releases observe-mode budget to 0', async t => {
+  const tracker = new InFlightBudgetTracker()
+  const { sockPath, upPort, setHandler, proxy, log } = await setupHarness(t, { inFlightTracker: tracker })
   let reqArrivedResolve!: () => void
   const reqArrived = new Promise<void>(r => { reqArrivedResolve = r })
   setHandler((_req, _res) => {
-    // Hold response open indefinitely so POST is genuinely in-flight at seal!
+    // Request body has already finished arriving at upstream; hold response open so POST is in-flight at seal!
     reqArrivedResolve()
   })
 
@@ -367,28 +368,40 @@ test('P2-5 finalizeAtSeal records in-flight POST as dispatch: unknown and increm
     headers: { host: `t.example:${upPort}`, 'content-type': 'application/json' },
   })
   req.on('error', () => {})
-  req.end('{"pending":true}')
+  req.end('{"pending":true,"amount":42}')
   await reqArrived
+  // Allow microtask eager projection build on prefixFrozenPromise to complete
+  await new Promise(r => setTimeout(r, 15))
 
+  assert.ok(tracker.getProcessBytes() > 0, 'in-flight observe request holds tee budget before seal')
   proxy.controller.finalizeAtSeal()
+  assert.equal(tracker.getProcessBytes(), 0, 'finalizeAtSeal releases all observe-mode tee & decoded budget')
+
   const entry = log.find((e: any) => e.path === '/hang') as V2Entry
   const summary = log.find((e: any) => e.rec === '_summary') as any
   assert.ok(entry, 'in-flight POST recorded at seal')
   assert.equal(entry.dispatch, 'unknown')
   assert.equal(entry.incomplete, true)
+  assert.deepEqual(entry.bodyShape, { pending: 'boolean', amount: 'number' }, 'bodyShape preserved on sealed in-flight POST')
   assert.equal(summary.incompleteAtSeal, 1)
 })
 
-test('P2-6 synchronous Stage-1 GET check is never blocked by saturated async-hook concurrency cap', async t => {
+test('P2-6 explicit checkSync Stage-1 GET bypasses async cap while non-async function returning Promise is capped before invocation', async t => {
   const releases: Array<() => void> = []
+  let getEvaluateInvoked = 0
   const hook: PolicyHookConfig = {
     mode: 'enforce',
-    evaluate: (d, ctx) => {
-      if (!d.safe.isWrite) {
+    checkSync: (d, ctx) => {
+      if (!d.safe.isWrite && d.safe.path === '/sync-read') {
         return { decisionId: ctx.decisionId, mode: 'enforce', stage: 1, action: 'allow', ruleId: 'sync-get', policyVersion: '1', ms: 0 }
       }
+      return undefined
+    },
+    // Non-async function returning a Promise (NOT an AsyncFunction!)
+    evaluate: (d, ctx) => {
+      if (!d.safe.isWrite) getEvaluateInvoked++
       return new Promise(resolve => {
-        releases.push(() => resolve({ decisionId: ctx.decisionId, mode: 'enforce', stage: 2, action: 'allow', ruleId: 'async-write', policyVersion: '1', ms: 1 }))
+        releases.push(() => resolve({ decisionId: ctx.decisionId, mode: 'enforce', stage: 2, action: 'allow', ruleId: 'async-hook', policyVersion: '1', ms: 1 }))
       })
     },
   }
@@ -401,9 +414,14 @@ test('P2-6 synchronous Stage-1 GET check is never blocked by saturated async-hoo
   const w3 = await sendReq('POST', '/w3', {}, 'c')
   assert.equal(w3.status, 503)
 
-  // Synchronous Stage-1 GET still passes with 200!
-  const g = await sendReq('GET', '/read')
-  assert.equal(g.status, 200)
+  // Non-async Promise-returning evaluate() on GET MUST fail closed BEFORE invoking evaluate()!
+  const asyncGet = await sendReq('GET', '/async-read')
+  assert.equal(asyncGet.status, 503)
+  assert.equal(getEvaluateInvoked, 0, 'non-async Promise-returning GET hook must NOT be invoked when cap is full')
+
+  // Explicit checkSync Stage-1 GET still passes with 200!
+  const syncGet = await sendReq('GET', '/sync-read')
+  assert.equal(syncGet.status, 200)
 
   for (const r of releases) r()
   assert.equal((await w1).status, 200)

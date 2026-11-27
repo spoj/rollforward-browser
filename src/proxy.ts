@@ -169,6 +169,11 @@ export type PolicyHookConfig = {
   mode: 'shadow' | 'enforce'
   liveMode?: 'enforce' | 'shadow' | 'allow'
   deadlineMs?: number
+  // Optional fast synchronous Stage-1 pre-check (never consumes async hook capacity).
+  // Return undefined to fall through to evaluate().
+  checkSync?: (d: RequestDescriptor, ctx: PolicyContext) => PolicyDecision | undefined
+  // Set true ONLY when evaluate() is guaranteed synchronous (non-Promise); returning a Promise fails closed.
+  sync?: true
   evaluate: (d: RequestDescriptor, ctx: PolicyContext) => PolicyDecision | Promise<PolicyDecision>
 }
 
@@ -1240,11 +1245,8 @@ export function startProxy(
       ms: Math.round(performance.now() - start),
     })
 
-    // Enforce concurrency cap BEFORE launching async work; never block synchronous Stage-1 checks!
-    const isAsyncFn = hook.evaluate.constructor?.name === 'AsyncFunction'
-    if (hook.mode === 'enforce' && activeAsyncHooks >= maxConcurrentAsyncHooks && (isAsyncFn || descriptor.safe.isWrite || descriptor.safe.kind === 'upgrade')) {
-      return { decision: makeErrorDecision(), busy: true }
-    }
+    const isValidDecision = (dec: unknown): dec is PolicyDecision =>
+      Boolean(dec && typeof (dec as any).action === 'string' && ['allow', 'deny', 'escalate', 'requireApproval'].includes((dec as any).action))
 
     // Per-call child AbortController aborted on parent disconnect OR deadline timeout
     const hookAbort = new AbortController()
@@ -1261,37 +1263,77 @@ export function startProxy(
       recentHttpCursor: httpCursorAtArrival,
     }
 
+    // 1. Optional explicit synchronous Stage-1 pre-check (never consumes async hook slot!)
+    if (hook.checkSync) {
+      let syncRes: PolicyDecision | undefined
+      try {
+        syncRes = hook.checkSync(descriptor, ctx)
+      } catch {
+        parentSignal.removeEventListener('abort', onParentAbort)
+        return { decision: makeErrorDecision() }
+      }
+      if (syncRes !== undefined) {
+        if (typeof (syncRes as any)?.then === 'function') {
+          Promise.resolve(syncRes).catch(() => {})
+          hookAbort.abort()
+          parentSignal.removeEventListener('abort', onParentAbort)
+          return { decision: makeErrorDecision() }
+        }
+        parentSignal.removeEventListener('abort', onParentAbort)
+        if (!isValidDecision(syncRes)) return { decision: makeErrorDecision() }
+        return { decision: { ...syncRes, decisionId } }
+      }
+    }
+
+    // 2. Explicit sync-only evaluate() contract (fails closed if a Promise is returned)
+    if (hook.sync === true) {
+      let result: PolicyDecision | Promise<PolicyDecision>
+      try {
+        result = hook.evaluate(descriptor, ctx)
+      } catch {
+        parentSignal.removeEventListener('abort', onParentAbort)
+        return { decision: makeErrorDecision() }
+      }
+      if (result && typeof (result as any).then === 'function') {
+        Promise.resolve(result).catch(() => {})
+        hookAbort.abort()
+        parentSignal.removeEventListener('abort', onParentAbort)
+        return { decision: makeErrorDecision() }
+      }
+      parentSignal.removeEventListener('abort', onParentAbort)
+      if (!isValidDecision(result)) return { decision: makeErrorDecision() }
+      return { decision: { ...result, decisionId } }
+    }
+
+    // 3. Default async-capable evaluate(): reserve concurrency capacity BEFORE invoking evaluate()!
+    if (hook.mode === 'enforce' && activeAsyncHooks >= maxConcurrentAsyncHooks) {
+      parentSignal.removeEventListener('abort', onParentAbort)
+      return { decision: makeErrorDecision(), busy: true }
+    }
+
+    activeAsyncHooks++
     let result: PolicyDecision | Promise<PolicyDecision>
     try {
       result = hook.evaluate(descriptor, ctx)
     } catch {
+      activeAsyncHooks = Math.max(0, activeAsyncHooks - 1)
       parentSignal.removeEventListener('abort', onParentAbort)
       return { decision: makeErrorDecision() }
     }
 
-    // Synchronous return (fast Stage-1 GET check): never consumes async hook slot!
+    // Synchronous return from an async-capable hook releases the reserved slot immediately
     if (!result || typeof (result as any).then !== 'function') {
+      activeAsyncHooks = Math.max(0, activeAsyncHooks - 1)
       parentSignal.removeEventListener('abort', onParentAbort)
-      const dec = result as PolicyDecision
-      if (!dec || typeof dec.action !== 'string' || !['allow', 'deny', 'escalate', 'requireApproval'].includes(dec.action)) {
-        return { decision: makeErrorDecision() }
-      }
-      // Always stamp host-issued decisionId
-      return { decision: { ...dec, decisionId } }
+      if (!isValidDecision(result)) return { decision: makeErrorDecision() }
+      return { decision: { ...result, decisionId } }
     }
 
     const promise = Promise.resolve(result)
     // Observe every promise so rejections never become unhandledProcessRejections
     promise.catch(() => {})
 
-    if (hook.mode === 'enforce' && activeAsyncHooks >= maxConcurrentAsyncHooks) {
-      hookAbort.abort()
-      parentSignal.removeEventListener('abort', onParentAbort)
-      return { decision: makeErrorDecision(), busy: true }
-    }
-
     // Slot stays occupied until underlying promise ACTUALLY settles (not released prematurely on timeout!)
-    activeAsyncHooks++
     void promise.finally(() => {
       activeAsyncHooks = Math.max(0, activeAsyncHooks - 1)
       parentSignal.removeEventListener('abort', onParentAbort)
@@ -1759,9 +1801,9 @@ export function startProxy(
     let pendingShadowLate: PolicyDecision | undefined
     let consumersLeft = activeHook && activeHook.mode === 'shadow' ? 2 : 1
     let builtPromise: Promise<{ safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void }> | undefined
-    let resolvedBuilt: { releaseDecoded: () => void } | undefined
+    let resolvedBuilt: { safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void } | undefined
 
-    const releaseObserveConsumer = (built?: { releaseDecoded: () => void }) => {
+    const releaseObserveConsumer = (built?: { safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void }) => {
       if (built) resolvedBuilt = built
       consumersLeft--
       if (consumersLeft <= 0) {
@@ -1785,6 +1827,10 @@ export function startProxy(
       if (budgetHit && built.safe.isWrite && (!built.safe.reqOmitted || built.safe.reqOmitted === 'policy-profile')) {
         built.safe.reqOmitted = 'budget'
       }
+      if (sealed || consumersLeft <= 0) {
+        built.releaseDecoded()
+        releaseTeeBudget()
+      }
       return built
     }
 
@@ -1795,6 +1841,7 @@ export function startProxy(
 
     cleanupExtra = () => {
       clearTimeout(prefixTimer)
+      consumersLeft = 0
       if (builtPromise) void builtPromise.then(b => b.releaseDecoded(), () => {})
       resolvedBuilt?.releaseDecoded()
       releaseTeeBudget()
@@ -1829,6 +1876,11 @@ export function startProxy(
           releaseObserveConsumer(desc)
         }
       })
+    } else {
+      // Eagerly compute projection as soon as prefix is frozen so finalizeAtSeal() preserves bodyShape/actions!
+      void prefixFrozenPromise.then(() => {
+        if (!sealed) void getBuilt().catch(() => {})
+      })
     }
 
     dispatchUpstream({
@@ -1841,7 +1893,7 @@ export function startProxy(
       markCommitted: () => { terminalCommitted = true; activeInFlight.delete(seq) },
       stateRef,
       getLazySafe: async () => {
-        let desc: { safe: SafeRequestProjection; releaseDecoded: () => void } | undefined
+        let desc: { safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void } | undefined
         try {
           desc = await getBuilt()
           return desc.safe
@@ -1849,6 +1901,8 @@ export function startProxy(
           releaseObserveConsumer(desc)
         }
       },
+      getResolvedSafe: () => resolvedBuilt?.safe,
+      onSealFinalize: () => cleanupExtra(),
       getShadowDecision: () => shadowDecision ?? pendingShadowLate,
       onEmittedN: n => {
         emittedEntryN = n
@@ -1884,6 +1938,8 @@ export function startProxy(
     preBuiltSafe?: SafeRequestProjection
     policyDecision?: PolicyDecision
     getLazySafe?: () => Promise<SafeRequestProjection>
+    getResolvedSafe?: () => SafeRequestProjection | undefined
+    onSealFinalize?: () => void
     getShadowDecision?: () => PolicyDecision | undefined
     onEmittedN?: (n: number | null) => void
     getReqBytes?: () => number
@@ -2010,21 +2066,22 @@ export function startProxy(
     }, streamTimeoutMs)
     streamTimer.unref?.()
 
-    // Update seal finalizer so even during async projection, seal() commits synchronously!
+    // Update seal finalizer so even during async projection, seal() commits synchronously and releases all budgets!
     activeInFlight.set(seq, {
       finalize: () => {
         if (ctx.isCommitted()) return
         incompleteAtSeal++
         clearTimeout(streamTimer)
         ctx.onCleanupTee?.()
-        ctx.replay?.releaseBudget()
-        cleanupCancellation()
-        const fb = ctx.preBuiltSafe ?? buildFallbackProjection({
+        const safe = ctx.preBuiltSafe ?? ctx.getResolvedSafe?.() ?? buildFallbackProjection({
           req, url, seq, t, kind: 'http', arrival, liveAtStart,
           httpCursorAtArrival: ctx.httpCursorAtArrival, cdpCursorAtArrival: ctx.cdpCursorAtArrival,
           siteConfigRev: ctx.revAtStart, reason: 'sealed-in-flight',
         })
-        commitProjection(fb, { incomplete: true, forceDispatch: 'unknown' })
+        ctx.onSealFinalize?.()
+        ctx.replay?.releaseBudget()
+        cleanupCancellation()
+        commitProjection(safe, { incomplete: true, forceDispatch: 'unknown' })
       },
     })
 
@@ -2331,20 +2388,35 @@ export function startProxy(
         }
       }
 
+      if (abortController.signal.aborted || socket.destroyed || sealed || admissionStopped) {
+        if (!committed) {
+          committed = true
+          activeInFlight.delete(seq)
+          cleanupAbort()
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+          emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, dispatch: 'not_dispatched', ...(policyDecision && { policy: policyDecision }), incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
+          reserved = 0
+        }
+        return
+      }
+
       const uOpts = outboundSnap!
       uOpts.headers.connection = 'upgrade'
       uOpts.headers.upgrade = req.headers.upgrade
       const up = (url!.protocol === 'https:' ? https : http).request(url!, uOpts)
       dispatchState = 'dispatched'
       activeUpstreams.add(up)
-      up.on('close', () => activeUpstreams.delete(up))
-      socket.on('close', () => up.destroy())
+      const destroyUp = () => up.destroy()
+      if (socket.destroyed) { up.destroy(); return }
+      socket.once('close', destroyUp)
+      up.on('close', () => { activeUpstreams.delete(up); socket.off('close', destroyUp) })
       up.on('upgrade', (r, upSocket, upHead) => {
-        if (socket.destroyed) { upSocket.destroy(); return }
+        if (socket.destroyed || sealed) { upSocket.destroy(); return }
         activeUpstreams.add(upSocket)
-        upSocket.on('close', () => activeUpstreams.delete(upSocket))
+        const destroyUpSock = () => upSocket.destroy()
+        upSocket.on('close', () => { activeUpstreams.delete(upSocket); socket.off('close', destroyUpSock) })
         upSocket.on('error', () => socket.destroy())
-        socket.on('close', () => upSocket.destroy())
+        socket.once('close', destroyUpSock)
         try { vault?.ingestSetCookie(r.headers['set-cookie']) } catch {}
         if (!committed) {
           committed = true

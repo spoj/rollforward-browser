@@ -911,27 +911,42 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Page.navigate' || rawMethod === 'Target.createTarget') {
       capture = true
       const rawUrl = typeof params.url === 'string' ? params.url : ''
-      const trimmedUrl = rawUrl.trim()
-      if (/^javascript:/i.test(trimmedUrl)) {
+      // Match WHATWG URL parser: strip leading/trailing C0+space and internal C0 controls/tabs/newlines before scheme check
+      const strippedUrl = rawUrl.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '')
+      const schemeProbe = strippedUrl.replace(/[\u0000-\u001f]+/g, '')
+      let navUrl: string
+      let extra: Record<string, unknown> = {}
+      if (/^(?:javascript|vbscript):/i.test(schemeProbe)) {
         severity = 'high'
-        summary = { url: 'javascript:[REDACTED]', exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
-      } else if (/^about:(?:blank|srcdoc)$/i.test(trimmedUrl)) {
-        summary = { url: trimmedUrl.toLowerCase() }
-      } else if (/^data:/i.test(trimmedUrl)) {
+        const scheme = /^vbscript:/i.test(schemeProbe) ? 'vbscript' : 'javascript'
+        navUrl = `${scheme}:[REDACTED]`
+        extra = { exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
+      } else if (/^about:(?:blank|srcdoc)$/i.test(schemeProbe)) {
+        navUrl = schemeProbe.toLowerCase()
+      } else if (/^data:/i.test(schemeProbe)) {
         severity = 'high'
-        const comma = trimmedUrl.indexOf(',')
-        const meta = (comma >= 0 ? trimmedUrl.slice(5, comma) : trimmedUrl.slice(5)).split(';')[0].trim().toLowerCase()
+        const comma = schemeProbe.indexOf(',')
+        const meta = (comma >= 0 ? schemeProbe.slice(5, comma) : schemeProbe.slice(5)).split(';')[0].trim().toLowerCase()
         const safeMime = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(meta) ? meta : 'unknown'
-        summary = { url: `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}` }
-      } else if (/^blob:/i.test(trimmedUrl)) {
-        const inner = URL.parse(trimmedUrl.slice(5))
-        summary = { url: inner ? `blob:${inner.origin}/[REDACTED]` : 'blob:[REDACTED]' }
-      } else if (/^https?:/i.test(trimmedUrl)) {
-        summary = { url: scrubUrlField(trimmedUrl) }
+        navUrl = `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}`
+      } else if (/^blob:/i.test(schemeProbe)) {
+        const inner = URL.parse(schemeProbe.slice(5))
+        navUrl = inner ? `blob:${inner.origin}/[REDACTED]` : 'blob:[REDACTED]'
+      } else if (/^https?:/i.test(schemeProbe)) {
+        navUrl = scrubUrlField(strippedUrl)
       } else {
-        const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(trimmedUrl)
-        summary = { url: `${schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown'}:[REDACTED]`, len: Buffer.byteLength(rawUrl, 'utf8') }
+        const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(schemeProbe)
+        navUrl = `${schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown'}:[REDACTED]`
+        extra = { len: Buffer.byteLength(rawUrl, 'utf8') }
       }
+      if (vault) {
+        const sc = vault.scrub(navUrl)
+        if (sc.count > 0) {
+          vaultRedactions += sc.count
+          navUrl = sc.text
+        }
+      }
+      summary = { url: navUrl, ...extra }
     } else if (NAV_SIMPLE_METHODS.has(rawMethod)) {
       capture = true
       summary = {}
@@ -1185,7 +1200,7 @@ export function createDriveVaultTap(vault: SecretVault, charger?: BudgetCharger)
   const driveBuf = vault.createDriveBuffer()
   const parser = new WsFrameParser(
     msg => {
-      if (disabled || msg.truncated) return
+      if (disabled || msg.truncated || msg.budgetDropped) return
       let parsed: any
       try {
         parsed = JSON.parse(msg.head.toString('utf8'))

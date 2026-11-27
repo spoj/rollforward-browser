@@ -7,6 +7,7 @@ import {
   isSensitiveKey,
   isTokenShaped,
   parseJsonSafe,
+  redactFormBody,
   redactJsonValue,
   sanitizeUrl,
   truncateHeadTail,
@@ -178,6 +179,7 @@ test('normalized auth-URL denylist handles WebLogic matrix params, dot segments,
   assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=%2Flogin'), false, 'in-segment matrix param stripped before decoding %2F')
   assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=login'), false, 'in-segment matrix param stripped')
   assert.equal(isAuthUrl('https://erp.example/app;v=1/login'), true, 'real auth endpoint after matrix-parameterized segment IS auth URL')
+  assert.equal(isAuthUrl('https://erp.example/app;v=/login'), true, 'empty matrix param on non-formservice segment preserves following /login auth route')
   assert.equal(isAuthUrl('https://erp.example/sso/callback'), true, 'callback endpoint IS auth URL')
   assert.equal(isAuthUrl('https://login.microsoftonline.com./common/foo'), true, 'trailing DNS dot stripped before auth host check')
   assert.equal(isAuthUrl('https://erp.example/login;jsessionid=ABC123'), true)
@@ -246,4 +248,12 @@ test('P1-5 valueless query params and query key names are templated/redacted in 
   assert.match(str, /"<key>":"ok"/)
   assert.match(str, /"\[REDACTED:vault\]":"x"/)
   assert.match(str, /"safeField":1/)
+
+  // R2 Astra P1-3: redactFormBody scrubs vault secrets in both raw and decoded form field names
+  vault.addTrustedDrive('FormFieldSec77!')
+  const rf = redactFormBody('FormFieldSec77%21=val&TypedVal9941=1&ok=2', vault)
+  assert.ok(!rf.text.includes('FormFieldSec77'))
+  assert.ok(!rf.text.includes('TypedVal9941'))
+  assert.equal(rf.text, '[REDACTED:vault]=val&[REDACTED:vault]=1&ok=2')
+  assert.equal(rf.vaultRedactions, 2)
 })

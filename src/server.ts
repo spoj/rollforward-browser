@@ -30,6 +30,8 @@ const runDir = `${os.tmpdir()}/rollforward-browser-${port}`
 const label = `rollforward-browser=${port}`
 const viewPage = fs.readFileSync(new URL('view.html', import.meta.url))
 const inFlightTracker = new InFlightBudgetTracker()
+// Dedicated /view/drive parser budget (256 KiB/session, 1 MiB/client, 8 MiB/process), isolated from HTTP proxy & external CDP!
+const driveParserTracker = new InFlightBudgetTracker(8 * 1024 * 1024, 1 * 1024 * 1024, 256 * 1024)
 
 type Session = BrowserSession & {
   client: string
@@ -98,6 +100,8 @@ function enforceRetainedMemoryCeiling(clientName: string) {
     let clientBytes = 0
     let processBytes = 0
     for (const s of sessions.values()) {
+      // Exclude non-evictable legacy sessions from ceiling accounting (unless draining) so they cannot 503 new auditV2 sessions!
+      if (!s.auditV2 && drainUntil === 0) continue
       const b = s.getRetainedBytes()
       processBytes += b
       if (s.client === clientName) clientBytes += b
@@ -361,19 +365,13 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   if (rest === '/view/watch') {
     watchOnly(socket, up, head)
   } else {
-    // Give each /view/drive connection its own small dedicated parser budget (isolated from proxy & external CDP!)
-    let driveUsed = 0
-    const driveCharger = {
-      tryAcquire: (b: number) => {
-        if (b <= 0) return true
-        if (driveUsed + b > 128 * 1024) return false
-        driveUsed += b
-        return true
-      },
-      release: (b: number) => {
-        driveUsed = Math.max(0, driveUsed - b)
-      },
-    }
+    // Shared per-session/client/process /view/drive parser budget (isolated from HTTP proxy & external CDP!)
+    const driveCharger = tapDriveVault
+      ? {
+          tryAcquire: (b: number) => driveParserTracker.tryAcquire(client.name, s.id, b),
+          release: (b: number) => driveParserTracker.release(client.name, s.id, b),
+        }
+      : undefined
     const tap = tapExternalCdp
       ? s.cdpTap!.attachConnection()
       : tapDriveVault

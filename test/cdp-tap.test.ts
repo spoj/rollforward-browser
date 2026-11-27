@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { CdpSessionTap, WsFrameParser, createDriveVaultTap, type CdpEntry } from '../src/cdp-tap.ts'
+import { InFlightBudgetTracker } from '../src/proxy.ts'
 import { SecretVault } from '../src/redact.ts'
 
 function encodeWsFrame(payload: Buffer, opts: { fin?: boolean; opcode?: number; mask?: boolean; rsv?: number } = {}): Buffer {
@@ -293,4 +294,53 @@ test('P2-12/13/14 non-http nav URLs preserve scheme, prototype method names stay
   const summary = tap.entries.find(e => e.rec === '_tap.summary') as any
   assert.equal(summary.methodCounts._unknown_other, 2)
   assert.equal(summary.methodCounts._unparsed, 1)
+})
+
+test('R2 CDP nav detects obfuscated javascript:/vbscript:/data: schemes and vault-scrubs non-http nav URLs', () => {
+  const vault = new SecretVault()
+  vault.addTrustedDrive('tenant-secret-42')
+  vault.addTrustedDrive('customsec')
+  const tap = new CdpSessionTap({ projection: 'semantic', vault, isLive: () => false, coalesceMs: 10 })
+  const conn = tap.attachConnection()
+
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: '\u0001java\tscript:alert(1)' } }))))
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 2, method: 'Page.navigate', params: { url: 'blob:https://tenant-secret-42.example/abc-123' } }))))
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 3, method: 'Target.createTarget', params: { url: 'customsec:payload' } }))))
+  tap.seal()
+
+  const navs = tap.entries.filter((e): e is CdpEntry => e.method === 'Page.navigate' || e.method === 'Target.createTarget')
+  assert.equal(navs.length, 3)
+  assert.equal(navs[0].severity, 'high')
+  assert.equal(navs[0].summary?.url, 'javascript:[REDACTED]')
+  assert.equal(navs[1].summary?.url, 'blob:https://[REDACTED:vault].example/[REDACTED]')
+  assert.ok((navs[1].vaultRedactions ?? 0) >= 1)
+  assert.equal(navs[2].summary?.url, '[REDACTED:vault]:[REDACTED]')
+  assert.ok((navs[2].vaultRedactions ?? 0) >= 1)
+})
+
+test('R2 shared per-session /view/drive parser budget bounds concurrent connections and isolates from proxy/CDP', () => {
+  const driveTracker = new InFlightBudgetTracker(8 * 1024 * 1024, 1 * 1024 * 1024, 256 * 1024)
+  const vault = new SecretVault()
+  const mkCharger = () => ({
+    tryAcquire: (b: number) => driveTracker.tryAcquire('c1', 's1', b),
+    release: (b: number) => driveTracker.release('c1', 's1', b),
+  })
+
+  // Open 6 concurrent /view/drive taps each feeding a 60 KiB unfinished fragmented frame (360 KiB > 256 KiB session cap)
+  const taps = Array.from({ length: 6 }, () => createDriveVaultTap(vault, mkCharger()))
+  const chunk60k = Buffer.alloc(60 * 1024, 0x42)
+  for (const d of taps) {
+    d.feed(encodeWsFrame(chunk60k, { fin: false, opcode: 0x1 }))
+  }
+  assert.ok(driveTracker.getProcessBytes() <= 256 * 1024, `drive budget capped at <=256KiB (got ${driveTracker.getProcessBytes()})`)
+
+  for (const d of taps) d.close()
+  assert.equal(driveTracker.getProcessBytes(), 0, 'all drive parser charges released on close')
+
+  // Subsequent /view/drive connection still populates SecretVault cleanly
+  const fresh = createDriveVaultTap(vault, mkCharger())
+  fresh.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Input.insertText', params: { text: 'DriveOtp77' } }))))
+  fresh.close()
+  assert.equal(vault.scrub('v=DriveOtp77').text, 'v=[REDACTED:vault]')
+  assert.equal(driveTracker.getProcessBytes(), 0)
 })

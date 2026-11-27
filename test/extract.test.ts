@@ -366,3 +366,55 @@ test('P2-11 SharePoint resource slice uses sanitizedPath offset when earlier seg
   })
   assert.equal(res.actions[0].resource, '/_api/web/lists')
 })
+
+test('R2 linear quote-aware XML redactor handles ReDoS, > inside quoted attrs, <Password value>, malformed XML, and vault tag/attr names', () => {
+  const mk = (body: string, vault?: SecretVault, reqType = 'text/xml') => extractSemantic({
+    url: new URL('https://bssv.example/Svc'),
+    sanitizedPath: '/Svc',
+    method: 'POST',
+    effectiveMethod: 'POST',
+    kind: 'http',
+    rawHeaders: {},
+    reqType,
+    decodedBuf: Buffer.from(body),
+    bodyComplete: true,
+    transport: 'complete',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+    projection: 'semantic+samples',
+    vault,
+  })
+
+  // 1. 64 KiB adversarial open tag attribute ReDoS completes in <20ms and omits malformed XML
+  const t0 = performance.now()
+  const redos = mk('<a ' + 'b'.repeat(65_000) + '>')
+  const ms = performance.now() - t0
+  assert.ok(ms < 20, `XML redactor must stay linear (took ${ms.toFixed(2)}ms)`)
+  assert.equal(redos.reqBody, undefined)
+  assert.equal(redos.reqOmitted, 'policy-profile')
+
+  // 2. '>' inside quoted attribute does not break tag parsing, and sensitive attribute is still redacted
+  const gtAttr = mk('<root><item note="a > b" password="SecretVal1!"/><Password value="MyPass99"/></root>')
+  assert.ok(gtAttr.reqBody, 'valid XML with > inside quoted attr preserved')
+  assert.ok(!gtAttr.reqBody!.includes('SecretVal1!'))
+  assert.ok(!gtAttr.reqBody!.includes('MyPass99'))
+  assert.match(gtAttr.reqBody!, /note="a > b"/)
+  assert.match(gtAttr.reqBody!, /password="\[REDACTED\]"/)
+  assert.match(gtAttr.reqBody!, /<Password value="\[REDACTED\]"\/>/)
+
+  // 3. Comment followed by non-XML form text is omitted fail-closed
+  const commentSmuggle = mk('<!-- ok -->password=Welcome1!&user=bob', undefined, 'text/plain')
+  assert.equal(commentSmuggle.reqBody, undefined)
+  assert.equal(commentSmuggle.reqOmitted, 'policy-profile')
+
+  // 4. Vault secret inside XML tag name or attribute name is scrubbed by final vault pass
+  const vault = new SecretVault()
+  vault.addTrustedDrive('VaultTagSec99')
+  vault.addTrustedDrive('VaultAttrSec88')
+  const tagVault = mk('<root><VaultTagSec99 VaultAttrSec88="1">ok</VaultTagSec99></root>', vault)
+  assert.ok(tagVault.reqBody)
+  assert.ok(!tagVault.reqBody!.includes('VaultTagSec99'))
+  assert.ok(!tagVault.reqBody!.includes('VaultAttrSec88'))
+  assert.ok(tagVault.vaultRedactions >= 2)
+})

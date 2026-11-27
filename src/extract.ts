@@ -594,106 +594,192 @@ export function extractSoapBodyRoot(xml: string): string | undefined {
 
 // Linear O(N) XML/SOAP redactor: redacts text inside elements whose local name is a sensitive key or container,
 // plus sensitive attribute values and vault/secret patterns.
-export function redactXmlBody(xml: string, vault?: SecretVault): { text: string; vaultRedactions: number } {
+export const MAX_XML_DEPTH = 256
+
+function isXmlWs(c: number): boolean {
+  return c === 32 || c === 9 || c === 10 || c === 13
+}
+
+function isXmlNameStart(c: number): boolean {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 58
+}
+
+function isXmlNameChar(c: number): boolean {
+  return isXmlNameStart(c) || (c >= 48 && c <= 57) || c === 45 || c === 46
+}
+
+// Single-pass, quote-aware, forward-only O(N) XML tokenizer & redactor (fail-closed on malformed/incomplete XML).
+function redactXmlBody(xml: string, vault?: SecretVault): { ok: boolean; text: string; vaultRedactions: number } {
   const len = xml.length
-  let i = 0
-  let out = ''
+  let i = len > 0 && xml.charCodeAt(0) === 0xfeff ? 1 : 0
+  const outParts: string[] = []
   let vaultRedactions = 0
-  const stack: Array<{ local: string; sensitive: boolean }> = []
-  const isNameChar = (c: number) =>
-    (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 45 || c === 46 || c === 58
+  const stack: Array<{ qname: string; sensitive: boolean }> = []
+  let rootOpened = false
+  let rootClosed = false
 
   const scrubSegment = (s: string, sensitive: boolean): string => {
     if (!s) return s
     if (sensitive) return s.trim() ? '[REDACTED]' : s
+    if (isSensitiveValue(s.trim())) return '[REDACTED]'
     const sc = scrubText(s, vault)
     vaultRedactions += sc.vaultRedactions
     return sc.text
-  }
-
-  const redactAttrs = (rawAttrs: string): string => {
-    if (!rawAttrs) return rawAttrs
-    return rawAttrs.replace(/([A-Za-z_][\w.:-]*)\s*=\s*("([^"]*)"|'([^']*)')/g, (m, name: string, _q: string, dval?: string, sval?: string) => {
-      const quote = dval !== undefined ? '"' : "'"
-      const val = dval ?? sval ?? ''
-      const colon = name.indexOf(':')
-      const local = colon >= 0 ? name.slice(colon + 1) : name
-      if (isSensitiveKey(local) || isSensitiveContainerKey(local) || isSensitiveValue(val)) {
-        return `${name}=${quote}[REDACTED]${quote}`
-      }
-      const sc = scrubText(val, vault)
-      vaultRedactions += sc.vaultRedactions
-      return sc.text === val ? m : `${name}=${quote}${sc.text}${quote}`
-    })
   }
 
   while (i < len) {
     const pos = xml.indexOf('<', i)
     const curSensitive = stack.length > 0 && stack[stack.length - 1].sensitive
     if (pos < 0) {
-      out += scrubSegment(xml.slice(i), curSensitive)
+      const tail = xml.slice(i)
+      if (tail.trim()) return { ok: false, text: '', vaultRedactions: 0 }
+      outParts.push(tail)
       break
     }
     if (pos > i) {
-      out += scrubSegment(xml.slice(i, pos), curSensitive)
+      const text = xml.slice(i, pos)
+      if (stack.length === 0) {
+        if (text.trim()) return { ok: false, text: '', vaultRedactions: 0 }
+        outParts.push(text)
+      } else {
+        outParts.push(scrubSegment(text, curSensitive))
+      }
     }
+
     if (xml.startsWith('<!--', pos)) {
       const end = xml.indexOf('-->', pos + 4)
-      if (end < 0) { out += '<!-- [REDACTED] -->'; break }
-      out += scrubSegment(xml.slice(pos, end + 3), false)
+      if (end < 0) return { ok: false, text: '', vaultRedactions: 0 }
+      outParts.push(`<!--${scrubSegment(xml.slice(pos + 4, end), curSensitive)}-->`)
       i = end + 3
       continue
     }
     if (xml.startsWith('<?', pos)) {
       const end = xml.indexOf('?>', pos + 2)
-      if (end < 0) { out += xml.slice(pos); break }
-      out += scrubSegment(xml.slice(pos, end + 2), false)
+      if (end < 0) return { ok: false, text: '', vaultRedactions: 0 }
+      outParts.push(`<?${scrubSegment(xml.slice(pos + 2, end), curSensitive)}?>`)
       i = end + 2
       continue
     }
     if (xml.startsWith('<![CDATA[', pos)) {
+      if (stack.length === 0) return { ok: false, text: '', vaultRedactions: 0 }
       const end = xml.indexOf(']]>', pos + 9)
-      if (end < 0) { out += '<![CDATA[[REDACTED]]]>'; break }
-      const inner = xml.slice(pos + 9, end)
-      out += `<![CDATA[${scrubSegment(inner, curSensitive)}]]>`
+      if (end < 0) return { ok: false, text: '', vaultRedactions: 0 }
+      outParts.push(`<![CDATA[${scrubSegment(xml.slice(pos + 9, end), curSensitive)}]]>`)
       i = end + 3
       continue
     }
-    const gt = xml.indexOf('>', pos + 1)
-    if (gt < 0) {
-      out += scrubSegment(xml.slice(pos), curSensitive)
-      break
+    if (xml.startsWith('<!', pos)) {
+      return { ok: false, text: '', vaultRedactions: 0 }
     }
-    if (xml.charCodeAt(pos + 1) === 47) { // '</'
-      const closeRaw = xml.slice(pos + 2, gt).trim()
-      const colon = closeRaw.indexOf(':')
-      const local = (colon >= 0 ? closeRaw.slice(colon + 1) : closeRaw).toLowerCase()
-      for (let k = stack.length - 1; k >= 0; k--) {
-        if (stack[k].local === local) {
-          stack.length = k
-          break
-        }
+
+    if (pos + 1 < len && xml.charCodeAt(pos + 1) === 47) { // '</'
+      let j = pos + 2
+      if (j >= len || !isXmlNameStart(xml.charCodeAt(j))) return { ok: false, text: '', vaultRedactions: 0 }
+      const nameStart = j
+      while (j < len && isXmlNameChar(xml.charCodeAt(j))) j++
+      const closeQname = xml.slice(nameStart, j)
+      while (j < len && isXmlWs(xml.charCodeAt(j))) j++
+      if (j >= len || xml.charCodeAt(j) !== 62) return { ok: false, text: '', vaultRedactions: 0 }
+      if (stack.length === 0 || stack[stack.length - 1].qname !== closeQname) {
+        return { ok: false, text: '', vaultRedactions: 0 }
       }
-      out += xml.slice(pos, gt + 1)
-      i = gt + 1
+      stack.pop()
+      if (stack.length === 0) rootClosed = true
+      outParts.push(`</${closeQname}>`)
+      i = j + 1
       continue
     }
-    let nameEnd = pos + 1
-    while (nameEnd < gt && isNameChar(xml.charCodeAt(nameEnd))) nameEnd++
-    const qname = xml.slice(pos + 1, nameEnd)
-    const selfClosing = xml.charCodeAt(gt - 1) === 47
-    const attrEnd = selfClosing ? gt - 1 : gt
-    const rawAttrs = xml.slice(nameEnd, attrEnd)
-    out += `<${qname}${redactAttrs(rawAttrs)}${selfClosing ? '/>' : '>'}`
-    if (!selfClosing && qname) {
-      const colon = qname.indexOf(':')
-      const local = colon >= 0 ? qname.slice(colon + 1) : qname
-      const nextSens = curSensitive || isSensitiveKey(local) || isSensitiveContainerKey(local)
-      stack.push({ local: local.toLowerCase(), sensitive: nextSens })
+
+    if (rootClosed) return { ok: false, text: '', vaultRedactions: 0 }
+    let j = pos + 1
+    if (j >= len || !isXmlNameStart(xml.charCodeAt(j))) return { ok: false, text: '', vaultRedactions: 0 }
+    const nameStart = j
+    while (j < len && isXmlNameChar(xml.charCodeAt(j))) j++
+    const qname = xml.slice(nameStart, j)
+    const colon = qname.indexOf(':')
+    const local = colon >= 0 ? qname.slice(colon + 1) : qname
+    const elemSensitive = curSensitive || isSensitiveKey(local) || isSensitiveContainerKey(local)
+
+    const tagParts: string[] = ['<', qname]
+    let selfClosing = false
+    let closedTag = false
+    while (j < len) {
+      const wsStart = j
+      while (j < len && isXmlWs(xml.charCodeAt(j))) j++
+      if (j >= len) return { ok: false, text: '', vaultRedactions: 0 }
+      const ch = xml.charCodeAt(j)
+      if (ch === 62) { // '>'
+        j++
+        closedTag = true
+        break
+      }
+      if (ch === 47) { // '/>'
+        if (j + 1 >= len || xml.charCodeAt(j + 1) !== 62) return { ok: false, text: '', vaultRedactions: 0 }
+        selfClosing = true
+        closedTag = true
+        j += 2
+        break
+      }
+      if (j === wsStart || !isXmlNameStart(ch)) return { ok: false, text: '', vaultRedactions: 0 }
+      const aStart = j
+      while (j < len && isXmlNameChar(xml.charCodeAt(j))) j++
+      const attrName = xml.slice(aStart, j)
+      while (j < len && isXmlWs(xml.charCodeAt(j))) j++
+      if (j >= len || xml.charCodeAt(j) !== 61) return { ok: false, text: '', vaultRedactions: 0 }
+      j++
+      while (j < len && isXmlWs(xml.charCodeAt(j))) j++
+      if (j >= len) return { ok: false, text: '', vaultRedactions: 0 }
+      const q = xml.charCodeAt(j)
+      if (q !== 34 && q !== 39) return { ok: false, text: '', vaultRedactions: 0 }
+      const quote = q === 34 ? '"' : "'"
+      j++
+      const vStart = j
+      const qEnd = xml.indexOf(quote, j)
+      if (qEnd < 0) return { ok: false, text: '', vaultRedactions: 0 }
+      const rawVal = xml.slice(vStart, qEnd)
+      if (rawVal.includes('<')) return { ok: false, text: '', vaultRedactions: 0 }
+      j = qEnd + 1
+
+      const aColon = attrName.indexOf(':')
+      const aLocal = aColon >= 0 ? attrName.slice(aColon + 1) : attrName
+      const isXmlns = attrName === 'xmlns' || attrName.startsWith('xmlns:')
+      let outVal: string
+      if (!isXmlns && (elemSensitive || isSensitiveKey(aLocal) || isSensitiveContainerKey(aLocal) || isSensitiveValue(rawVal))) {
+        outVal = '[REDACTED]'
+      } else {
+        const sc = scrubText(rawVal, vault)
+        vaultRedactions += sc.vaultRedactions
+        outVal = sc.text
+      }
+      tagParts.push(' ', attrName, '=', quote, outVal, quote)
     }
-    i = gt + 1
+    if (!closedTag) return { ok: false, text: '', vaultRedactions: 0 }
+
+    tagParts.push(selfClosing ? '/>' : '>')
+    outParts.push(tagParts.join(''))
+    if (!rootOpened) rootOpened = true
+    if (selfClosing) {
+      if (stack.length === 0) rootClosed = true
+    } else {
+      if (stack.length >= MAX_XML_DEPTH) return { ok: false, text: '', vaultRedactions: 0 }
+      stack.push({ qname, sensitive: elemSensitive })
+    }
+    i = j
   }
-  return { text: out, vaultRedactions }
+
+  if (!rootOpened || stack.length !== 0) {
+    return { ok: false, text: '', vaultRedactions: 0 }
+  }
+
+  let finalOut = outParts.join('')
+  if (vault) {
+    const finalScrub = vault.scrub(finalOut)
+    if (finalScrub.count > 0) {
+      vaultRedactions += finalScrub.count
+      finalOut = finalScrub.text
+    }
+  }
+  return { ok: true, text: finalOut, vaultRedactions }
 }
 
 const FORM_LIKE_RE = /^[A-Za-z0-9_.%+-]+=[^&\r\n]*(?:&[A-Za-z0-9_.%+-]+=[^&\r\n]*)*$/
@@ -1158,8 +1244,13 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
           redactedText = rf.text
         } else if (isXml) {
           const rx = redactXmlBody(decodedText, input.vault)
-          vaultRedactions += rx.vaultRedactions
-          redactedText = rx.text
+          if (rx.ok) {
+            vaultRedactions += rx.vaultRedactions
+            redactedText = rx.text
+          } else {
+            reqOmitted = 'policy-profile'
+            reasons.push('malformed-xml')
+          }
         } else {
           // Omit unstructured plain text where key-based redaction cannot protect passwords
           reqOmitted = 'policy-profile'
