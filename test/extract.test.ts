@@ -417,4 +417,13 @@ test('R2 linear quote-aware XML redactor handles ReDoS, > inside quoted attrs, <
   assert.ok(!tagVault.reqBody!.includes('VaultTagSec99'))
   assert.ok(!tagVault.reqBody!.includes('VaultAttrSec88'))
   assert.ok(tagVault.vaultRedactions >= 2)
+
+  // 5. R3 Astra P1-2: 64 KiB all-uppercase legal XML tag & attribute names run in linear time (<50ms)
+  const bigTag = 'A'.repeat(32_000)
+  const bigAttr = 'B'.repeat(32_000)
+  const t1 = performance.now()
+  const upperXml = mk(`<${bigTag} ${bigAttr}="1"/>`)
+  const upperMs = performance.now() - t1
+  assert.ok(upperMs < 50, `tokenizeKey on 64 KiB uppercase XML names must stay linear (took ${upperMs.toFixed(2)}ms)`)
+  assert.ok(upperXml.reqBody && upperXml.reqBody.length > 0)
 })

@@ -427,3 +427,66 @@ test('P2-6 explicit checkSync Stage-1 GET bypasses async cap while non-async fun
   assert.equal((await w1).status, 200)
   assert.equal((await w2).status, 200)
 })
+
+test('R3 seal() during pending async WebSocket upgrade admission aborts hook, closes downstream socket, and never dials upstream', async t => {
+  let hookStartedResolve!: () => void
+  const hookStarted = new Promise<void>(r => { hookStartedResolve = r })
+  let signalAborted = false
+  let releaseHook!: () => void
+
+  const hook: PolicyHookConfig = {
+    mode: 'enforce',
+    evaluate: (_d, ctx) => {
+      ctx.signal.addEventListener('abort', () => { signalAborted = true }, { once: true })
+      hookStartedResolve()
+      return new Promise(resolve => {
+        releaseHook = () => resolve({
+          decisionId: ctx.decisionId,
+          mode: 'enforce',
+          stage: 2,
+          action: 'allow',
+          ruleId: 'late-allow',
+          policyVersion: '1',
+          ms: 10,
+        })
+      })
+    },
+  }
+
+  const { sockPath, upPort, upstreamHits, proxy, log } = await setupHarness(t, { policyHook: hook })
+  const sock = net.connect(sockPath)
+  await once(sock, 'connect')
+  let sockClosed = false
+  const closedPromise = once(sock, 'close').then(() => { sockClosed = true })
+  sock.on('error', () => {})
+
+  const key = crypto.randomBytes(16).toString('base64')
+  sock.write(
+    `GET http://t.example:${upPort}/ws HTTP/1.1\r\n` +
+    `Host: t.example:${upPort}\r\n` +
+    `Upgrade: websocket\r\n` +
+    `Connection: Upgrade\r\n` +
+    `Sec-WebSocket-Key: ${key}\r\n` +
+    `Sec-WebSocket-Version: 13\r\n\r\n`,
+  )
+
+  await hookStarted
+  proxy.controller.finalizeAtSeal()
+
+  // Downstream upgrade socket MUST close promptly and hook AbortSignal MUST fire
+  await Promise.race([
+    closedPromise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('downstream upgrade socket hung open after seal()')), 500)),
+  ])
+  assert.equal(sockClosed, true, 'downstream upgrade socket closed on seal()')
+  assert.equal(signalAborted, true, 'pending upgrade admission AbortSignal fired on seal()')
+
+  // Even after the late hook resolves, upstream must NEVER be dialed!
+  releaseHook()
+  await new Promise(r => setTimeout(r, 30))
+  assert.equal(upstreamHits.length, 0, 'no upstream dial after sealed upgrade admission')
+  const entry = log.find((e: any) => e.kind === 'upgrade') as V2Entry
+  assert.ok(entry, 'sealed pending upgrade recorded')
+  assert.equal(entry.dispatch, 'not_dispatched')
+  assert.equal(entry.incomplete, true)
+})

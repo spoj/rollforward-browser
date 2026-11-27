@@ -10,6 +10,7 @@ import {
   redactFormBody,
   redactJsonValue,
   sanitizeUrl,
+  tokenizeKey,
   truncateHeadTail,
 } from '../src/redact.ts'
 
@@ -256,4 +257,13 @@ test('P1-5 valueless query params and query key names are templated/redacted in 
   assert.ok(!rf.text.includes('TypedVal9941'))
   assert.equal(rf.text, '[REDACTED:vault]=val&[REDACTED:vault]=1&ok=2')
   assert.equal(rf.vaultRedactions, 2)
+
+  // R3 Astra P1-2: linear tokenizeKey matches camelCase/PascalCase/acronyms and runs <20ms on 64 KiB uppercase
+  assert.deepEqual(tokenizeKey('XMLHttpRequest'), ['xml', 'http', 'request'])
+  assert.deepEqual(tokenizeKey('APIKey'), ['api', 'key'])
+  assert.deepEqual(tokenizeKey('userID'), ['user', 'id'])
+  assert.deepEqual(tokenizeKey('oauth2Token'), ['oauth2', 'token'])
+  const t0 = performance.now()
+  assert.deepEqual(tokenizeKey('A'.repeat(65_536)), ['a'.repeat(65_536)])
+  assert.ok(performance.now() - t0 < 20, 'tokenizeKey must stay linear on 64 KiB uppercase run')
 })

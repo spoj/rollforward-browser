@@ -911,8 +911,12 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Page.navigate' || rawMethod === 'Target.createTarget') {
       capture = true
       const rawUrl = typeof params.url === 'string' ? params.url : ''
-      // Match WHATWG URL parser: strip leading/trailing C0+space and internal C0 controls/tabs/newlines before scheme check
-      const strippedUrl = rawUrl.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '')
+      // Linear O(N) C0/space trim (matches WHATWG URL parser without regex backtracking)
+      let uStart = 0
+      let uEnd = rawUrl.length
+      while (uStart < uEnd && rawUrl.charCodeAt(uStart) <= 0x20) uStart++
+      while (uEnd > uStart && rawUrl.charCodeAt(uEnd - 1) <= 0x20) uEnd--
+      const strippedUrl = rawUrl.slice(uStart, uEnd)
       const schemeProbe = strippedUrl.replace(/[\u0000-\u001f]+/g, '')
       let navUrl: string
       let extra: Record<string, unknown> = {}
@@ -926,17 +930,45 @@ export class CdpSessionTap {
       } else if (/^data:/i.test(schemeProbe)) {
         severity = 'high'
         const comma = schemeProbe.indexOf(',')
-        const meta = (comma >= 0 ? schemeProbe.slice(5, comma) : schemeProbe.slice(5)).split(';')[0].trim().toLowerCase()
-        const safeMime = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(meta) ? meta : 'unknown'
+        const rawMeta = (comma >= 0 ? schemeProbe.slice(5, comma) : schemeProbe.slice(5)).split(';')[0].trim()
+        let safeMime = /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(rawMeta) ? rawMeta : 'unknown'
+        if (vault) {
+          const sm = vault.scrub(safeMime)
+          if (sm.count > 0) {
+            vaultRedactions += sm.count
+            safeMime = sm.text
+          }
+        }
+        safeMime = safeMime.includes('[REDACTED:vault]') ? safeMime : safeMime.toLowerCase()
         navUrl = `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}`
       } else if (/^blob:/i.test(schemeProbe)) {
-        const inner = URL.parse(schemeProbe.slice(5))
-        navUrl = inner ? `blob:${inner.origin}/[REDACTED]` : 'blob:[REDACTED]'
+        const rawInner = schemeProbe.slice(5)
+        const inner = URL.parse(rawInner)
+        let origin = inner ? inner.origin : ''
+        // Scrub mixed-case authority BEFORE URL.parse lowercases hostname
+        const authMatch = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(rawInner)
+        if (vault && authMatch) {
+          const sa = vault.scrub(authMatch[1])
+          if (sa.count > 0) {
+            vaultRedactions += sa.count
+            origin = `${inner ? inner.protocol : 'https:'}//${sa.text}`
+          }
+        }
+        navUrl = origin ? `blob:${origin}/[REDACTED]` : 'blob:[REDACTED]'
       } else if (/^https?:/i.test(schemeProbe)) {
         navUrl = scrubUrlField(strippedUrl)
       } else {
         const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(schemeProbe)
-        navUrl = `${schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown'}:[REDACTED]`
+        let rawScheme = schemeMatch ? schemeMatch[1] : 'unknown'
+        if (vault) {
+          const ss = vault.scrub(rawScheme)
+          if (ss.count > 0) {
+            vaultRedactions += ss.count
+            rawScheme = ss.text
+          }
+        }
+        const finalScheme = rawScheme.includes('[REDACTED:vault]') ? rawScheme : rawScheme.toLowerCase()
+        navUrl = `${finalScheme}:[REDACTED]`
         extra = { len: Buffer.byteLength(rawUrl, 'utf8') }
       }
       if (vault) {

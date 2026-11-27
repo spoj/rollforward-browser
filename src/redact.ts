@@ -418,13 +418,45 @@ export function isAuthUrl(raw: string | URL): boolean {
   return AUTH_PATH_RE.test(norm)
 }
 
+const isAsciiUpper = (c: number) => c >= 65 && c <= 90
+const isAsciiLower = (c: number) => c >= 97 && c <= 122
+const isAsciiDigit = (c: number) => c >= 48 && c <= 57
+const isAsciiAlnum = (c: number) => isAsciiUpper(c) || isAsciiLower(c) || isAsciiDigit(c)
+
+// Single-pass O(N) identifier tokenizer (handles camelCase, PascalCase, acronyms like XMLHttpRequest/APIKey/userID, delimiters).
 export function tokenizeKey(key: string): string[] {
-  return key
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean)
+  const tokens: string[] = []
+  const len = key.length
+  let tokStart = -1
+  for (let i = 0; i < len; i++) {
+    const c = key.charCodeAt(i)
+    if (!isAsciiAlnum(c)) {
+      if (tokStart >= 0) {
+        tokens.push(key.slice(tokStart, i).toLowerCase())
+        tokStart = -1
+      }
+      continue
+    }
+    if (tokStart < 0) {
+      tokStart = i
+      continue
+    }
+    if (isAsciiUpper(c)) {
+      const prev = key.charCodeAt(i - 1)
+      if (
+        isAsciiLower(prev) ||
+        isAsciiDigit(prev) ||
+        (isAsciiUpper(prev) && i + 1 < len && isAsciiLower(key.charCodeAt(i + 1)))
+      ) {
+        tokens.push(key.slice(tokStart, i).toLowerCase())
+        tokStart = i
+      }
+    }
+  }
+  if (tokStart >= 0) {
+    tokens.push(key.slice(tokStart).toLowerCase())
+  }
+  return tokens
 }
 
 export function isSensitiveContainerKey(key: string): boolean {

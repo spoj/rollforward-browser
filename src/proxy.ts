@@ -782,6 +782,7 @@ export function startProxy(
   const collapsedGets: Record<string, { count: number; bytes: number }> = {}
   const activeUpstreams = new Set<http.ClientRequest | net.Socket>()
   const activeTunnels = new Set<net.Socket>()
+  const activeUpgradeSockets = new Set<net.Socket>()
   const activeInFlight = new Map<number, { finalize: () => void }>()
   const activeAbortControllers = new Set<AbortController>()
 
@@ -1266,14 +1267,18 @@ export function startProxy(
     // 1. Optional explicit synchronous Stage-1 pre-check (never consumes async hook slot!)
     if (hook.checkSync) {
       let syncRes: PolicyDecision | undefined
+      let isThenable = false
       try {
         syncRes = hook.checkSync(descriptor, ctx)
+        if (syncRes !== undefined) {
+          isThenable = typeof (syncRes as any)?.then === 'function'
+        }
       } catch {
         parentSignal.removeEventListener('abort', onParentAbort)
         return { decision: makeErrorDecision() }
       }
       if (syncRes !== undefined) {
-        if (typeof (syncRes as any)?.then === 'function') {
+        if (isThenable) {
           Promise.resolve(syncRes).catch(() => {})
           hookAbort.abort()
           parentSignal.removeEventListener('abort', onParentAbort)
@@ -1288,13 +1293,15 @@ export function startProxy(
     // 2. Explicit sync-only evaluate() contract (fails closed if a Promise is returned)
     if (hook.sync === true) {
       let result: PolicyDecision | Promise<PolicyDecision>
+      let isThenable = false
       try {
         result = hook.evaluate(descriptor, ctx)
+        isThenable = Boolean(result && typeof (result as any).then === 'function')
       } catch {
         parentSignal.removeEventListener('abort', onParentAbort)
         return { decision: makeErrorDecision() }
       }
-      if (result && typeof (result as any).then === 'function') {
+      if (isThenable) {
         Promise.resolve(result).catch(() => {})
         hookAbort.abort()
         parentSignal.removeEventListener('abort', onParentAbort)
@@ -1313,8 +1320,10 @@ export function startProxy(
 
     activeAsyncHooks++
     let result: PolicyDecision | Promise<PolicyDecision>
+    let isThenable = false
     try {
       result = hook.evaluate(descriptor, ctx)
+      isThenable = Boolean(result && typeof (result as any).then === 'function')
     } catch {
       activeAsyncHooks = Math.max(0, activeAsyncHooks - 1)
       parentSignal.removeEventListener('abort', onParentAbort)
@@ -1322,7 +1331,7 @@ export function startProxy(
     }
 
     // Synchronous return from an async-capable hook releases the reserved slot immediately
-    if (!result || typeof (result as any).then !== 'function') {
+    if (!isThenable) {
       activeAsyncHooks = Math.max(0, activeAsyncHooks - 1)
       parentSignal.removeEventListener('abort', onParentAbort)
       if (!isValidDecision(result)) return { decision: makeErrorDecision() }
@@ -2198,6 +2207,8 @@ export function startProxy(
       socket.end('HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\n\r\n')
       return
     }
+    activeUpgradeSockets.add(socket)
+    socket.once('close', () => activeUpgradeSockets.delete(socket))
     const startMs = performance.now()
     const t = new Date().toISOString()
     const url = urlOf(req)
@@ -2256,11 +2267,13 @@ export function startProxy(
 
       const abortController = new AbortController()
       activeAbortControllers.add(abortController)
-      const onSockClose = () => abortController.abort()
-      socket.once('close', onSockClose)
+      const onSockAbort = () => abortController.abort()
+      socket.once('close', onSockAbort)
+      socket.once('end', onSockAbort)
       const cleanupAbort = () => {
         activeAbortControllers.delete(abortController)
-        socket.off('close', onSockClose)
+        socket.off('close', onSockAbort)
+        socket.off('end', onSockAbort)
       }
 
       let committed = false
@@ -2343,6 +2356,7 @@ export function startProxy(
               emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, dispatch: 'not_dispatched', policy: policyDecision, incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
               reserved = 0
             }
+            socket.destroy()
             return
           }
           if (policyDecision.action !== 'allow') {
@@ -2397,6 +2411,7 @@ export function startProxy(
           emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, dispatch: 'not_dispatched', ...(policyDecision && { policy: policyDecision }), incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         }
+        socket.destroy()
         return
       }
 
@@ -2546,6 +2561,8 @@ export function startProxy(
     activeAbortControllers.clear()
     for (const sock of activeTunnels) sock.destroy()
     activeTunnels.clear()
+    for (const sock of activeUpgradeSockets) sock.destroy()
+    activeUpgradeSockets.clear()
     for (const up of activeUpstreams) up.destroy()
     activeUpstreams.clear()
   }
@@ -2554,13 +2571,19 @@ export function startProxy(
     stopAdmission,
     finalizeAtSeal: () => {
       if (sealed) return { logCursor: cursorCounter, droppedGets, refusedFull: refusedFullCount }
-      // Stop accepting new connections first, finalize all still-in-flight entries with dispatch:'unknown' & incompleteAtSeal
-      // BEFORE aborting/destroying active upstreams so onAbort() cannot misclassify them as normal dispatched completions!
+      // Stop accepting new connections first; snapshot pending abort controllers before finalize() unregisters them,
+      // finalize all in-flight entries with exact dispatch ('unknown' / 'not_dispatched'), then abort all controllers
+      // and destroy every tunnel, downstream upgrade socket, and upstream cleanly!
       admissionStopped = true
       outer.close()
       inner.close()
+      const pendingAborts = [...activeAbortControllers]
+      activeAbortControllers.clear()
       for (const item of [...activeInFlight.values()]) item.finalize()
       activeInFlight.clear()
+      for (const ac of pendingAborts) ac.abort()
+      for (const ac of activeAbortControllers) ac.abort()
+      activeAbortControllers.clear()
       if (v2Enabled) {
         const summary: SummaryEntry = {
           n: ++cursorCounter,
@@ -2576,13 +2599,12 @@ export function startProxy(
         tailLogBytes += Buffer.byteLength(JSON.stringify(summary), 'utf8')
       }
       sealed = true
-      // Now destroy all remaining connections, tunnels, abort controllers, and upstreams cleanly.
       outer.closeAllConnections?.()
       inner.closeAllConnections?.()
-      for (const ac of activeAbortControllers) ac.abort()
-      activeAbortControllers.clear()
       for (const sock of activeTunnels) sock.destroy()
       activeTunnels.clear()
+      for (const sock of activeUpgradeSockets) sock.destroy()
+      activeUpgradeSockets.clear()
       for (const up of activeUpstreams) up.destroy()
       activeUpstreams.clear()
       return { logCursor: cursorCounter, droppedGets, refusedFull: refusedFullCount }

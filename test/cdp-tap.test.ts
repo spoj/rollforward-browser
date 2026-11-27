@@ -344,3 +344,35 @@ test('R2 shared per-session /view/drive parser budget bounds concurrent connecti
   assert.equal(vault.scrub('v=DriveOtp77').text, 'v=[REDACTED:vault]')
   assert.equal(driveTracker.getProcessBytes(), 0)
 })
+
+test('R3 linear C0/space nav URL trim (<50ms on 64 KiB spaces) and mixed-case vault scrub before lowercasing', () => {
+  const vault = new SecretVault()
+  vault.addTrustedDrive('MixedCaseTenant99')
+  vault.addTrustedDrive('MySecScheme')
+  vault.addTrustedDrive('MyMimeSec')
+  const tap = new CdpSessionTap({ projection: 'semantic', vault, isLive: () => false, coalesceMs: 10 })
+  const conn = tap.attachConnection()
+
+  const t0 = performance.now()
+  // Keep total JSON frame <= MAX_MSG_HEAD (65,536 B) so Page.navigate actually parses & trims ~65.4 KiB of interior spaces!
+  const spaceRun = 'a' + ' '.repeat(65_450) + 'b'
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: spaceRun } }))))
+  const ms = performance.now() - t0
+  assert.ok(ms < 50, `C0/space trim must stay linear (took ${ms.toFixed(2)}ms)`)
+
+  // Mixed-case vault secrets in non-HTTP scheme, data MIME, and blob authority scrubbed before lowercasing
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 2, method: 'Page.navigate', params: { url: 'MySecScheme:secret-payload' } }))))
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 3, method: 'Page.navigate', params: { url: 'data:application/vnd.MyMimeSec+xml,abc' } }))))
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 4, method: 'Page.navigate', params: { url: 'blob:https://MixedCaseTenant99.example/item-1' } }))))
+  tap.seal()
+
+  const navs = tap.entries.filter((e): e is CdpEntry => e.method === 'Page.navigate')
+  assert.equal(navs.length, 4)
+  assert.equal(navs[1].summary?.url, '[REDACTED:vault]:[REDACTED]')
+  assert.ok((navs[1].vaultRedactions ?? 0) >= 1)
+  assert.equal(navs[2].severity, 'high')
+  assert.match(String(navs[2].summary?.url), /^data:application\/vnd\.\[REDACTED:vault\]\+xml;len=/)
+  assert.ok((navs[2].vaultRedactions ?? 0) >= 1)
+  assert.equal(navs[3].summary?.url, 'blob:https://[REDACTED:vault].example/[REDACTED]')
+  assert.ok((navs[3].vaultRedactions ?? 0) >= 1)
+})
