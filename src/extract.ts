@@ -3,11 +3,12 @@ import {
   buildBodyShape,
   buildFormBodyShape,
   isDataLikeKey,
+  isSensitiveContainerKey,
+  isSensitiveKey,
   isSensitiveValue,
   parseJsonSafe,
   redactFormBody,
   redactJsonValue,
-  redactPlainText,
   scrubStructuralKey,
   scrubText,
   truncateUtf8HeadTail,
@@ -520,14 +521,182 @@ export function classifyGraphqlQuery(
   return { op: 'mixed', opNames, opKinds }
 }
 
+// Linear O(N) SOAP Body root element scanner (zero regex backtracking / ReDoS-safe).
 export function extractSoapBodyRoot(xml: string): string | undefined {
-  const clean = xml.replace(/<!--[\s\S]*?-->/g, '').replace(/<\?[\s\S]*?\?>/g, '')
-  const bodyMatch = /<(?:[A-Za-z_][\w.-]*:)?Body(?:\s[^>]*)?>([\s\S]*)/i.exec(clean)
-  if (!bodyMatch) return undefined
-  const inside = bodyMatch[1]
-  const childMatch = /<([A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)(?=[\s/>])/.exec(inside)
-  return childMatch?.[1]
+  const len = xml.length
+  let i = 0
+  let inBody = false
+  const isNameChar = (c: number) =>
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 45 || c === 46 || c === 58
+
+  while (i < len) {
+    const pos = xml.indexOf('<', i)
+    if (pos < 0 || pos + 1 >= len) return undefined
+    if (xml.startsWith('<!--', pos)) {
+      const end = xml.indexOf('-->', pos + 4)
+      if (end < 0) return undefined
+      i = end + 3
+      continue
+    }
+    if (xml.startsWith('<?', pos)) {
+      const end = xml.indexOf('?>', pos + 2)
+      if (end < 0) return undefined
+      i = end + 2
+      continue
+    }
+    if (xml.startsWith('<![CDATA[', pos)) {
+      const end = xml.indexOf(']]>', pos + 9)
+      if (end < 0) return undefined
+      i = end + 3
+      continue
+    }
+    if (xml.startsWith('<!', pos)) {
+      const end = xml.indexOf('>', pos + 2)
+      if (end < 0) return undefined
+      i = end + 1
+      continue
+    }
+    const nextCh = xml.charCodeAt(pos + 1)
+    if (nextCh === 47) { // '</'
+      const end = xml.indexOf('>', pos + 2)
+      if (end < 0) return undefined
+      if (inBody) {
+        const closeName = xml.slice(pos + 2, end).trim()
+        const colon = closeName.indexOf(':')
+        const local = (colon >= 0 ? closeName.slice(colon + 1) : closeName).toLowerCase()
+        if (local === 'body') return undefined
+      }
+      i = end + 1
+      continue
+    }
+    let nameEnd = pos + 1
+    while (nameEnd < len && isNameChar(xml.charCodeAt(nameEnd))) nameEnd++
+    if (nameEnd === pos + 1) {
+      i = pos + 1
+      continue
+    }
+    const qname = xml.slice(pos + 1, nameEnd)
+    const gt = xml.indexOf('>', nameEnd)
+    if (gt < 0) return undefined
+    const selfClosing = xml.charCodeAt(gt - 1) === 47
+    if (inBody) {
+      return qname
+    }
+    const colon = qname.indexOf(':')
+    const local = (colon >= 0 ? qname.slice(colon + 1) : qname).toLowerCase()
+    if (local === 'body' && !selfClosing) {
+      inBody = true
+    }
+    i = gt + 1
+  }
+  return undefined
 }
+
+// Linear O(N) XML/SOAP redactor: redacts text inside elements whose local name is a sensitive key or container,
+// plus sensitive attribute values and vault/secret patterns.
+export function redactXmlBody(xml: string, vault?: SecretVault): { text: string; vaultRedactions: number } {
+  const len = xml.length
+  let i = 0
+  let out = ''
+  let vaultRedactions = 0
+  const stack: Array<{ local: string; sensitive: boolean }> = []
+  const isNameChar = (c: number) =>
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 45 || c === 46 || c === 58
+
+  const scrubSegment = (s: string, sensitive: boolean): string => {
+    if (!s) return s
+    if (sensitive) return s.trim() ? '[REDACTED]' : s
+    const sc = scrubText(s, vault)
+    vaultRedactions += sc.vaultRedactions
+    return sc.text
+  }
+
+  const redactAttrs = (rawAttrs: string): string => {
+    if (!rawAttrs) return rawAttrs
+    return rawAttrs.replace(/([A-Za-z_][\w.:-]*)\s*=\s*("([^"]*)"|'([^']*)')/g, (m, name: string, _q: string, dval?: string, sval?: string) => {
+      const quote = dval !== undefined ? '"' : "'"
+      const val = dval ?? sval ?? ''
+      const colon = name.indexOf(':')
+      const local = colon >= 0 ? name.slice(colon + 1) : name
+      if (isSensitiveKey(local) || isSensitiveContainerKey(local) || isSensitiveValue(val)) {
+        return `${name}=${quote}[REDACTED]${quote}`
+      }
+      const sc = scrubText(val, vault)
+      vaultRedactions += sc.vaultRedactions
+      return sc.text === val ? m : `${name}=${quote}${sc.text}${quote}`
+    })
+  }
+
+  while (i < len) {
+    const pos = xml.indexOf('<', i)
+    const curSensitive = stack.length > 0 && stack[stack.length - 1].sensitive
+    if (pos < 0) {
+      out += scrubSegment(xml.slice(i), curSensitive)
+      break
+    }
+    if (pos > i) {
+      out += scrubSegment(xml.slice(i, pos), curSensitive)
+    }
+    if (xml.startsWith('<!--', pos)) {
+      const end = xml.indexOf('-->', pos + 4)
+      if (end < 0) { out += '<!-- [REDACTED] -->'; break }
+      out += scrubSegment(xml.slice(pos, end + 3), false)
+      i = end + 3
+      continue
+    }
+    if (xml.startsWith('<?', pos)) {
+      const end = xml.indexOf('?>', pos + 2)
+      if (end < 0) { out += xml.slice(pos); break }
+      out += scrubSegment(xml.slice(pos, end + 2), false)
+      i = end + 2
+      continue
+    }
+    if (xml.startsWith('<![CDATA[', pos)) {
+      const end = xml.indexOf(']]>', pos + 9)
+      if (end < 0) { out += '<![CDATA[[REDACTED]]]>'; break }
+      const inner = xml.slice(pos + 9, end)
+      out += `<![CDATA[${scrubSegment(inner, curSensitive)}]]>`
+      i = end + 3
+      continue
+    }
+    const gt = xml.indexOf('>', pos + 1)
+    if (gt < 0) {
+      out += scrubSegment(xml.slice(pos), curSensitive)
+      break
+    }
+    if (xml.charCodeAt(pos + 1) === 47) { // '</'
+      const closeRaw = xml.slice(pos + 2, gt).trim()
+      const colon = closeRaw.indexOf(':')
+      const local = (colon >= 0 ? closeRaw.slice(colon + 1) : closeRaw).toLowerCase()
+      for (let k = stack.length - 1; k >= 0; k--) {
+        if (stack[k].local === local) {
+          stack.length = k
+          break
+        }
+      }
+      out += xml.slice(pos, gt + 1)
+      i = gt + 1
+      continue
+    }
+    let nameEnd = pos + 1
+    while (nameEnd < gt && isNameChar(xml.charCodeAt(nameEnd))) nameEnd++
+    const qname = xml.slice(pos + 1, nameEnd)
+    const selfClosing = xml.charCodeAt(gt - 1) === 47
+    const attrEnd = selfClosing ? gt - 1 : gt
+    const rawAttrs = xml.slice(nameEnd, attrEnd)
+    out += `<${qname}${redactAttrs(rawAttrs)}${selfClosing ? '/>' : '>'}`
+    if (!selfClosing && qname) {
+      const colon = qname.indexOf(':')
+      const local = colon >= 0 ? qname.slice(colon + 1) : qname
+      const nextSens = curSensitive || isSensitiveKey(local) || isSensitiveContainerKey(local)
+      stack.push({ local: local.toLowerCase(), sensitive: nextSens })
+    }
+    i = gt + 1
+  }
+  return { text: out, vaultRedactions }
+}
+
+const FORM_LIKE_RE = /^[A-Za-z0-9_.%+-]+=[^&\r\n]*(?:&[A-Za-z0-9_.%+-]+=[^&\r\n]*)*$/
 
 export type ExtractInput = {
   url: URL
@@ -765,8 +934,9 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
 
     // 2. SharePoint REST API
     else if (lowerPath.includes('/_api/') || lowerPath.includes('/_vti_bin/')) {
-      const apiIdx = lowerPath.indexOf('/_api/') >= 0 ? lowerPath.indexOf('/_api/') : lowerPath.indexOf('/_vti_bin/')
-      const spResource = input.sanitizedPath.slice(Math.max(0, apiIdx)) || input.sanitizedPath
+      const sanLower = input.sanitizedPath.toLowerCase()
+      const apiIdx = sanLower.indexOf('/_api/') >= 0 ? sanLower.indexOf('/_api/') : sanLower.indexOf('/_vti_bin/')
+      const spResource = apiIdx >= 0 ? input.sanitizedPath.slice(apiIdx) : input.sanitizedPath
       if (lowerPath.includes('/$batch')) {
         actions.push({
           family: 'sharepoint',
@@ -967,25 +1137,41 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       } else if (input.sampleBudgetOk === false) {
         reqOmitted = 'budget'
       } else if (decodedText !== undefined) {
-        let redactedText: string
+        const trimmedSample = decodedText.trim()
+        const isXml =
+          input.reqType === 'text/xml' ||
+          input.reqType === 'application/xml' ||
+          input.reqType === 'application/soap+xml' ||
+          trimmedSample.startsWith('<')
+        const isForm =
+          input.reqType === 'application/x-www-form-urlencoded' ||
+          (!isJson && !isXml && FORM_LIKE_RE.test(trimmedSample))
+
+        let redactedText: string | undefined
         if (isJson) {
           const rj = redactJsonValue(parsedJson, input.vault, false)
           vaultRedactions += rj.vaultRedactions
           redactedText = JSON.stringify(rj.value)
-        } else if (input.reqType === 'application/x-www-form-urlencoded') {
+        } else if (isForm) {
           const rf = redactFormBody(decodedText, input.vault)
           vaultRedactions += rf.vaultRedactions
           redactedText = rf.text
+        } else if (isXml) {
+          const rx = redactXmlBody(decodedText, input.vault)
+          vaultRedactions += rx.vaultRedactions
+          redactedText = rx.text
         } else {
-          const rp = redactPlainText(decodedText, input.vault)
-          vaultRedactions += rp.vaultRedactions
-          redactedText = rp.text
+          // Omit unstructured plain text where key-based redaction cannot protect passwords
+          reqOmitted = 'policy-profile'
+          reasons.push('unstructured-text')
         }
-        if (Buffer.byteLength(redactedText, 'utf8') > MAX_SAMPLE_BODY_BYTES) {
-          reqBody = truncateUtf8HeadTail(redactedText, MAX_SAMPLE_BODY_BYTES, 3072, 1020)
-          reqTrunc = true
-        } else {
-          reqBody = redactedText
+        if (redactedText !== undefined) {
+          if (Buffer.byteLength(redactedText, 'utf8') > MAX_SAMPLE_BODY_BYTES) {
+            reqBody = truncateUtf8HeadTail(redactedText, MAX_SAMPLE_BODY_BYTES, 3072, 1020)
+            reqTrunc = true
+          } else {
+            reqBody = redactedText
+          }
         }
       }
     }

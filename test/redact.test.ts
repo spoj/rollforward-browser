@@ -174,9 +174,9 @@ test('SecretVault two-pool isolation prevents cookie poisoning, protects trusted
 })
 
 test('normalized auth-URL denylist handles WebLogic matrix params, dot segments, trailing host dot, callbacks, and percent-encoding', () => {
+  assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=/login'), false, 'WebLogic ;x=/login matches §6.2 acceptance matrix (NOT auth URL)')
   assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=%2Flogin'), false, 'in-segment matrix param stripped before decoding %2F')
   assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=login'), false, 'in-segment matrix param stripped')
-  assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=/login'), true, 'fail-closed: real following /login segment preserved')
   assert.equal(isAuthUrl('https://erp.example/app;v=1/login'), true, 'real auth endpoint after matrix-parameterized segment IS auth URL')
   assert.equal(isAuthUrl('https://erp.example/sso/callback'), true, 'callback endpoint IS auth URL')
   assert.equal(isAuthUrl('https://login.microsoftonline.com./common/foo'), true, 'trailing DNS dot stripped before auth host check')
@@ -213,4 +213,37 @@ test('URL sanitization templates query values in semantic mode, preserves %20 in
       assert.ok(next >= 0xdc00 && next <= 0xdfff, 'no lone high surrogate')
     }
   }
+})
+
+test('P1-5 valueless query params and query key names are templated/redacted in semantic & samples modes, and P2-3/P2-4 UUID gate & JSON key scrubbing hold', () => {
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcDEF1234567890'
+  const ghp = 'ghp_1234567890abcdefghij123456'
+
+  const semJwt = sanitizeUrl(`https://h.example/p?${jwt}&a=b&plainflag`, { projection: 'semantic' })
+  assert.equal(semJwt.url, 'https://h.example/p?[REDACTED]&a=<str>&<str>')
+
+  const sampJwt = sanitizeUrl(`https://h.example/p?${jwt}&a=b`, { projection: 'semantic+samples' })
+  assert.equal(sampJwt.url, 'https://h.example/p?[REDACTED]&a=b')
+
+  const emailKey = sanitizeUrl('https://h.example/p?jane.doe%40example.com=1', { projection: 'semantic' })
+  assert.equal(emailKey.url, 'https://h.example/p?<key>=<num>')
+
+  const tokKey = sanitizeUrl(`https://h.example/p?${ghp}=`, { projection: 'semantic' })
+  assert.equal(tokKey.url, 'https://h.example/p?[REDACTED]=')
+
+  // P2-3: UUIDs, ISO dates, URLs rejected from SecretVault LRU token gate
+  assert.equal(isTokenShaped('550e8400-e29b-41d4-a716-446655440000'), false, 'plain UUID rejected from vault LRU')
+  assert.equal(isTokenShaped('2026-11-27T12:00:00.000Z'), false, 'ISO date rejected from vault LRU')
+  assert.equal(isTokenShaped('https://portal.example/items/12345'), false, 'URL rejected from vault LRU')
+
+  // P2-4: redactJsonValue scrubs data-like and vault map keys in samples mode
+  const vault = new SecretVault()
+  vault.addTrustedDrive('TypedVal9941')
+  const { value } = redactJsonValue({ 'jane.doe@example.com': 'ok', TypedVal9941: 'x', safeField: 1 }, vault)
+  const str = JSON.stringify(value)
+  assert.ok(!str.includes('jane.doe@example.com'))
+  assert.ok(!str.includes('TypedVal9941'))
+  assert.match(str, /"<key>":"ok"/)
+  assert.match(str, /"\[REDACTED:vault\]":"x"/)
+  assert.match(str, /"safeField":1/)
 })

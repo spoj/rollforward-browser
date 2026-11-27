@@ -256,3 +256,113 @@ test('semantic+samples emits redacted reqBody with JSON.rawJSON numbers and scru
   assert.equal(res.reqBody, '{"amount":12.50,"note":"ref [REDACTED:vault]","apiKey":"[REDACTED]"}')
   assert.equal(res.vaultRedactions, 1)
 })
+
+test('P1-3 SOAP extractor runs in linear time (<20ms) on 64 KiB adversarial <Body and <!-- payloads', () => {
+  for (const adversarial of ['<Body '.repeat(10_922), '<!--'.repeat(16_384)]) {
+    const t0 = performance.now()
+    const res = extractSemantic({
+      url: new URL('https://bssv.example/VoucherManager'),
+      sanitizedPath: '/VoucherManager',
+      method: 'POST',
+      effectiveMethod: 'POST',
+      kind: 'http',
+      hdr: { soapaction: '"TestAction"' },
+      rawHeaders: {},
+      reqType: 'text/xml',
+      decodedBuf: Buffer.from(adversarial),
+      bodyComplete: true,
+      transport: 'complete',
+      isWrite: true,
+      isAuth: false,
+      isLive: false,
+      projection: 'semantic',
+    })
+    const ms = performance.now() - t0
+    assert.ok(ms < 20, `SOAP extraction must stay linear (took ${ms.toFixed(2)}ms)`)
+    assert.equal(res.actions[0].family, 'soap')
+  }
+})
+
+test('P1-4 semantic+samples redacts form-like text/plain and XML sensitive elements, and omits unstructured plain text', () => {
+  // 1. text/plain carrying form body
+  const formText = extractSemantic({
+    url: new URL('https://app.example/api/form'),
+    sanitizedPath: '/api/form',
+    method: 'POST',
+    effectiveMethod: 'POST',
+    kind: 'http',
+    rawHeaders: {},
+    reqType: 'text/plain',
+    decodedBuf: Buffer.from('username=jde&password=Welcome1!'),
+    bodyComplete: true,
+    transport: 'complete',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+    projection: 'semantic+samples',
+  })
+  assert.equal(formText.reqBody, 'username=jde&password=[REDACTED]')
+
+  // 2. SOAP/XML with <wsse:Password>
+  const xmlBody = '<soapenv:Envelope><soapenv:Header><wsse:Password>Welcome1!</wsse:Password></soapenv:Header><soapenv:Body><GetOrder><id>42</id></GetOrder></soapenv:Body></soapenv:Envelope>'
+  const xmlRes = extractSemantic({
+    url: new URL('https://bssv.example/Order'),
+    sanitizedPath: '/Order',
+    method: 'POST',
+    effectiveMethod: 'POST',
+    kind: 'http',
+    hdr: { soapaction: '"GetOrder"' },
+    rawHeaders: {},
+    reqType: 'text/xml',
+    decodedBuf: Buffer.from(xmlBody),
+    bodyComplete: true,
+    transport: 'complete',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+    projection: 'semantic+samples',
+  })
+  assert.ok(xmlRes.reqBody && !xmlRes.reqBody.includes('Welcome1!'), 'XML Password element redacted')
+  assert.match(xmlRes.reqBody!, /<wsse:Password>\[REDACTED\]<\/wsse:Password>/)
+  assert.match(xmlRes.reqBody!, /<id>42<\/id>/)
+
+  // 3. Unstructured plain text omitted instead of risking password leak
+  const plainRes = extractSemantic({
+    url: new URL('https://app.example/api/note'),
+    sanitizedPath: '/api/note',
+    method: 'POST',
+    effectiveMethod: 'POST',
+    kind: 'http',
+    rawHeaders: {},
+    reqType: 'text/plain',
+    decodedBuf: Buffer.from('freeform note with password Welcome1! inside'),
+    bodyComplete: true,
+    transport: 'complete',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+    projection: 'semantic+samples',
+  })
+  assert.equal(plainRes.reqBody, undefined)
+  assert.equal(plainRes.reqOmitted, 'policy-profile')
+})
+
+test('P2-11 SharePoint resource slice uses sanitizedPath offset when earlier segments were redacted', () => {
+  const res = extractSemantic({
+    url: new URL('https://tenant.sharepoint.com/sites/aB3dE9fG2hJ5kL8mN1pQ4rS7tU0vW/_api/web/lists'),
+    sanitizedPath: '/sites/[REDACTED:seg]/_api/web/lists',
+    method: 'POST',
+    effectiveMethod: 'POST',
+    kind: 'http',
+    rawHeaders: {},
+    reqType: 'application/json',
+    decodedBuf: Buffer.from('{}'),
+    bodyComplete: true,
+    transport: 'complete',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+    projection: 'semantic',
+  })
+  assert.equal(res.actions[0].resource, '/_api/web/lists')
+})
