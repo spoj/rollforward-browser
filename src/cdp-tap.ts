@@ -959,7 +959,7 @@ export class CdpSessionTap {
             (canonTrimmed.rawAuthority && vault.scrub(canonTrimmed.rawAuthority).count > 0)
           ),
         )
-        if (hostVaultHit || (preHitCount > 0 && (!canonicalHostMatch || san.vaultRedactions < preHitCount))) {
+        if (hostVaultHit || !canonicalHostMatch || (preHitCount > 0 && san.vaultRedactions < preHitCount)) {
           navUrl = `${scheme}//[REDACTED]`
           vaultRedactions += Math.max(san.vaultRedactions, preHitCount, hostVaultHit ? 1 : 0)
         } else {
@@ -1024,9 +1024,10 @@ export class CdpSessionTap {
         const finalCheck = vault.scrub(navUrl)
         if (finalCheck.count > 0) {
           vaultRedactions += finalCheck.count
-          navUrl = navUrl.endsWith(':[REDACTED]') || navUrl.endsWith('//[REDACTED]')
+          const candidate = navUrl.endsWith(':[REDACTED]') || navUrl.endsWith('//[REDACTED]')
             ? '[REDACTED]'
             : finalCheck.text
+          navUrl = vault.scrub(candidate).count > 0 ? '' : candidate
         }
       }
       summary = { url: navUrl, ...extra }

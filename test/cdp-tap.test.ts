@@ -449,10 +449,12 @@ test('R6 unified pre-lowercasing vault check covers mixed-case HTTPS hosts and c
   c7.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 2, method: 'Target.createTarget', params: { url: 'https:///MixedTenant99.example/?q=%4FtherSecret' } }))))
   // R7 probe 2: uppercase JAVASCRIPT:0 with lowercase 'javascript' vaulted is caught by unconditional final exit gate
   c7.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 3, method: 'Page.navigate', params: { url: 'JAVASCRIPT:0' } }))))
+  // R8 probe 1: percent-encoded host fails closed to https://[REDACTED] even when preHitCount === 0
+  c7.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 4, method: 'Page.navigate', params: { url: 'https://%4DixedTenant99.example/' } }))))
   tap7.seal()
 
   const navs7 = tap7.entries.filter((e): e is CdpEntry => e.method === 'Page.navigate' || e.method === 'Target.createTarget')
-  assert.equal(navs7.length, 3)
+  assert.equal(navs7.length, 4)
   assert.equal(navs7[0].summary?.url, 'https://[REDACTED]')
   assert.ok(!String(navs7[0].summary?.url).includes('mixedtenant99'))
   assert.ok((navs7[0].vaultRedactions ?? 0) >= 1)
@@ -463,4 +465,18 @@ test('R6 unified pre-lowercasing vault check covers mixed-case HTTPS hosts and c
   assert.ok(!String(navs7[2].summary?.url).includes('javascript'), 'final exit gate must scrub lowercased javascript scheme')
   assert.equal(navs7[2].summary?.url, '[REDACTED]')
   assert.ok((navs7[2].vaultRedactions ?? 0) >= 1)
+  assert.equal(navs7[3].summary?.url, 'https://[REDACTED]')
+  assert.ok(!String(navs7[3].summary?.url).includes('mixedtenant99'))
+
+  // R8 probes: percent-encoded host fails closed even with preHitCount===0, and vaulted 'REDACTED' falls back to ''
+  const v8 = new SecretVault()
+  v8.addTrustedDrive('MixedTenant99')
+  v8.addTrustedDrive('REDACTED')
+  const tap8 = new CdpSessionTap({ projection: 'semantic', vault: v8, isLive: () => false, coalesceMs: 10 })
+  const c8 = tap8.attachConnection()
+  c8.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: 'https://%4DixedTenant99.example/' } }))))
+  tap8.seal()
+  const nav8 = tap8.entries.find((e): e is CdpEntry => e.method === 'Page.navigate')!
+  assert.equal(nav8.summary?.url, '', 'non-canonical percent-encoded host + vaulted REDACTED emits empty string')
+  assert.ok(!String(nav8.summary?.url).includes('mixedtenant99') && !String(nav8.summary?.url).includes('REDACTED'))
 })
