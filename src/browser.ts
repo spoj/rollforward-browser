@@ -165,18 +165,11 @@ export class BrowserSession {
     }
 
     if (this.auditV2 && this.auditV2.cdp !== false) {
-      const tracker = opts.inFlightTracker
-      const clientId = opts.clientId ?? 'default'
+      // Dedicated per-session CDP parser budget (isolated from HTTP proxy & /view/drive tap so unfinished frames cannot starve proxy!)
       this.cdpTap = new CdpSessionTap({
         projection: this.auditV2.projection ?? 'semantic',
         vault: this.vault,
         isLive: () => this.isLiveOrCooldown(),
-        charger: tracker
-          ? {
-              tryAcquire: b => tracker.tryAcquire(clientId, this.id, b),
-              release: b => tracker.release(clientId, this.id, b),
-            }
-          : undefined,
         onEvent: e => this.recordHudCdp(e),
         onFileUpload: () => this.scheduleShot(undefined, 'file-upload', false),
       })
@@ -568,8 +561,9 @@ export class BrowserSession {
     clearTimeout(this.shotTimer)
     this.shotTimer = undefined
 
-    // Stop proxy admission, tunnels, and active upstream requests SYNCHRONOUSLY before awaiting storageState/shutdown!
-    this.proxy?.controller.stopAdmission()
+    // Finalize in-flight proxy requests & stop admission SYNCHRONOUSLY before awaiting storageState/shutdown
+    // so in-flight writes record dispatch:'unknown' and accurate incompleteAtSeal counts!
+    const pSnap = this.proxy?.controller.finalizeAtSeal() ?? { logCursor: 0, droppedGets: 0, refusedFull: 0 }
 
     let state: unknown = null
     try {
@@ -580,7 +574,6 @@ export class BrowserSession {
       fs.rmSync(this.dir, { recursive: true, force: true })
     }
 
-    const pSnap = this.proxy?.controller.finalizeAtSeal() ?? { logCursor: 0, droppedGets: 0, refusedFull: 0 }
     const cSnap = this.cdpTap?.seal() ?? { cdpCursor: 0, droppedCdp: 0 }
 
     if (state) {

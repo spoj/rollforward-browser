@@ -350,3 +350,62 @@ test('vault scrubs errors and Referer headers without crashing', async t => {
   assert.ok(!entry.from!.includes('TopSecretRef99'))
   assert.ok(entry.from!.includes('[REDACTED:vault]'))
 })
+
+test('P2-5 finalizeAtSeal records in-flight POST as dispatch: unknown and increments incompleteAtSeal', async t => {
+  const { sockPath, upPort, setHandler, proxy, log } = await setupHarness(t)
+  let reqArrivedResolve!: () => void
+  const reqArrived = new Promise<void>(r => { reqArrivedResolve = r })
+  setHandler((_req, _res) => {
+    // Hold response open indefinitely so POST is genuinely in-flight at seal!
+    reqArrivedResolve()
+  })
+
+  const req = http.request({
+    socketPath: sockPath,
+    method: 'POST',
+    path: `http://t.example:${upPort}/hang`,
+    headers: { host: `t.example:${upPort}`, 'content-type': 'application/json' },
+  })
+  req.on('error', () => {})
+  req.end('{"pending":true}')
+  await reqArrived
+
+  proxy.controller.finalizeAtSeal()
+  const entry = log.find((e: any) => e.path === '/hang') as V2Entry
+  const summary = log.find((e: any) => e.rec === '_summary') as any
+  assert.ok(entry, 'in-flight POST recorded at seal')
+  assert.equal(entry.dispatch, 'unknown')
+  assert.equal(entry.incomplete, true)
+  assert.equal(summary.incompleteAtSeal, 1)
+})
+
+test('P2-6 synchronous Stage-1 GET check is never blocked by saturated async-hook concurrency cap', async t => {
+  const releases: Array<() => void> = []
+  const hook: PolicyHookConfig = {
+    mode: 'enforce',
+    evaluate: (d, ctx) => {
+      if (!d.safe.isWrite) {
+        return { decisionId: ctx.decisionId, mode: 'enforce', stage: 1, action: 'allow', ruleId: 'sync-get', policyVersion: '1', ms: 0 }
+      }
+      return new Promise(resolve => {
+        releases.push(() => resolve({ decisionId: ctx.decisionId, mode: 'enforce', stage: 2, action: 'allow', ruleId: 'async-write', policyVersion: '1', ms: 1 }))
+      })
+    },
+  }
+  const { sendReq } = await setupHarness(t, { policyHook: hook, maxConcurrentAsyncHooks: 2 })
+  const w1 = sendReq('POST', '/w1', {}, 'a')
+  const w2 = sendReq('POST', '/w2', {}, 'b')
+  while (releases.length < 2) await new Promise(r => setTimeout(r, 5))
+
+  // 3rd write fails closed with 503 while 2 async hooks are saturated
+  const w3 = await sendReq('POST', '/w3', {}, 'c')
+  assert.equal(w3.status, 503)
+
+  // Synchronous Stage-1 GET still passes with 200!
+  const g = await sendReq('GET', '/read')
+  assert.equal(g.status, 200)
+
+  for (const r of releases) r()
+  assert.equal((await w1).status, 200)
+  assert.equal((await w2).status, 200)
+})

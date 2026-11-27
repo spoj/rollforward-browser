@@ -62,6 +62,8 @@ export type ParsedWsMessage = {
   tail: Buffer
   totalBytes: number
   truncated: boolean
+  budgetDropped?: boolean
+  sniff?: string
   sha256: string
 }
 
@@ -70,7 +72,11 @@ export type BudgetCharger = {
   release: (bytes: number) => void
 }
 
+const MAX_SNIFF_BYTES = 256
+
 // Incremental O(N) RFC 6455 client->browser frame parser (zero mutation, strictly bounded <=70 KiB per connection).
+// Never disables the tap on capture-budget exhaustion: drops payload buffering for the affected message only while
+// preserving RFC 6455 frame tracking and sniffing the leading 256 bytes for method counting & anomaly reporting.
 export class WsFrameParser {
   private disabled = false
   private state: 'hdr2' | 'len16' | 'len64' | 'mask' | 'payload' = 'hdr2'
@@ -92,6 +98,9 @@ export class WsFrameParser {
   private msgHeadLen = 0
   private msgTail = Buffer.alloc(0)
   private msgTotalBytes = 0
+  private msgBudgetDropped = false
+  private msgSniff = Buffer.alloc(MAX_SNIFF_BYTES)
+  private msgSniffLen = 0
   private msgHash: crypto.Hash | null = null
   private chargedBytes = 0
 
@@ -118,6 +127,8 @@ export class WsFrameParser {
     this.msgHeadLen = 0
     this.msgTail = Buffer.alloc(0)
     this.msgTotalBytes = 0
+    this.msgBudgetDropped = false
+    this.msgSniffLen = 0
     this.msgHash = null
     this.releaseCharge()
   }
@@ -137,13 +148,20 @@ export class WsFrameParser {
     const prevTotal = this.msgTotalBytes
     this.msgTotalBytes += data.length
     this.msgHash!.update(data)
+    if (this.msgSniffLen < MAX_SNIFF_BYTES) {
+      const takeSniff = Math.min(data.length, MAX_SNIFF_BYTES - this.msgSniffLen)
+      data.copy(this.msgSniff, this.msgSniffLen, 0, takeSniff)
+      this.msgSniffLen += takeSniff
+    }
+    if (this.msgBudgetDropped) return
+
     let overflowOffset = 0
     if (this.msgHeadLen < MAX_MSG_HEAD) {
       const take = Math.min(data.length, MAX_MSG_HEAD - this.msgHeadLen)
       if (this.msgHead.length === 0) {
         const allocSize = Math.min(MAX_MSG_HEAD, Math.max(4096, take))
         if (this.charger && !this.charger.tryAcquire(allocSize)) {
-          this.fail('capture budget exceeded')
+          this.msgBudgetDropped = true
           return
         }
         this.chargedBytes += allocSize
@@ -152,7 +170,7 @@ export class WsFrameParser {
         const nextSize = Math.min(MAX_MSG_HEAD, Math.max(this.msgHead.length * 2, this.msgHeadLen + take))
         const delta = nextSize - this.msgHead.length
         if (this.charger && !this.charger.tryAcquire(delta)) {
-          this.fail('capture budget exceeded')
+          this.msgBudgetDropped = true
           return
         }
         this.chargedBytes += delta
@@ -165,11 +183,9 @@ export class WsFrameParser {
       overflowOffset = take
     }
     if (this.msgTotalBytes > MAX_MSG_HEAD) {
-      // Allocate fixed MAX_MSG_TAIL rolling buffer ONCE on first overflow (charged BEFORE allocating!),
-      // seeded with the last MAX_MSG_TAIL bytes of msgHead so the tail is ALWAYS exact regardless of chunk splits.
       if (this.msgTail.length === 0) {
         if (this.charger && !this.charger.tryAcquire(MAX_MSG_TAIL)) {
-          this.fail('capture budget exceeded')
+          this.msgBudgetDropped = true
           return
         }
         this.chargedBytes += MAX_MSG_TAIL
@@ -216,6 +232,8 @@ export class WsFrameParser {
       this.msgHeadLen = 0
       this.msgTail = Buffer.alloc(0)
       this.msgTotalBytes = 0
+      this.msgBudgetDropped = false
+      this.msgSniffLen = 0
       this.msgHash = crypto.createHash('sha256')
     }
 
@@ -234,6 +252,10 @@ export class WsFrameParser {
         tail: this.msgTail,
         totalBytes: this.msgTotalBytes,
         truncated: this.msgTotalBytes > MAX_MSG_HEAD,
+        ...(this.msgBudgetDropped && {
+          budgetDropped: true,
+          sniff: this.msgSniff.subarray(0, this.msgSniffLen).toString('utf8'),
+        }),
         sha256: this.msgHash!.digest('hex'),
       }
       // Keep parser charge active while synchronous consumer reads msg, then release cleanly!
@@ -532,12 +554,17 @@ type CoalesceSlot = {
   timer: NodeJS.Timeout
 }
 
+const PW_UTILITY_WRAPPER = '(utilityScript, ...args) => utilityScript.evaluate(...args)'
+const DEFAULT_CDP_PARSER_BUDGET = 1024 * 1024 // 1 MiB dedicated per-session CDP parser budget (isolated from HTTP proxy & drive tap)
+const RESERVED_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
 export type CdpTapOptions = {
   projection: ProjectionMode
   vault?: SecretVault
   isLive: () => boolean
   coalesceMs?: number
   maxBytes?: number
+  maxParserBytes?: number
   injectedScriptSha256Allowlist?: Set<string>
   charger?: BudgetCharger
   onEvent?: (entry: CdpEntry) => void
@@ -549,7 +576,7 @@ export class CdpSessionTap {
   private cursor = 0
   private bytes = 0
   private connSeq = 0
-  private methodCounts: Record<string, number> = {}
+  private methodCounts: Record<string, number> = Object.create(null)
   private distinctMethods = 0
   private depthLimited = 0
   private droppedCdp = 0
@@ -564,13 +591,32 @@ export class CdpSessionTap {
   private maxBytes: number
   private summaryReserve: number
   private anomalyReserve: number
+  private parserUsedBytes = 0
+  private parserMaxBytes: number
 
   constructor(opts: CdpTapOptions) {
     this.opts = opts
     this.coalesceMs = opts.coalesceMs ?? 2_000
     this.maxBytes = opts.maxBytes ?? MAX_CDP_LOG_BYTES
+    this.parserMaxBytes = opts.maxParserBytes ?? DEFAULT_CDP_PARSER_BUDGET
     this.summaryReserve = Math.min(CDP_SUMMARY_RESERVE, Math.floor(this.maxBytes * 0.1))
     this.anomalyReserve = Math.min(CDP_ANOMALY_RESERVE, Math.floor(this.maxBytes * 0.15))
+  }
+
+  private getParserCharger(): BudgetCharger {
+    if (this.opts.charger) return this.opts.charger
+    return {
+      tryAcquire: bytes => {
+        if (bytes <= 0) return true
+        if (this.parserUsedBytes + bytes > this.parserMaxBytes) return false
+        this.parserUsedBytes += bytes
+        return true
+      },
+      release: bytes => {
+        if (bytes <= 0) return
+        this.parserUsedBytes = Math.max(0, this.parserUsedBytes - bytes)
+      },
+    }
   }
 
   get currentCursor(): number {
@@ -587,8 +633,8 @@ export class CdpSessionTap {
 
   private countMethod(rawMethod: string) {
     const vault = this.opts.vault
-    let name = rawMethod
-    if (vault && vault.scrub(name).count > 0) {
+    const name = rawMethod
+    if (RESERVED_PROTO_KEYS.has(name) || (vault && vault.scrub(name).count > 0)) {
       this.methodCounts._unknown_other = (this.methodCounts._unknown_other ?? 0) + 1
       return
     }
@@ -596,7 +642,7 @@ export class CdpSessionTap {
       this.methodCounts._unknown_other = (this.methodCounts._unknown_other ?? 0) + 1
       return
     }
-    if (name in this.methodCounts) {
+    if (Object.prototype.hasOwnProperty.call(this.methodCounts, name)) {
       this.methodCounts[name]++
     } else if (this.distinctMethods < MAX_METHOD_NAMES) {
       this.methodCounts[name] = 1
@@ -712,9 +758,14 @@ export class CdpSessionTap {
     try {
       parsed = JSON.parse(rawText)
     } catch {
+      this.countMethod('_unparsed')
+      this.enqueue(conn, cdpSessionFallback, '_tap.unparsed', 'high', false, { bytes: Buffer.byteLength(rawText, 'utf8') }, 0)
       return
     }
-    if (!parsed || typeof parsed !== 'object' || typeof parsed.method !== 'string') return
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.method !== 'string') {
+      this.countMethod('_unparsed')
+      return
+    }
 
     const vault = this.opts.vault
     const rawMethod: string = parsed.method
@@ -762,9 +813,12 @@ export class CdpSessionTap {
     if (rawMethod === 'Runtime.callFunctionOn') {
       capture = true
       const fn = typeof params.functionDeclaration === 'string' ? params.functionDeclaration : ''
+      const fnLen = Buffer.byteLength(fn, 'utf8')
+      const fnHash64 = hash64(fn)
       const args = Array.isArray(params.arguments) ? params.arguments : []
+      // Require EXACT match on Playwright 1.64's utilityScript.evaluate wrapper (defeats comment-smuggling impostors!)
       const isPwUtility =
-        fn.includes('utilityScript.evaluate') &&
+        fn === PW_UTILITY_WRAPPER &&
         args.length >= 5 &&
         typeof (args[1] as any)?.value === 'boolean' &&
         typeof (args[2] as any)?.value === 'boolean' &&
@@ -788,6 +842,8 @@ export class CdpSessionTap {
         })
         summary = {
           wrapper: 'playwright-utility',
+          fnLen,
+          fnHash64,
           isFunction,
           returnByValue,
           argc,
@@ -806,15 +862,16 @@ export class CdpSessionTap {
           vaultRedactions += r.vaultRedactions
           return r.item
         })
+        const isImpostor = fn.includes('utilityScript.evaluate')
         summary = {
-          wrapper: 'custom',
-          fnLen: Buffer.byteLength(fn, 'utf8'),
-          fnHash64: hash64(fn),
+          wrapper: isImpostor ? 'impostor' : 'custom',
+          fnLen,
+          fnHash64,
           argCount: args.length,
           ...(argSummary.length > 0 && { argSummary }),
           ...(samples && { fn: scrubSampleExpr(fn) }),
         }
-        if ((Buffer.byteLength(fn, 'utf8') > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
+        if (isImpostor || ((fnLen > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected)) {
           severity = 'high'
         }
       }
@@ -854,11 +911,26 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Page.navigate' || rawMethod === 'Target.createTarget') {
       capture = true
       const rawUrl = typeof params.url === 'string' ? params.url : ''
-      if (/^\s*javascript:/i.test(rawUrl)) {
+      const trimmedUrl = rawUrl.trim()
+      if (/^javascript:/i.test(trimmedUrl)) {
         severity = 'high'
         summary = { url: 'javascript:[REDACTED]', exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
+      } else if (/^about:(?:blank|srcdoc)$/i.test(trimmedUrl)) {
+        summary = { url: trimmedUrl.toLowerCase() }
+      } else if (/^data:/i.test(trimmedUrl)) {
+        severity = 'high'
+        const comma = trimmedUrl.indexOf(',')
+        const meta = (comma >= 0 ? trimmedUrl.slice(5, comma) : trimmedUrl.slice(5)).split(';')[0].trim().toLowerCase()
+        const safeMime = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(meta) ? meta : 'unknown'
+        summary = { url: `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}` }
+      } else if (/^blob:/i.test(trimmedUrl)) {
+        const inner = URL.parse(trimmedUrl.slice(5))
+        summary = { url: inner ? `blob:${inner.origin}/[REDACTED]` : 'blob:[REDACTED]' }
+      } else if (/^https?:/i.test(trimmedUrl)) {
+        summary = { url: scrubUrlField(trimmedUrl) }
       } else {
-        summary = { url: scrubUrlField(rawUrl) }
+        const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(trimmedUrl)
+        summary = { url: `${schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown'}:[REDACTED]`, len: Buffer.byteLength(rawUrl, 'utf8') }
       }
     } else if (NAV_SIMPLE_METHODS.has(rawMethod)) {
       capture = true
@@ -971,12 +1043,12 @@ export class CdpSessionTap {
     const parser = new WsFrameParser(
       msg => {
         if (this.sealed || connDisabled) return
-        if (msg.truncated) {
-          if (this.opts.injectedScriptSha256Allowlist?.has(msg.sha256)) {
+        if (msg.truncated || msg.budgetDropped) {
+          if (!msg.budgetDropped && this.opts.injectedScriptSha256Allowlist?.has(msg.sha256)) {
             this.countMethod('_playwright.injectedScript')
             return
           }
-          const headText = msg.head.toString('utf8')
+          const headText = msg.head.length ? msg.head.toString('utf8') : (msg.sniff ?? '')
           const methodMatch = /"method"\s*:\s*"([^"]{1,64})"/.exec(headText)
           const sessionMatch = /"sessionId"\s*:\s*"([^"]{1,128})"/.exec(headText)
           const rawInner = methodMatch?.[1]
@@ -998,6 +1070,7 @@ export class CdpSessionTap {
             severity: 'high',
             summary: {
               bytes: msg.totalBytes,
+              ...(msg.budgetDropped && { reason: 'budget' }),
               ...(safeInner && { innerMethod: safeInner }),
               sha256: msg.sha256.slice(0, 16),
             },
@@ -1009,7 +1082,7 @@ export class CdpSessionTap {
         this.handleCommand(conn, text, undefined, 0, msg.sha256, msg.totalBytes)
       },
       reason => emitDisabled(reason),
-      this.opts.charger,
+      this.getParserCharger(),
     )
 
     return {
@@ -1039,7 +1112,7 @@ export class CdpSessionTap {
       n: this.cursor + 1,
       rec: '_tap.summary',
       t: new Date().toISOString(),
-      methodCounts: { ...this.methodCounts },
+      methodCounts: Object.fromEntries(Object.entries(this.methodCounts)),
       depthLimited: this.depthLimited,
       droppedCdp: this.droppedCdp,
       droppedHighSeverity: this.droppedHighSeverity,

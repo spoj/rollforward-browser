@@ -1240,9 +1240,9 @@ export function startProxy(
       ms: Math.round(performance.now() - start),
     })
 
-    // Enforce concurrency cap BEFORE invoking evaluate() so zero unbounded async work can start above cap!
-    // (Synchronous Stage-1 GET checks never increment activeAsyncHooks, so they never trigger the cap during normal traffic.)
-    if (hook.mode === 'enforce' && activeAsyncHooks >= maxConcurrentAsyncHooks) {
+    // Enforce concurrency cap BEFORE launching async work; never block synchronous Stage-1 checks!
+    const isAsyncFn = hook.evaluate.constructor?.name === 'AsyncFunction'
+    if (hook.mode === 'enforce' && activeAsyncHooks >= maxConcurrentAsyncHooks && (isAsyncFn || descriptor.safe.isWrite || descriptor.safe.kind === 'upgrade')) {
       return { decision: makeErrorDecision(), busy: true }
     }
 
@@ -1759,11 +1759,13 @@ export function startProxy(
     let pendingShadowLate: PolicyDecision | undefined
     let consumersLeft = activeHook && activeHook.mode === 'shadow' ? 2 : 1
     let builtPromise: Promise<{ safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void }> | undefined
+    let resolvedBuilt: { releaseDecoded: () => void } | undefined
 
     const releaseObserveConsumer = (built?: { releaseDecoded: () => void }) => {
+      if (built) resolvedBuilt = built
       consumersLeft--
       if (consumersLeft <= 0) {
-        built?.releaseDecoded()
+        resolvedBuilt?.releaseDecoded()
         releaseTeeBudget()
       }
     }
@@ -1779,6 +1781,7 @@ export function startProxy(
         liveAtStart, genAtStart, arrival, hasBody: totalReqBytes > 0,
         httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
       })
+      resolvedBuilt = built
       if (budgetHit && built.safe.isWrite && (!built.safe.reqOmitted || built.safe.reqOmitted === 'policy-profile')) {
         built.safe.reqOmitted = 'budget'
       }
@@ -1792,12 +1795,15 @@ export function startProxy(
 
     cleanupExtra = () => {
       clearTimeout(prefixTimer)
+      if (builtPromise) void builtPromise.then(b => b.releaseDecoded(), () => {})
+      resolvedBuilt?.releaseDecoded()
       releaseTeeBudget()
     }
 
     if (activeHook && activeHook.mode === 'shadow') {
       void prefixFrozenPromise.then(async () => {
         if (sealed) {
+          if (builtPromise) void builtPromise.then(b => b.releaseDecoded(), () => {})
           releaseObserveConsumer()
           return
         }
@@ -1835,16 +1841,18 @@ export function startProxy(
       markCommitted: () => { terminalCommitted = true; activeInFlight.delete(seq) },
       stateRef,
       getLazySafe: async () => {
-        const desc = await getBuilt()
-        const safe = desc.safe
-        releaseObserveConsumer(desc)
-        return safe
+        let desc: { safe: SafeRequestProjection; releaseDecoded: () => void } | undefined
+        try {
+          desc = await getBuilt()
+          return desc.safe
+        } finally {
+          releaseObserveConsumer(desc)
+        }
       },
       getShadowDecision: () => shadowDecision ?? pendingShadowLate,
       onEmittedN: n => {
         emittedEntryN = n
         if (n !== null && pendingShadowLate && !sealed) {
-          // Already attached to Entry if returned by getShadowDecision
           pendingShadowLate = undefined
         }
       },
@@ -2150,7 +2158,9 @@ export function startProxy(
       const up = (url!.protocol === 'https:' ? https : http).request(url!, uOpts)
       activeUpstreams.add(up)
       up.on('close', () => activeUpstreams.delete(up))
+      socket.on('close', () => up.destroy())
       up.on('upgrade', (r, upSocket, upHead) => {
+        if (socket.destroyed) { upSocket.destroy(); return }
         activeUpstreams.add(upSocket)
         upSocket.on('close', () => activeUpstreams.delete(upSocket))
         upSocket.on('error', () => socket.destroy())
@@ -2328,7 +2338,9 @@ export function startProxy(
       dispatchState = 'dispatched'
       activeUpstreams.add(up)
       up.on('close', () => activeUpstreams.delete(up))
+      socket.on('close', () => up.destroy())
       up.on('upgrade', (r, upSocket, upHead) => {
+        if (socket.destroyed) { upSocket.destroy(); return }
         activeUpstreams.add(upSocket)
         upSocket.on('close', () => activeUpstreams.delete(upSocket))
         upSocket.on('error', () => socket.destroy())
@@ -2470,7 +2482,11 @@ export function startProxy(
     stopAdmission,
     finalizeAtSeal: () => {
       if (sealed) return { logCursor: cursorCounter, droppedGets, refusedFull: refusedFullCount }
-      stopAdmission()
+      // Stop accepting new connections first, finalize all still-in-flight entries with dispatch:'unknown' & incompleteAtSeal
+      // BEFORE aborting/destroying active upstreams so onAbort() cannot misclassify them as normal dispatched completions!
+      admissionStopped = true
+      outer.close()
+      inner.close()
       for (const item of [...activeInFlight.values()]) item.finalize()
       activeInFlight.clear()
       if (v2Enabled) {
@@ -2488,6 +2504,15 @@ export function startProxy(
         tailLogBytes += Buffer.byteLength(JSON.stringify(summary), 'utf8')
       }
       sealed = true
+      // Now destroy all remaining connections, tunnels, abort controllers, and upstreams cleanly.
+      outer.closeAllConnections?.()
+      inner.closeAllConnections?.()
+      for (const ac of activeAbortControllers) ac.abort()
+      activeAbortControllers.clear()
+      for (const sock of activeTunnels) sock.destroy()
+      activeTunnels.clear()
+      for (const up of activeUpstreams) up.destroy()
+      activeUpstreams.clear()
       return { logCursor: cursorCounter, droppedGets, refusedFull: refusedFullCount }
     },
     getLogPage: (after: number, limit = 500) => {

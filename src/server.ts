@@ -57,7 +57,8 @@ const sealSession = (s: Session, scheduleGc = false): Promise<SealSnapshot> => {
   if (!s.closing) {
     s.closing = s.seal()
   }
-  if (scheduleGc && !s.gcTimer) {
+  // Scope post-TTL 25-min GC strictly to auditV2 sessions (or during active SIGUSR2 drain) so legacy v0.9 sessions keep v0.2.2 retention!
+  if (scheduleGc && !s.gcTimer && (s.auditV2 || drainUntil > 0)) {
     // Start post-TTL GC timer ONLY after seal() finishes publishing the frozen snapshot!
     void s.closing.then(() => {
       if (!sessions.has(s.id) || s.gcTimer) return
@@ -107,9 +108,9 @@ function enforceRetainedMemoryCeiling(clientName: string) {
   let { clientBytes, processBytes } = usage()
   if (clientBytes < maxClientRetainedBytes && processBytes < maxProcessRetainedBytes) return
 
-  // GC ONLY sessions whose seal() snapshot has ALREADY finished publishing (never mid-seal!)
+  // GC ONLY sealed auditV2 sessions whose snapshot has ALREADY finished publishing (never evict legacy non-auditV2 sessions unless draining!)
   const sealed = [...sessions.values()]
-    .filter(s => s.isSealed())
+    .filter(s => s.isSealed() && (Boolean(s.auditV2) || drainUntil > 0))
     .sort((a, b) => (a.sealedAt ?? 0) - (b.sealedAt ?? 0))
 
   for (const s of sealed) {
@@ -360,13 +361,23 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   if (rest === '/view/watch') {
     watchOnly(socket, up, head)
   } else {
+    // Give each /view/drive connection its own small dedicated parser budget (isolated from proxy & external CDP!)
+    let driveUsed = 0
+    const driveCharger = {
+      tryAcquire: (b: number) => {
+        if (b <= 0) return true
+        if (driveUsed + b > 128 * 1024) return false
+        driveUsed += b
+        return true
+      },
+      release: (b: number) => {
+        driveUsed = Math.max(0, driveUsed - b)
+      },
+    }
     const tap = tapExternalCdp
       ? s.cdpTap!.attachConnection()
       : tapDriveVault
-        ? createDriveVaultTap(s.vault, {
-            tryAcquire: b => inFlightTracker.tryAcquire(client.name, s.id, b),
-            release: b => inFlightTracker.release(client.name, s.id, b),
-          })
+        ? createDriveVaultTap(s.vault, driveCharger)
         : undefined
     // Passive zero-mutation attachment: feed head before up.write(head), then pipe, then observe socket data (§3.1.3)
     if (tap && head.length) tap.feed(head)

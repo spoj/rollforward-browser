@@ -236,3 +236,48 @@ test('auditV2 with cdp: false returns empty zero-cursor envelope on /cdp-log', a
   assert.equal((await api('DELETE', `/sessions/${id}?sealed=1`)).status, 200)
   assert.equal(leftovers(), '')
 })
+
+test('P1-6 post-TTL GC reclaims expired auditV2 sessions but preserves legacy non-auditV2 sessions indefinitely for v0.9 rollback', async t => {
+  const gcPort = 8802
+  const gcKey = 'gc-test-key'
+  const gcSvc = spawn('node', ['--import', './test/resolve.ts', 'src/server.ts'], {
+    env: {
+      ...process.env,
+      BROWSER_PORT: String(gcPort),
+      BROWSER_KEY: gcKey,
+      BROWSER_BLOCKLISTS: '',
+      BROWSER_POST_TTL_GC_MS: '400',
+      NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem`,
+    },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  })
+  t.after(() => gcSvc.kill())
+  await Promise.race([once(gcSvc.stdout!, 'data'), once(gcSvc, 'exit').then(() => { throw new Error('gc service exited') })])
+
+  const gcApi = async (method: string, path: string, body?: unknown) => {
+    const res = await fetch(`http://127.0.0.1:${gcPort}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${gcKey}` },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+    return { status: res.status, body: await res.json() }
+  }
+
+  const v2 = await gcApi('POST', '/sessions', { site, audit: true, auditV2: { v: 2 }, ttl_s: 0.3 })
+  const legacy = await gcApi('POST', '/sessions', { site, audit: true, ttl_s: 0.3 })
+  assert.equal(v2.status, 201)
+  assert.equal(legacy.status, 201)
+
+  // Wait past TTL (0.3s) + container seal (~0.5s) + post-TTL GC (0.4s)
+  await new Promise(r => setTimeout(r, 2500))
+
+  // auditV2 session was GC'd after post-TTL window
+  assert.equal((await gcApi('GET', `/sessions/${v2.body.id}/log?after=0`)).status, 404, 'expired auditV2 session GCd after POST_TTL_GC_MS')
+
+  // legacy session MUST still be listed and collectible via DELETE (v0.2.2 / v0.9 compatibility!)
+  const list = await gcApi('GET', '/sessions')
+  assert.ok(list.body.some((s: any) => s.id === legacy.body.id && s.closed === true), 'legacy session remains listed after POST_TTL_GC_MS')
+  const del = await gcApi('DELETE', `/sessions/${legacy.body.id}`)
+  assert.equal(del.status, 200, 'legacy session remains collectible via DELETE')
+  assert.ok(Array.isArray(del.body.log))
+})

