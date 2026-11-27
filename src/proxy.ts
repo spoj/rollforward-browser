@@ -476,12 +476,12 @@ function capEntryTo12KiB(entry: V2Entry): { entry: V2Entry; bytes: number } {
   return { entry: minimal, bytes: Buffer.byteLength(JSON.stringify(minimal), 'utf8') }
 }
 
-// Guaranteed <= MINIMAL_RESERVE_BYTES (768 UTF-8 bytes) minimal record preserving origin + pathname for checkRefused!
+// Guaranteed <= MINIMAL_RESERVE_BYTES minimal record preserving full hostname in origin+pathname for checkRefused whenever it fits!
 function toMinimalCappedEntry(e: V2Entry): V2Entry {
   let pathMax = 80
   let msgMax = 48
-  let authMax = 64
-  for (let attempt = 0; attempt < 5; attempt++) {
+  let authMax = 255
+  for (let attempt = 0; attempt < 6; attempt++) {
     const p = truncateUtf8HeadTail(e.path || '/', pathMax)
     const authority = truncateUtf8HeadTail(e.authority || '', authMax)
     const originPath = authority ? `${e.scheme}://${authority}${p}` : truncateUtf8HeadTail(e.url, pathMax)
@@ -518,9 +518,9 @@ function toMinimalCappedEntry(e: V2Entry): V2Entry {
       logCapped: true,
     }
     if (Buffer.byteLength(JSON.stringify(minimal), 'utf8') <= MINIMAL_RESERVE_BYTES) return minimal
-    pathMax = Math.max(4, Math.floor(pathMax / 2))
+    pathMax = Math.max(1, Math.floor(pathMax / 2))
     msgMax = Math.max(8, Math.floor(msgMax / 2))
-    authMax = Math.max(24, Math.floor(authMax * 0.75))
+    if (attempt >= 3) authMax = Math.max(48, Math.floor(authMax * 0.6))
   }
   const authority = truncateUtf8HeadTail(e.authority || '', 48)
   const originPath = authority ? `${e.scheme}://${authority}/` : '/'
@@ -762,6 +762,7 @@ export function startProxy(
   let seqCounter = 0
   let cursorCounter = 0
   let logBytes = 0
+  let tailLogBytes = 0
   let reservedBytes = 0
   let sampleBytes = 0
   let droppedGets = 0
@@ -841,8 +842,13 @@ export function startProxy(
       for (const [k, v] of Object.entries(site.headers)) headers[k.toLowerCase()] = v
     }
     headers.host = url.host
+    const hadChunked = Boolean(req.headers['transfer-encoding'])
     for (const h of hopByHop) delete headers[h]
     delete headers['expect']
+    // Preserve chunked body framing upstream when inbound was chunked without Content-Length (critical for chunked GET/OPTIONS!)
+    if (hadChunked && headers['content-length'] === undefined) {
+      headers['transfer-encoding'] = 'chunked'
+    }
     const strict = !!site.public || !exact(url.hostname)
     return {
       method: req.method,
@@ -985,15 +991,15 @@ export function startProxy(
     if (sealed || !v2Enabled) return
     const preview: LateOutcomeEntry = { n: cursorCounter + 1, ...rec }
     const bytes = Buffer.byteLength(JSON.stringify(preview), 'utf8')
-    // Account for outstanding write reservations AND reserve 8 KiB for _summary; never bump cursor on refusal!
+    // Late outcomes draw strictly from TAIL_RESERVE_BYTES (leaving 8 KiB for _summary) so they can NEVER displace reserved normal writes!
     const summaryFloor = Math.min(8192, Math.floor(TAIL_RESERVE_BYTES / 2))
-    if (logBytes + reservedBytes + bytes > maxLogHardBytes - summaryFloor) {
+    if (tailLogBytes + bytes > TAIL_RESERVE_BYTES - summaryFloor) {
       droppedLateOutcomes++
       return
     }
     const full: LateOutcomeEntry = { n: ++cursorCounter, ...rec }
     log.push(full)
-    logBytes += bytes
+    tailLogBytes += bytes
     opts?.onEntry?.(full)
   }
 
@@ -1098,7 +1104,7 @@ export function startProxy(
       vaultRedactions += sanFrom.vaultRedactions
     }
 
-    const reqType = normalizeContentType(typeof hdrs['content-type'] === 'string' ? hdrs['content-type'] : undefined)
+    const reqType = normalizeContentType(typeof hdrs['content-type'] === 'string' ? hdrs['content-type'] : undefined, vault)
     const isWrite = arrival.isWrite || (SAFE_METHODS.has(arrival.sem.wireMethod) && (hasBody || prefixBuf.length > 0))
     const liveOrChanged = liveAtStart || isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart)
 
@@ -2016,7 +2022,7 @@ export function startProxy(
       headerMs = Math.round(performance.now() - startMs)
       status = r.statusCode ?? 0
       stateRef.status = status
-      resType = normalizeContentType(r.headers['content-type'])
+      resType = normalizeContentType(r.headers['content-type'], vault)
       try { vault?.ingestSetCookie(r.headers['set-cookie']) } catch {}
 
       const headers = { ...r.headers }
@@ -2476,7 +2482,7 @@ export function startProxy(
           ...(droppedLateOutcomes > 0 && { droppedLateOutcomes }),
         }
         log.push(summary)
-        logBytes += Buffer.byteLength(JSON.stringify(summary), 'utf8')
+        tailLogBytes += Buffer.byteLength(JSON.stringify(summary), 'utf8')
       }
       sealed = true
       return { logCursor: cursorCounter, droppedGets, refusedFull: refusedFullCount }
@@ -2502,10 +2508,11 @@ export function startProxy(
       return { oldestCursor, nextCursor, hasMore, dropped: droppedGets, entries: out }
     },
     getCurrentCursor: () => cursorCounter,
-    getRetainedBytes: () => logBytes,
+    getRetainedBytes: () => logBytes + tailLogBytes,
     clear: () => {
       log.length = 0
       logBytes = 0
+      tailLogBytes = 0
       reservedBytes = 0
       sampleBytes = 0
     },

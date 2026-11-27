@@ -134,8 +134,10 @@ export class WsFrameParser {
   }
 
   private appendMessagePayload(data: Buffer) {
+    const prevTotal = this.msgTotalBytes
     this.msgTotalBytes += data.length
     this.msgHash!.update(data)
+    let overflowOffset = 0
     if (this.msgHeadLen < MAX_MSG_HEAD) {
       const take = Math.min(data.length, MAX_MSG_HEAD - this.msgHeadLen)
       if (this.msgHead.length === 0) {
@@ -160,31 +162,28 @@ export class WsFrameParser {
       }
       data.copy(this.msgHead, this.msgHeadLen, 0, take)
       this.msgHeadLen += take
+      overflowOffset = take
     }
     if (this.msgTotalBytes > MAX_MSG_HEAD) {
-      if (data.length >= MAX_MSG_TAIL) {
-        if (this.msgTail.length < MAX_MSG_TAIL) {
-          const delta = MAX_MSG_TAIL - this.msgTail.length
-          if (this.charger && !this.charger.tryAcquire(delta)) {
-            this.fail('capture budget exceeded')
-            return
-          }
-          this.chargedBytes += delta
-          this.msgTail = Buffer.allocUnsafe(MAX_MSG_TAIL)
+      // Allocate fixed MAX_MSG_TAIL rolling buffer ONCE on first overflow (charged BEFORE allocating!),
+      // seeded with the last MAX_MSG_TAIL bytes of msgHead so the tail is ALWAYS exact regardless of chunk splits.
+      if (this.msgTail.length === 0) {
+        if (this.charger && !this.charger.tryAcquire(MAX_MSG_TAIL)) {
+          this.fail('capture budget exceeded')
+          return
         }
-        data.copy(this.msgTail, 0, data.length - MAX_MSG_TAIL, data.length)
-      } else {
-        const combined = Buffer.concat([this.msgTail, data])
-        const sliced = combined.length > MAX_MSG_TAIL ? combined.subarray(combined.length - MAX_MSG_TAIL) : combined
-        const delta = sliced.length - this.msgTail.length
-        if (delta > 0 && this.charger) {
-          if (!this.charger.tryAcquire(delta)) {
-            this.fail('capture budget exceeded')
-            return
-          }
-          this.chargedBytes += delta
+        this.chargedBytes += MAX_MSG_TAIL
+        this.msgTail = Buffer.allocUnsafe(MAX_MSG_TAIL)
+        if (prevTotal <= MAX_MSG_HEAD && this.msgHeadLen >= MAX_MSG_TAIL) {
+          this.msgHead.copy(this.msgTail, 0, this.msgHeadLen - MAX_MSG_TAIL, this.msgHeadLen)
         }
-        this.msgTail = Buffer.from(sliced)
+      }
+      const tailIn = overflowOffset > 0 ? data.subarray(overflowOffset) : data
+      if (tailIn.length >= MAX_MSG_TAIL) {
+        tailIn.copy(this.msgTail, 0, tailIn.length - MAX_MSG_TAIL, tailIn.length)
+      } else if (tailIn.length > 0) {
+        this.msgTail.copyWithin(0, tailIn.length, MAX_MSG_TAIL)
+        tailIn.copy(this.msgTail, MAX_MSG_TAIL - tailIn.length, 0, tailIn.length)
       }
     }
   }

@@ -97,7 +97,7 @@ function decompressSingleLayer(
       return
     }
 
-    const chunks: Buffer[] = []
+    let outBuf = Buffer.alloc(0)
     let outBytes = 0
     let charged = 0
     let done = false
@@ -108,6 +108,8 @@ function decompressSingleLayer(
         charger.release(charged)
         charged = 0
       }
+      outBuf = Buffer.alloc(0)
+      outBytes = 0
     }
 
     const timer = setTimeout(() => {
@@ -116,7 +118,7 @@ function decompressSingleLayer(
       stream.destroy()
       resolve({
         ok: true,
-        buf: Buffer.concat(chunks).subarray(0, maxBytes),
+        buf: outBuf.subarray(0, outBytes),
         decodeComplete: false,
         decode: 'truncated',
         truncated: true,
@@ -139,7 +141,7 @@ function decompressSingleLayer(
         stream.destroy()
         finish({
           ok: true,
-          buf: Buffer.concat(chunks).subarray(0, maxBytes),
+          buf: outBuf.subarray(0, outBytes),
           decodeComplete: false,
           decode: 'truncated',
           truncated: true,
@@ -149,32 +151,38 @@ function decompressSingleLayer(
         return
       }
       const need = Math.min(c.length, maxBytes - outBytes)
-      if (need > 0 && charger && !charger.tryAcquire(need)) {
-        stream.destroy()
-        chunks.length = 0
-        releaseAll()
-        finish({
-          ok: false,
-          buf: Buffer.alloc(0),
-          decodeComplete: false,
-          decode: 'error',
-          truncated: true,
-          reason: 'inflight-budget',
-          budgetExceeded: true,
-          chargedBytes: 0,
-        })
-        return
-      }
       if (need > 0) {
-        if (charger) charged += need
-        chunks.push(need < c.length ? Buffer.from(c.subarray(0, need)) : c)
+        if (outBytes + need > outBuf.length) {
+          const nextCap = Math.min(maxBytes, Math.max(4096, outBuf.length * 2, outBytes + need))
+          const delta = nextCap - outBuf.length
+          if (charger && !charger.tryAcquire(delta)) {
+            stream.destroy()
+            releaseAll()
+            finish({
+              ok: false,
+              buf: Buffer.alloc(0),
+              decodeComplete: false,
+              decode: 'error',
+              truncated: true,
+              reason: 'inflight-budget',
+              budgetExceeded: true,
+              chargedBytes: 0,
+            })
+            return
+          }
+          if (charger) charged += delta
+          const next = Buffer.allocUnsafe(nextCap)
+          if (outBytes > 0) outBuf.copy(next, 0, 0, outBytes)
+          outBuf = next
+        }
+        c.copy(outBuf, outBytes, 0, need)
         outBytes += need
       }
       if (outBytes >= maxBytes) {
         stream.destroy()
         finish({
           ok: true,
-          buf: Buffer.concat(chunks),
+          buf: outBuf.subarray(0, outBytes),
           decodeComplete: false,
           decode: 'truncated',
           truncated: true,
@@ -185,8 +193,7 @@ function decompressSingleLayer(
     })
 
     stream.on('end', () => {
-      const buf = Buffer.concat(chunks)
-      chunks.length = 0
+      const buf = outBuf.subarray(0, outBytes)
       if (!inputComplete) {
         finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB', chargedBytes: charged })
       } else {
@@ -195,8 +202,7 @@ function decompressSingleLayer(
     })
 
     stream.on('error', () => {
-      const buf = Buffer.concat(chunks)
-      chunks.length = 0
+      const buf = outBuf.subarray(0, outBytes)
       if (!inputComplete) {
         finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB', chargedBytes: charged })
         return
@@ -291,10 +297,17 @@ export async function decompressPrefix(
   }
 }
 
-export function normalizeContentType(header: string | undefined): string | undefined {
+const SAFE_MIME_RE = /^[a-z0-9!#$&^_.+-]{1,40}\/[a-z0-9!#$&^_.+-]{1,64}$/
+
+export function normalizeContentType(header: string | undefined, vault?: SecretVault): string | undefined {
   if (!header) return undefined
   const essence = header.split(';')[0].trim().toLowerCase()
-  return essence || undefined
+  if (!essence) return undefined
+  if (vault && vault.scrub(essence).count > 0) return 'application/octet-stream'
+  if (!SAFE_MIME_RE.test(essence)) return 'application/octet-stream'
+  const [type, subtype] = essence.split('/')
+  if (isSensitiveValue(subtype) || isDataLikeKey(subtype)) return `${type}/<redacted>`
+  return essence
 }
 
 export function isBinaryContentType(reqType: string | undefined): boolean {
@@ -590,9 +603,9 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         : []
       return {
         actions,
-        completeness: { transport: input.transport, decode: 'error', extract: 'none', ...(reasons.length && { reasons }) },
+        completeness: { transport: input.transport, decode: decodeRes.budgetExceeded ? 'truncated' : 'error', extract: 'none', ...(reasons.length && { reasons }) },
         decodeComplete: false,
-        reqOmitted: input.isLive ? 'live' : input.isAuth ? 'auth-url' : 'decompress-err',
+        reqOmitted: input.isLive ? 'live' : input.isAuth ? 'auth-url' : decodeRes.budgetExceeded ? 'budget' : 'decompress-err',
         vaultRedactions,
       }
     }
