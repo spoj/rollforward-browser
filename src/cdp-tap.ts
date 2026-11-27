@@ -911,90 +911,113 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Page.navigate' || rawMethod === 'Target.createTarget') {
       capture = true
       const rawUrl = typeof params.url === 'string' ? params.url : ''
-      // Linear O(N) C0/space trim (matches WHATWG URL parser without regex backtracking)
+      // Linear O(N) C0/space trim + WHATWG C0/tab/newline strip (exact original case preserved!)
       let uStart = 0
       let uEnd = rawUrl.length
       while (uStart < uEnd && rawUrl.charCodeAt(uStart) <= 0x20) uStart++
       while (uEnd > uStart && rawUrl.charCodeAt(uEnd - 1) <= 0x20) uEnd--
-      const strippedUrl = rawUrl.slice(uStart, uEnd)
-      const schemeProbe = strippedUrl.replace(/[\u0000-\u001f]+/g, '')
+      const trimmedUrl = rawUrl.slice(uStart, uEnd)
+      const strippedUrl = trimmedUrl.replace(/[\u0000-\u001f]+/g, '')
+
+      // Unified pre-lowercasing vault check on BOTH complete original rawUrl AND control-stripped strippedUrl
+      const rawHitCount = vault ? vault.scrub(rawUrl).count : 0
+      const strippedHitCount = vault && strippedUrl !== rawUrl ? vault.scrub(strippedUrl).count : 0
+      const preHitCount = Math.max(rawHitCount, strippedHitCount)
+
       let navUrl: string
       let extra: Record<string, unknown> = {}
-      if (/^https?:/i.test(schemeProbe)) {
-        navUrl = scrubUrlField(strippedUrl)
-      } else {
-        // Check vault on the COMPLETE original rawUrl FIRST (before trimming, control-stripping, slicing, or lowercasing!)
-        const fullVaultHits = vault ? vault.scrub(rawUrl).count : 0
-        if (fullVaultHits > 0) vaultRedactions += fullVaultHits
+      let finalScrubNeeded = true
 
-        if (/^(?:javascript|vbscript):/i.test(schemeProbe)) {
+      if (/^https?:/i.test(strippedUrl)) {
+        const scheme = /^https:/i.test(strippedUrl) ? 'https:' : 'http:'
+        const san = sanitizeUrl(strippedUrl, { projection: this.opts.projection, vault })
+        let authVaultHit = false
+        if (vault && preHitCount > 0) {
+          const strippedAuth = /^https?:\/\/([^/?#\\]*)/i.exec(strippedUrl)
+          const rawAuth = /^https?:\/\/([^/?#\\]*)/i.exec(trimmedUrl)
+          if (!strippedAuth || vault.scrub(strippedAuth[1]).count > 0 || (rawAuth && vault.scrub(rawAuth[1]).count > 0)) {
+            authVaultHit = true
+          }
+        }
+        if (preHitCount > 0 && (authVaultHit || san.vaultRedactions < preHitCount)) {
+          navUrl = `${scheme}//[REDACTED]`
+          vaultRedactions += Math.max(san.vaultRedactions, preHitCount)
+          finalScrubNeeded = false
+        } else {
+          navUrl = san.url
+          vaultRedactions += san.vaultRedactions
+        }
+      } else {
+        if (preHitCount > 0) vaultRedactions += preHitCount
+
+        if (/^(?:javascript|vbscript):/i.test(strippedUrl)) {
           severity = 'high'
-          const scheme = /^vbscript:/i.test(schemeProbe) ? 'vbscript' : 'javascript'
+          const scheme = /^vbscript:/i.test(strippedUrl) ? 'vbscript' : 'javascript'
           navUrl = `${scheme}:[REDACTED]`
           extra = { exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
-        } else if (/^about:(?:blank|srcdoc)$/i.test(schemeProbe)) {
-          navUrl = fullVaultHits > 0 ? 'about:[REDACTED]' : schemeProbe.toLowerCase()
-        } else if (/^data:/i.test(schemeProbe)) {
+          finalScrubNeeded = false
+        } else if (/^about:(?:blank|srcdoc)$/i.test(strippedUrl)) {
+          navUrl = preHitCount > 0 ? 'about:[REDACTED]' : strippedUrl.toLowerCase()
+          if (preHitCount > 0) finalScrubNeeded = false
+        } else if (/^data:/i.test(strippedUrl)) {
           severity = 'high'
-          if (fullVaultHits > 0) {
+          if (preHitCount > 0) {
             navUrl = `data:[REDACTED];len=${Buffer.byteLength(rawUrl, 'utf8')}`
+            finalScrubNeeded = false
           } else {
-            const comma = schemeProbe.indexOf(',')
-            const rawMeta = (comma >= 0 ? schemeProbe.slice(5, comma) : schemeProbe.slice(5)).split(';')[0].trim()
+            const comma = strippedUrl.indexOf(',')
+            const rawMeta = (comma >= 0 ? strippedUrl.slice(5, comma) : strippedUrl.slice(5)).split(';')[0].trim()
             const safeMime = /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(rawMeta) ? rawMeta.toLowerCase() : 'unknown'
             navUrl = `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}`
           }
-        } else if (/^blob:/i.test(schemeProbe)) {
-          if (fullVaultHits > 0) {
+        } else if (/^blob:/i.test(strippedUrl)) {
+          if (preHitCount > 0) {
             navUrl = 'blob:[REDACTED]'
+            finalScrubNeeded = false
           } else {
-            const rawInner = schemeProbe.slice(5)
-            const rawScrub = vault ? vault.scrub(rawInner) : { count: 0, text: rawInner }
-            if (rawScrub.count > 0) {
-              vaultRedactions += rawScrub.count
+            const rawInner = strippedUrl.slice(5)
+            const inner = URL.parse(rawInner)
+            if (!inner) {
               navUrl = 'blob:[REDACTED]'
+            } else if (inner.origin === 'null') {
+              navUrl = 'blob:null'
             } else {
-              const inner = URL.parse(rawInner)
-              if (!inner) {
+              const originScrub = vault ? vault.scrub(inner.origin) : { count: 0, text: inner.origin }
+              if (originScrub.count > 0) {
+                vaultRedactions += originScrub.count
                 navUrl = 'blob:[REDACTED]'
-              } else if (inner.origin === 'null') {
-                navUrl = 'blob:null'
+                finalScrubNeeded = false
               } else {
-                const originScrub = vault ? vault.scrub(inner.origin) : { count: 0, text: inner.origin }
-                if (originScrub.count > 0) {
-                  vaultRedactions += originScrub.count
-                  navUrl = 'blob:[REDACTED]'
-                } else {
-                  // Require canonical scheme://[userinfo@]host[:port] followed by /, ?, #, or end (rejects `\` like http:\host or app.example\item)
-                  const canon = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]+)(?:[/?#]|$)/i.exec(rawInner)
-                  let hostMatches = false
-                  if (canon) {
-                    const auth = canon[1]
-                    const at = auth.lastIndexOf('@')
-                    const hostPort = at >= 0 ? auth.slice(at + 1) : auth
-                    const rawHost = hostPort.startsWith('[')
-                      ? hostPort.slice(0, hostPort.indexOf(']') + 1)
-                      : hostPort.split(':')[0]
-                    hostMatches = rawHost.length > 0 && rawHost.toLowerCase() === inner.hostname.toLowerCase()
-                  }
-                  navUrl = hostMatches ? `blob:${inner.origin}` : 'blob:[REDACTED]'
+                // Require canonical scheme://[userinfo@]host[:port] followed by /, ?, #, or end (rejects `\` like http:\host or app.example\item)
+                const canon = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]+)(?:[/?#]|$)/i.exec(rawInner)
+                let hostMatches = false
+                if (canon) {
+                  const auth = canon[1]
+                  const at = auth.lastIndexOf('@')
+                  const hostPort = at >= 0 ? auth.slice(at + 1) : auth
+                  const rawHost = hostPort.startsWith('[')
+                    ? hostPort.slice(0, hostPort.indexOf(']') + 1)
+                    : hostPort.split(':')[0]
+                  hostMatches = rawHost.length > 0 && rawHost.toLowerCase() === inner.hostname.toLowerCase()
                 }
+                navUrl = hostMatches ? `blob:${inner.origin}` : 'blob:[REDACTED]'
               }
             }
           }
         } else {
-          const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(schemeProbe)
+          const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(strippedUrl)
           const rawScheme = schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown'
-          const SAFE_KNOWN_SCHEMES = new Set(['file', 'mailto', 'tel', 'ftp', 'ws', 'wss', 'chrome', 'edge'])
-          if (fullVaultHits > 0) {
+          const SAFE_KNOWN_SCHEMES = new Set(['file', 'mailto', 'tel', 'ftp', 'ws', 'wss', 'chrome', 'edge', 'about'])
+          if (preHitCount > 0) {
             navUrl = SAFE_KNOWN_SCHEMES.has(rawScheme) ? `${rawScheme}:[REDACTED]` : '[REDACTED]'
+            finalScrubNeeded = false
           } else {
             navUrl = `${rawScheme}:[REDACTED]`
           }
           extra = { len: Buffer.byteLength(rawUrl, 'utf8') }
         }
       }
-      if (vault) {
+      if (vault && finalScrubNeeded) {
         const sc = vault.scrub(navUrl)
         if (sc.count > 0) {
           vaultRedactions += sc.count

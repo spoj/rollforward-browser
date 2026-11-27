@@ -399,3 +399,42 @@ test('R3 linear C0/space nav URL trim (<50ms on 64 KiB spaces) and mixed-case va
   assert.equal(navs[11].summary?.url, 'blob:[REDACTED]', 'vault-miss non-canonical blob:http:\\clean.example fails closed')
   assert.equal(navs[13].summary?.url, 'blob:[REDACTED]', 'vault-miss backslash terminator blob:https://app.example\\item fails closed')
 })
+
+test('R6 unified pre-lowercasing vault check covers mixed-case HTTPS hosts and control-stripped data:/custom schemes on Page.navigate & Target.createTarget', () => {
+  const vault = new SecretVault()
+  vault.addTrustedDrive('MixedTenant99')
+  vault.addTrustedDrive('MyMimeSec')
+  vault.addTrustedDrive('MySecScheme')
+  vault.addTrustedDrive('MyVaultSecret99')
+  const tap = new CdpSessionTap({ projection: 'semantic', vault, isLive: () => false, coalesceMs: 10 })
+  const conn = tap.attachConnection()
+
+  // 1. Mixed-case HTTPS hostname on both Page.navigate and Target.createTarget
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: 'https://MixedTenant99.example/' } }))))
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 2, method: 'Target.createTarget', params: { url: 'https://MixedTenant99.example/' } }))))
+  // 2. Control-char-split mixed-case HTTPS hostname
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 3, method: 'Page.navigate', params: { url: 'https://app.example/cb?token=MyVaultSecret99' } }))))
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 4, method: 'Page.navigate', params: { url: 'https://Mixed\tTenant99.example/' } }))))
+  // 3. Control-char-split data: MIME
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 5, method: 'Page.navigate', params: { url: 'data:application/MyMi\tmeSec,abc' } }))))
+  // 4. Control-char-split custom scheme
+  conn.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 6, method: 'Target.createTarget', params: { url: 'MySec\tScheme:abc' } }))))
+  tap.seal()
+
+  const navs = tap.entries.filter((e): e is CdpEntry => e.method === 'Page.navigate' || e.method === 'Target.createTarget')
+  assert.equal(navs.length, 6)
+  assert.equal(navs[0].summary?.url, 'https://[REDACTED]')
+  assert.equal(navs[0].vaultRedactions, 1)
+  assert.equal(navs[1].summary?.url, 'https://[REDACTED]')
+  assert.equal(navs[1].vaultRedactions, 1)
+  // Clean host with vaulted query param still preserves host + path!
+  assert.equal(navs[2].summary?.url, 'https://app.example/cb?token=[REDACTED:vault]')
+  assert.equal(navs[2].vaultRedactions, 1)
+  assert.equal(navs[3].summary?.url, 'https://[REDACTED]')
+  assert.equal(navs[3].vaultRedactions, 1)
+  assert.equal(navs[4].severity, 'high')
+  assert.match(String(navs[4].summary?.url), /^data:\[REDACTED\];len=/)
+  assert.equal(navs[4].vaultRedactions, 1)
+  assert.equal(navs[5].summary?.url, '[REDACTED]')
+  assert.equal(navs[5].vaultRedactions, 1)
+})
