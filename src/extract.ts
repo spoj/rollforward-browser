@@ -52,6 +52,13 @@ export type DecompressResult = {
   decode: 'complete' | 'truncated' | 'error' | 'none'
   truncated: boolean
   reason?: string
+  budgetExceeded?: boolean
+  chargedBytes?: number
+}
+
+export type DecodeBudgetCharger = {
+  tryAcquire: (bytes: number) => boolean
+  release: (bytes: number) => void
 }
 
 const SUPPORTED_ENCODINGS = new Set(['gzip', 'x-gzip', 'deflate', 'br', 'zstd'])
@@ -62,6 +69,7 @@ function decompressSingleLayer(
   inputComplete: boolean,
   maxBytes: number,
   maxMs: number,
+  charger?: DecodeBudgetCharger,
   rawDeflateFallback = false,
 ): Promise<DecompressResult> {
   return new Promise(resolve => {
@@ -91,8 +99,17 @@ function decompressSingleLayer(
 
     const chunks: Buffer[] = []
     let outBytes = 0
+    let charged = 0
     let done = false
     const start = performance.now()
+
+    const releaseAll = () => {
+      if (charged > 0 && charger) {
+        charger.release(charged)
+        charged = 0
+      }
+    }
+
     const timer = setTimeout(() => {
       if (done) return
       done = true
@@ -104,6 +121,7 @@ function decompressSingleLayer(
         decode: 'truncated',
         truncated: true,
         reason: 'decompress-cpu-limit',
+        chargedBytes: charged,
       })
     }, maxMs)
     timer.unref?.()
@@ -126,13 +144,33 @@ function decompressSingleLayer(
           decode: 'truncated',
           truncated: true,
           reason: 'decompress-cpu-limit',
+          chargedBytes: charged,
         })
         return
       }
-      if (outBytes + c.length >= maxBytes) {
-        const need = maxBytes - outBytes
-        if (need > 0) chunks.push(c.subarray(0, need))
-        outBytes = maxBytes
+      const need = Math.min(c.length, maxBytes - outBytes)
+      if (need > 0 && charger && !charger.tryAcquire(need)) {
+        stream.destroy()
+        chunks.length = 0
+        releaseAll()
+        finish({
+          ok: false,
+          buf: Buffer.alloc(0),
+          decodeComplete: false,
+          decode: 'error',
+          truncated: true,
+          reason: 'inflight-budget',
+          budgetExceeded: true,
+          chargedBytes: 0,
+        })
+        return
+      }
+      if (need > 0) {
+        if (charger) charged += need
+        chunks.push(need < c.length ? Buffer.from(c.subarray(0, need)) : c)
+        outBytes += need
+      }
+      if (outBytes >= maxBytes) {
         stream.destroy()
         finish({
           ok: true,
@@ -141,38 +179,38 @@ function decompressSingleLayer(
           decode: 'truncated',
           truncated: true,
           reason: '>64KiB-decoded',
+          chargedBytes: charged,
         })
-        return
       }
-      chunks.push(c)
-      outBytes += c.length
     })
 
     stream.on('end', () => {
       const buf = Buffer.concat(chunks)
+      chunks.length = 0
       if (!inputComplete) {
-        finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB' })
+        finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB', chargedBytes: charged })
       } else {
-        finish({ ok: true, buf, decodeComplete: true, decode: 'complete', truncated: false })
+        finish({ ok: true, buf, decodeComplete: true, decode: 'complete', truncated: false, chargedBytes: charged })
       }
     })
 
     stream.on('error', () => {
       const buf = Buffer.concat(chunks)
+      chunks.length = 0
       if (!inputComplete) {
-        finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB' })
+        finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB', chargedBytes: charged })
         return
       }
+      releaseAll()
       if (encoding === 'deflate' && !rawDeflateFallback) {
         clearTimeout(timer)
         done = true
-        void decompressSingleLayer(input, encoding, inputComplete, maxBytes, maxMs, true).then(resolve)
+        void decompressSingleLayer(input, encoding, inputComplete, maxBytes, maxMs, charger, true).then(resolve)
         return
       }
-      finish({ ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error', truncated: false, reason: 'decompress-err' })
+      finish({ ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error', truncated: false, reason: 'decompress-err', chargedBytes: 0 })
     })
 
-    // Feed in 4 KiB slices so decompression bombs stop immediately at the 64 KiB output cap.
     const SLICE = 4096
     let offset = 0
     const pump = () => {
@@ -197,9 +235,10 @@ export async function decompressPrefix(
   bodyComplete: boolean,
   maxBytes = MAX_PREFIX_BYTES,
   maxMs = 50,
+  charger?: DecodeBudgetCharger,
 ): Promise<DecompressResult> {
   if (rawBuf.length === 0) {
-    return { ok: true, buf: rawBuf, decodeComplete: bodyComplete, decode: 'none', truncated: !bodyComplete }
+    return { ok: true, buf: rawBuf, decodeComplete: bodyComplete, decode: 'none', truncated: !bodyComplete, chargedBytes: 0 }
   }
   const encodings = (contentEncoding ?? '')
     .split(',')
@@ -212,6 +251,7 @@ export async function decompressPrefix(
       decodeComplete: bodyComplete && rawBuf.length <= maxBytes,
       decode: bodyComplete && rawBuf.length <= maxBytes ? 'complete' : 'truncated',
       truncated: !bodyComplete || rawBuf.length > maxBytes,
+      chargedBytes: 0,
     }
   }
   if (encodings.length > 2 || encodings.some(e => !SUPPORTED_ENCODINGS.has(e))) {
@@ -222,16 +262,23 @@ export async function decompressPrefix(
       decode: 'error',
       truncated: false,
       reason: 'unsupported-encoding',
+      chargedBytes: 0,
     }
   }
   let curBuf = rawBuf
   let curComplete = bodyComplete
+  let curCharged = 0
   let anyTruncated = !bodyComplete
   for (let i = encodings.length - 1; i >= 0; i--) {
-    const res = await decompressSingleLayer(curBuf, encodings[i], curComplete, maxBytes, maxMs)
+    const res = await decompressSingleLayer(curBuf, encodings[i], curComplete, maxBytes, maxMs, charger)
+    if (curCharged > 0 && charger) {
+      charger.release(curCharged)
+      curCharged = 0
+    }
     if (!res.ok) return res
     curBuf = res.buf
     curComplete = res.decodeComplete
+    curCharged = res.chargedBytes ?? 0
     if (res.truncated) anyTruncated = true
   }
   return {
@@ -240,6 +287,7 @@ export async function decompressPrefix(
     decodeComplete: curComplete && !anyTruncated,
     decode: curComplete && !anyTruncated ? 'complete' : 'truncated',
     truncated: anyTruncated,
+    chargedBytes: curCharged,
   }
 }
 

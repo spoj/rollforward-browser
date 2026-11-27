@@ -270,9 +270,14 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 const OVERRIDE_HEADERS = ['x-http-method', 'x-http-method-override', 'x-method-override'] as const
 const VALID_VERB_RE = /^[A-Z]{3,16}$/
 const STATIC_DESTS = new Set(['image', 'font', 'style', 'script', 'audio', 'video'])
+const ALLOWED_FETCH_DESTS = new Set([
+  'audio', 'audioworklet', 'document', 'embed', 'empty', 'fencedframe', 'font', 'frame',
+  'iframe', 'image', 'manifest', 'object', 'paintworklet', 'report', 'script',
+  'serviceworker', 'sharedworker', 'style', 'track', 'video', 'webidentity', 'worker', 'xslt',
+])
 
 const MAX_ENTRY_BYTES = 12 * 1024
-const MINIMAL_RESERVE_BYTES = 512
+const MINIMAL_RESERVE_BYTES = 768
 const TAIL_RESERVE_BYTES = 64 * 1024
 const MAX_PAGE_BYTES = 4 * 1024 * 1024
 const MAX_COLLAPSE_BUCKETS = 64
@@ -471,13 +476,14 @@ function capEntryTo12KiB(entry: V2Entry): { entry: V2Entry; bytes: number } {
   return { entry: minimal, bytes: Buffer.byteLength(JSON.stringify(minimal), 'utf8') }
 }
 
-// Guaranteed <= 512 UTF-8 bytes minimal record preserving origin + pathname for checkRefused!
+// Guaranteed <= MINIMAL_RESERVE_BYTES (768 UTF-8 bytes) minimal record preserving origin + pathname for checkRefused!
 function toMinimalCappedEntry(e: V2Entry): V2Entry {
   let pathMax = 80
   let msgMax = 48
-  for (let attempt = 0; attempt < 4; attempt++) {
+  let authMax = 64
+  for (let attempt = 0; attempt < 5; attempt++) {
     const p = truncateUtf8HeadTail(e.path || '/', pathMax)
-    const authority = truncateUtf8HeadTail(e.authority || '', 64)
+    const authority = truncateUtf8HeadTail(e.authority || '', authMax)
     const originPath = authority ? `${e.scheme}://${authority}${p}` : truncateUtf8HeadTail(e.url, pathMax)
     const minimal: V2Entry = {
       n: e.n,
@@ -493,8 +499,8 @@ function toMinimalCappedEntry(e: V2Entry): V2Entry {
       authority,
       path: p,
       url: originPath,
-      method: e.method,
-      effectiveMethod: e.effectiveMethod,
+      method: e.method.slice(0, 16),
+      effectiveMethod: e.effectiveMethod.slice(0, 16),
       methodSource: e.methodSource,
       isWrite: e.isWrite,
       prefixBytes: e.prefixBytes,
@@ -512,8 +518,9 @@ function toMinimalCappedEntry(e: V2Entry): V2Entry {
       logCapped: true,
     }
     if (Buffer.byteLength(JSON.stringify(minimal), 'utf8') <= MINIMAL_RESERVE_BYTES) return minimal
-    pathMax = Math.max(8, Math.floor(pathMax / 2))
-    msgMax = Math.max(12, Math.floor(msgMax / 2))
+    pathMax = Math.max(4, Math.floor(pathMax / 2))
+    msgMax = Math.max(8, Math.floor(msgMax / 2))
+    authMax = Math.max(24, Math.floor(authMax * 0.75))
   }
   const authority = truncateUtf8HeadTail(e.authority || '', 48)
   const originPath = authority ? `${e.scheme}://${authority}/` : '/'
@@ -828,7 +835,12 @@ export function startProxy(
   }
 
   const buildOutboundSnapshot = (req: http.IncomingMessage, url: URL) => {
-    const headers: Record<string, string | string[] | undefined> = { ...req.headers, ...(url.origin === origin && site.headers), host: url.host }
+    const headers: Record<string, string | string[] | undefined> = { ...req.headers }
+    // Normalize site.headers keys to lowercase so mixed-case site overrides replace inbound headers consistently!
+    if (url.origin === origin && site.headers) {
+      for (const [k, v] of Object.entries(site.headers)) headers[k.toLowerCase()] = v
+    }
+    headers.host = url.host
     for (const h of hopByHop) delete headers[h]
     delete headers['expect']
     const strict = !!site.public || !exact(url.hostname)
@@ -845,11 +857,32 @@ export function startProxy(
     const hdrs = effectiveHeaders ?? req.headers
     const sem = parseSemanticMethods(req.method, hdrs, vault)
     const declaredBytes = parseDeclaredBytes(hdrs)
-    const hasBodyHint = (declaredBytes ?? 0) > 0 || Boolean(hdrs['transfer-encoding'])
+    // Check inbound req.headers['transfer-encoding'] too because buildOutboundSnapshot strips hop-by-hop headers!
+    const hasBodyHint = (declaredBytes ?? 0) > 0 || Boolean(req.headers['transfer-encoding']) || Boolean(hdrs['transfer-encoding'])
     const hasPotentialBody = !SAFE_METHODS.has(sem.wireMethod) || hasBodyHint
     const isWrite = !SAFE_METHODS.has(sem.wireMethod) || !SAFE_METHODS.has(sem.effectiveMethod) || sem.invalidOrConflictingOverride || (SAFE_METHODS.has(sem.wireMethod) && hasBodyHint)
     const isAuth = url ? isAuthUrl(url) : false
     return { sem, declaredBytes, hasPotentialBody, isWrite, isAuth }
+  }
+
+  const sanitizeDestHeader = (headers: Record<string, string | string[] | undefined>): { dest?: string; vaultRedactions: number } => {
+    const raw = headers['sec-fetch-dest']
+    if (typeof raw !== 'string' || !raw) return { vaultRedactions: 0 }
+    const lower = raw.trim().toLowerCase()
+    if (ALLOWED_FETCH_DESTS.has(lower)) return { dest: lower, vaultRedactions: 0 }
+    const s = scrubText(truncateUtf8HeadTail(raw, 32), vault)
+    return { dest: s.vaultRedactions > 0 ? '[REDACTED:vault]' : 'other', vaultRedactions: s.vaultRedactions }
+  }
+
+  const applyLateLive = (safe: SafeRequestProjection, liveAtStart: boolean, genAtStart: number | undefined): { safe: SafeRequestProjection; liveAtEnd?: true } => {
+    const lateLive = !liveAtStart && (isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart))
+    if (!lateLive) return { safe }
+    const copy: SafeRequestProjection = { ...safe }
+    if (copy.reqBody !== undefined) {
+      delete copy.reqBody
+      copy.reqOmitted = 'live'
+    }
+    return { safe: copy, liveAtEnd: true }
   }
 
   const normalLimit = () => Math.max(0, maxLogHardBytes - TAIL_RESERVE_BYTES)
@@ -952,9 +985,9 @@ export function startProxy(
     if (sealed || !v2Enabled) return
     const preview: LateOutcomeEntry = { n: cursorCounter + 1, ...rec }
     const bytes = Buffer.byteLength(JSON.stringify(preview), 'utf8')
-    // Reserve 8 KiB inside hard cap for _summary so late outcomes never starve _summary, and never bump cursor on refusal!
+    // Account for outstanding write reservations AND reserve 8 KiB for _summary; never bump cursor on refusal!
     const summaryFloor = Math.min(8192, Math.floor(TAIL_RESERVE_BYTES / 2))
-    if (logBytes + bytes > maxLogHardBytes - summaryFloor) {
+    if (logBytes + reservedBytes + bytes > maxLogHardBytes - summaryFloor) {
       droppedLateOutcomes++
       return
     }
@@ -997,7 +1030,8 @@ export function startProxy(
     reason: string
   }): SafeRequestProjection => {
     const sanUrl = params.url ? sanitizeUrl(params.url, { projection, vault }) : sanitizeUrl(params.req.url ?? '/', { projection, vault })
-    const dest = typeof params.req.headers['sec-fetch-dest'] === 'string' ? params.req.headers['sec-fetch-dest'] : undefined
+    const destInfo = sanitizeDestHeader(params.req.headers)
+    const dest = destInfo.dest
     return {
       descV: DESC_V,
       redactV: REDACT_V,
@@ -1033,6 +1067,7 @@ export function startProxy(
 
   const buildSafeProjection = async (params: {
     req: http.IncomingMessage
+    effectiveHeaders?: Record<string, string | string[] | undefined>
     url: URL | null
     seq: number
     t: string
@@ -1048,33 +1083,44 @@ export function startProxy(
     httpCursorAtArrival: number
     cdpCursorAtArrival: number
     siteConfigRev?: number
-  }): Promise<{ safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void }> => {
+  }): Promise<{ safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void; decodeBudgetExceeded?: boolean }> => {
     const { req, url, seq, t, kind, prefixBuf, bodyComplete, transport, transportReasons, liveAtStart, genAtStart, arrival, hasBody } = params
+    const hdrs = params.effectiveHeaders ?? req.headers
     const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
 
-    let vaultRedactions = sanUrl.vaultRedactions + arrival.sem.vaultRedactions
-    const dest = typeof req.headers['sec-fetch-dest'] === 'string' ? req.headers['sec-fetch-dest'] : undefined
+    const destInfo = sanitizeDestHeader(hdrs)
+    const dest = destInfo.dest
+    let vaultRedactions = sanUrl.vaultRedactions + arrival.sem.vaultRedactions + destInfo.vaultRedactions
     let from: string | undefined
-    if (typeof req.headers.referer === 'string' && req.headers.referer) {
-      const sanFrom = sanitizeUrl(req.headers.referer, { projection, vault })
+    if (typeof hdrs.referer === 'string' && hdrs.referer) {
+      const sanFrom = sanitizeUrl(hdrs.referer, { projection, vault })
       from = sanFrom.url
       vaultRedactions += sanFrom.vaultRedactions
     }
 
-    const reqType = normalizeContentType(req.headers['content-type'])
+    const reqType = normalizeContentType(typeof hdrs['content-type'] === 'string' ? hdrs['content-type'] : undefined)
     const isWrite = arrival.isWrite || (SAFE_METHODS.has(arrival.sem.wireMethod) && (hasBody || prefixBuf.length > 0))
     const liveOrChanged = liveAtStart || isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart)
 
     let decodeRes = undefined
     let decodedCharge = 0
+    let decodeBudgetExceeded = false
     if (kind === 'http' && prefixBuf.length > 0 && !liveOrChanged) {
+      const charger = {
+        tryAcquire: (b: number) => inFlightTracker.tryAcquire(clientId, sessionId, b),
+        release: (b: number) => inFlightTracker.release(clientId, sessionId, b),
+      }
       try {
-        decodeRes = await decompressPrefix(prefixBuf, typeof req.headers['content-encoding'] === 'string' ? req.headers['content-encoding'] : undefined, bodyComplete)
-        if (decodeRes.ok && decodeRes.buf !== prefixBuf && decodeRes.buf.length > 0) {
-          if (inFlightTracker.tryAcquire(clientId, sessionId, decodeRes.buf.length)) {
-            decodedCharge = decodeRes.buf.length
-          }
-        }
+        decodeRes = await decompressPrefix(
+          prefixBuf,
+          typeof hdrs['content-encoding'] === 'string' ? hdrs['content-encoding'] : undefined,
+          bodyComplete,
+          MAX_PREFIX_BYTES,
+          50,
+          charger,
+        )
+        decodedCharge = decodeRes.chargedBytes ?? 0
+        if (decodeRes.budgetExceeded) decodeBudgetExceeded = true
       } catch {
         decodeRes = { ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error' as const, truncated: false, reason: 'decompress-err' }
       }
@@ -1096,7 +1142,7 @@ export function startProxy(
       effectiveMethod: arrival.sem.effectiveMethod,
       kind,
       hdr: arrival.sem.hdr,
-      rawHeaders: req.headers,
+      rawHeaders: hdrs,
       reqType,
       decodedBuf: decodeRes ? decodeRes.buf : prefixBuf,
       decodeResult: decodeRes,
@@ -1162,7 +1208,7 @@ export function startProxy(
         }
       : undefined
 
-    return { safe, raw, releaseDecoded }
+    return { safe, raw, releaseDecoded, ...(decodeBudgetExceeded && { decodeBudgetExceeded: true }) }
   }
 
   const runPolicyHook = async (
@@ -1186,8 +1232,9 @@ export function startProxy(
       ms: Math.round(performance.now() - start),
     })
 
-    // Enforce concurrency cap BEFORE launching async work on writes/upgrades!
-    if (hook.mode === 'enforce' && activeAsyncHooks >= maxConcurrentAsyncHooks && (descriptor.safe.isWrite || descriptor.safe.kind === 'upgrade')) {
+    // Enforce concurrency cap BEFORE invoking evaluate() so zero unbounded async work can start above cap!
+    // (Synchronous Stage-1 GET checks never increment activeAsyncHooks, so they never trigger the cap during normal traffic.)
+    if (hook.mode === 'enforce' && activeAsyncHooks >= maxConcurrentAsyncHooks) {
       return { decision: makeErrorDecision(), busy: true }
     }
 
@@ -1495,11 +1542,26 @@ export function startProxy(
       }
 
       const built = await buildSafeProjection({
-        req, url, seq, t, kind: 'http', prefixBuf, bodyComplete, transport, transportReasons,
+        req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'http', prefixBuf, bodyComplete, transport, transportReasons,
         liveAtStart, genAtStart, arrival, hasBody: totalReqBytes > 0,
         httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
       })
       cleanupExtra = () => { releasePrefixBudget(); built.releaseDecoded() }
+
+      if (built.decodeBudgetExceeded) {
+        releasePrefixBudget()
+        built.releaseDecoded()
+        if (!terminalCommitted) {
+          terminalCommitted = true
+          activeInFlight.delete(seq)
+          cleanupCancellation()
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 503, blocked: 'capture budget exceeded', dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
+          reserved = 0
+        }
+        res.writeHead(503, { 'content-type': 'application/json', connection: 'close' }).end(JSON.stringify({ error: 'capture budget exceeded' }))
+        return
+      }
 
       const hookRes = await runPolicyHook(activeHook, { safe: built.safe, raw: built.raw }, abortController.signal, cdpCursorAtArrival, httpCursorAtArrival)
       built.releaseDecoded()
@@ -1510,7 +1572,8 @@ export function startProxy(
           terminalCommitted = true
           activeInFlight.delete(seq)
           cleanupCancellation()
-          appendV2Entry({ ...built.safe, status: 503, blocked: 'policy busy', dispatch: 'not_dispatched', policy: hookRes.decision, ms: Math.round(performance.now() - startMs) }, reserved)
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 503, blocked: 'policy busy', dispatch: 'not_dispatched', policy: hookRes.decision, ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         }
         res.writeHead(503, { 'content-type': 'application/json', connection: 'close' }).end(JSON.stringify({ error: 'policy evaluator busy' }))
@@ -1523,7 +1586,8 @@ export function startProxy(
           terminalCommitted = true
           activeInFlight.delete(seq)
           cleanupCancellation()
-          appendV2Entry({ ...built.safe, status: 0, reqBytes: totalReqBytes, dispatch: 'not_dispatched', policy: hookRes.decision, incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, reqBytes: totalReqBytes, dispatch: 'not_dispatched', policy: hookRes.decision, incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         }
         return
@@ -1531,23 +1595,18 @@ export function startProxy(
 
       if (hookRes.decision.action !== 'allow') {
         releasePrefixBudget()
-        const lateLive = !liveAtStart && (isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart))
         if (!terminalCommitted) {
           terminalCommitted = true
           activeInFlight.delete(seq)
           cleanupCancellation()
-          const finalSafe = { ...built.safe }
-          if (lateLive && finalSafe.reqBody !== undefined) {
-            delete finalSafe.reqBody
-            finalSafe.reqOmitted = 'live'
-          }
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
           appendV2Entry({
-            ...finalSafe,
+            ...ll.safe,
+            ...(ll.liveAtEnd && { liveAtEnd: true as const }),
             status: 403,
             blocked: 'blocked by policy',
             dispatch: 'not_dispatched',
             policy: hookRes.decision,
-            ...(lateLive && { liveAtEnd: true as const }),
             ms: Math.round(performance.now() - startMs),
           }, reserved)
           reserved = 0
@@ -1571,8 +1630,10 @@ export function startProxy(
           terminalCommitted = true
           activeInFlight.delete(seq)
           cleanupCancellation()
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
           appendV2Entry({
-            ...built.safe,
+            ...ll.safe,
+            ...(ll.liveAtEnd && { liveAtEnd: true as const }),
             status: 403,
             blocked: recheckBlocked,
             dispatch: 'not_dispatched',
@@ -1703,7 +1764,7 @@ export function startProxy(
       const prefixBuf = teeChunks.length === 1 ? teeChunks[0] : Buffer.concat(teeChunks)
       teeChunks.length = 0 // drop chunk array immediately; charge stays held until all consumers finish!
       const built = await buildSafeProjection({
-        req, url, seq, t, kind: 'http', prefixBuf,
+        req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'http', prefixBuf,
         bodyComplete: teeComplete,
         transport: teeTransport,
         transportReasons: teeReasons,
@@ -2127,6 +2188,8 @@ export function startProxy(
       }
 
       let committed = false
+      let emittedUpgradeN: number | null = null
+      let reserved = 0
       let dispatchState: 'not_dispatched' | 'dispatched' | 'unknown' = 'not_dispatched'
       activeInFlight.set(seq, {
         finalize: () => {
@@ -2139,12 +2202,13 @@ export function startProxy(
             req, url, seq, t, kind: 'upgrade', arrival, liveAtStart,
             httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart, reason: 'sealed-in-flight',
           })
-          appendV2Entry({ ...fb, status: 0, dispatch: dispatchState === 'dispatched' ? 'unknown' : 'not_dispatched', incomplete: true, ms: Math.round(performance.now() - startMs) })
+          emittedUpgradeN = appendV2Entry({ ...fb, status: 0, dispatch: dispatchState === 'dispatched' ? 'unknown' : 'not_dispatched', incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
+          reserved = 0
         },
       })
 
       const built = await buildSafeProjection({
-        req, url, seq, t, kind: 'upgrade', prefixBuf: Buffer.alloc(0), bodyComplete: false,
+        req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'upgrade', prefixBuf: Buffer.alloc(0), bodyComplete: false,
         transport: 'not-read', transportReasons: [], liveAtStart, genAtStart, arrival,
         hasBody: false, httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
       })
@@ -2156,9 +2220,23 @@ export function startProxy(
           committed = true
           activeInFlight.delete(seq)
           cleanupAbort()
-          appendV2Entry({ ...built.safe, status: 403, blocked, dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) })
+          emittedUpgradeN = appendV2Entry({ ...built.safe, status: 403, blocked, dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
+          reserved = 0
         }
         socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n')
+        return
+      }
+
+      // Reserve log capacity for upgrades (especially write-classified upgrades) before policy/upstream dispatch!
+      reserved = tryReserveLogSpace()
+      if (reserved < 0) {
+        reserved = 0
+        committed = true
+        activeInFlight.delete(seq)
+        cleanupAbort()
+        refusedFullCount++
+        const fullJson = JSON.stringify({ error: 'audit log full' })
+        socket.end(`HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(fullJson)}\r\nconnection: close\r\n\r\n${fullJson}`)
         return
       }
 
@@ -2173,7 +2251,9 @@ export function startProxy(
               committed = true
               activeInFlight.delete(seq)
               cleanupAbort()
-              appendV2Entry({ ...built.safe, status: 503, blocked: 'policy busy', dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) })
+              const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+              emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 503, blocked: 'policy busy', dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) }, reserved)
+              reserved = 0
             }
             socket.end('HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\n\r\n')
             return
@@ -2183,7 +2263,9 @@ export function startProxy(
               committed = true
               activeInFlight.delete(seq)
               cleanupAbort()
-              appendV2Entry({ ...built.safe, status: 0, dispatch: 'not_dispatched', policy: policyDecision, incomplete: true, ms: Math.round(performance.now() - startMs) })
+              const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+              emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, dispatch: 'not_dispatched', policy: policyDecision, incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
+              reserved = 0
             }
             return
           }
@@ -2192,7 +2274,9 @@ export function startProxy(
               committed = true
               activeInFlight.delete(seq)
               cleanupAbort()
-              appendV2Entry({ ...built.safe, status: 403, blocked: 'blocked by policy', dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) })
+              const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+              emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 403, blocked: 'blocked by policy', dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) }, reserved)
+              reserved = 0
             }
             const bodyJson = JSON.stringify({ error: 'blocked by policy', ruleId: policyDecision.ruleId, decisionId: policyDecision.decisionId })
             socket.end(`HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(bodyJson)}\r\nconnection: close\r\n\r\n${bodyJson}`)
@@ -2205,7 +2289,9 @@ export function startProxy(
               committed = true
               activeInFlight.delete(seq)
               cleanupAbort()
-              appendV2Entry({ ...built.safe, status: 403, blocked: recheck, dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) })
+              const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+              emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 403, blocked: recheck, dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) }, reserved)
+              reserved = 0
             }
             socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n')
             return
@@ -2213,6 +2299,15 @@ export function startProxy(
         } else {
           void runPolicyHook(activeHook, { safe: built.safe, raw: built.raw }, abortController.signal, cdpCursorAtArrival, httpCursorAtArrival).then(hr => {
             policyDecision = hr.decision
+            if (emittedUpgradeN !== null && !sealed) {
+              appendLateOutcome({
+                rec: 'http_end',
+                ref: emittedUpgradeN,
+                t: new Date().toISOString(),
+                ms: Math.round(performance.now() - startMs),
+                policy: policyDecision,
+              })
+            }
           }).catch(() => {})
         }
       }
@@ -2234,7 +2329,9 @@ export function startProxy(
           committed = true
           activeInFlight.delete(seq)
           cleanupAbort()
-          appendV2Entry({ ...built.safe, status: 101, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) })
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+          emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 101, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) }, reserved)
+          reserved = 0
         }
         socket.write(`HTTP/1.1 101 Switching Protocols\r\n${Object.entries(r.headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`)
         upSocket.write(head)
@@ -2242,13 +2339,14 @@ export function startProxy(
         upSocket.pipe(socket).pipe(upSocket)
       })
       up.on('response', r => {
-        // Drain rejected handshake response body so upstream socket is not leaked!
         r.resume()
         if (!committed) {
           committed = true
           activeInFlight.delete(seq)
           cleanupAbort()
-          appendV2Entry({ ...built.safe, status: r.statusCode ?? 0, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) })
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+          emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: r.statusCode ?? 0, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) }, reserved)
+          reserved = 0
         }
         socket.end(`HTTP/1.1 ${r.statusCode} ${r.statusMessage}\r\nconnection: close\r\n\r\n`)
       })
@@ -2258,7 +2356,9 @@ export function startProxy(
           committed = true
           activeInFlight.delete(seq)
           cleanupAbort()
-          appendV2Entry({ ...built.safe, status: 502, error: err, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) })
+          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
+          emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 502, error: err, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) }, reserved)
+          reserved = 0
         }
         socket.end('HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n')
       })

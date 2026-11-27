@@ -174,8 +174,9 @@ test('SecretVault two-pool isolation prevents cookie poisoning, protects trusted
 })
 
 test('normalized auth-URL denylist handles WebLogic matrix params, dot segments, trailing host dot, callbacks, and percent-encoding', () => {
-  assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=/login'), false, 'WebLogic ;x=/login bypass must NOT misclassify formservice as auth URL')
-  assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=%2Flogin'), false)
+  assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=%2Flogin'), false, 'in-segment matrix param stripped before decoding %2F')
+  assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=login'), false, 'in-segment matrix param stripped')
+  assert.equal(isAuthUrl('https://erp.example/jderest/v2/formservice;x=/login'), true, 'fail-closed: real following /login segment preserved')
   assert.equal(isAuthUrl('https://erp.example/app;v=1/login'), true, 'real auth endpoint after matrix-parameterized segment IS auth URL')
   assert.equal(isAuthUrl('https://erp.example/sso/callback'), true, 'callback endpoint IS auth URL')
   assert.equal(isAuthUrl('https://login.microsoftonline.com./common/foo'), true, 'trailing DNS dot stripped before auth host check')

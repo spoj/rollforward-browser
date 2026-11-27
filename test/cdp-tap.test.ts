@@ -79,13 +79,17 @@ test('WsFrameParser protocol violations emit _tap.disabled and oversized message
   const c2 = tap.attachConnection()
   c2.feed(encodeWsFrame(Buffer.from('{"method":"Page.reload"}'), { rsv: 0x40 }))
 
+  // Unmasked client->server frame triggers _tap.disabled (severity: 'high')
+  const c3 = tap.attachConnection()
+  c3.feed(encodeWsFrame(Buffer.from('{"method":"Page.reload"}'), { mask: false }))
+
   tap.seal()
   const entries = tap.entries.filter((e): e is CdpEntry => e.rec !== '_tap.summary')
   assert.ok(entries.some(e => e.method === '_tap.oversized' && e.severity === 'high' && e.summary?.bytes === bigPayload.length))
   assert.ok(entries.some(e => e.method === '_tap.disabled' && e.severity === 'high'))
   const summary = tap.entries.find(e => e.rec === '_tap.summary') as any
   assert.equal(summary.methodCounts['_playwright.injectedScript'], 1)
-  assert.equal(summary.tapDisabledCount, 1)
+  assert.equal(summary.tapDisabledCount, 2)
 })
 
 test('CdpSessionTap parses Playwright 1.64 Runtime.callFunctionOn, input length-only, names-only network/storage, recursion depth, high-severity, and coalescing', async () => {

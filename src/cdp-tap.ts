@@ -163,12 +163,13 @@ export class WsFrameParser {
     }
     if (this.msgTotalBytes > MAX_MSG_HEAD) {
       if (data.length >= MAX_MSG_TAIL) {
-        if (this.msgTail.length === 0) {
-          if (this.charger && !this.charger.tryAcquire(MAX_MSG_TAIL)) {
+        if (this.msgTail.length < MAX_MSG_TAIL) {
+          const delta = MAX_MSG_TAIL - this.msgTail.length
+          if (this.charger && !this.charger.tryAcquire(delta)) {
             this.fail('capture budget exceeded')
             return
           }
-          this.chargedBytes += MAX_MSG_TAIL
+          this.chargedBytes += delta
           this.msgTail = Buffer.allocUnsafe(MAX_MSG_TAIL)
         }
         data.copy(this.msgTail, 0, data.length - MAX_MSG_TAIL, data.length)
@@ -266,6 +267,7 @@ export class WsFrameParser {
           this.frameMasked = (b1 & 0x80) !== 0
           const len7 = b1 & 0x7f
           if (rsv !== 0) return this.fail(`non-zero RSV bits: 0x${rsv.toString(16)}`)
+          if (!this.frameMasked) return this.fail('unmasked client frame')
           this.frameIsControl = this.frameOpcode >= 0x8
           if (this.frameOpcode > 0xa || (this.frameOpcode >= 0x3 && this.frameOpcode <= 0x7)) {
             return this.fail(`invalid opcode: ${this.frameOpcode}`)
@@ -426,6 +428,7 @@ const CONTROL_KEYS = new Set([
 ])
 
 const NAV_SIMPLE_METHODS = new Set(['Page.reload', 'Page.goBack', 'Page.goForward', 'Target.closeTarget'])
+const MOUSE_BUTTONS = new Set(['none', 'left', 'middle', 'right', 'back', 'forward'])
 const NET_SIMPLE_METHODS = new Set([
   'Network.deleteCookies', 'Storage.clearCookies', 'Fetch.enable',
   'Network.setRequestInterception', 'Browser.setDownloadBehavior',
@@ -871,8 +874,9 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Input.dispatchMouseEvent') {
       if (params.type === 'mousePressed') {
         capture = true
+        const rawBtn = typeof params.button === 'string' ? params.button : undefined
         summary = {
-          button: typeof params.button === 'string' ? params.button.slice(0, 16) : undefined,
+          button: rawBtn && MOUSE_BUTTONS.has(rawBtn) ? rawBtn : rawBtn ? 'other' : undefined,
           x: typeof params.x === 'number' ? Math.round(params.x) : undefined,
           y: typeof params.y === 'number' ? Math.round(params.y) : undefined,
         }
@@ -1100,7 +1104,7 @@ export class CdpSessionTap {
 }
 
 // Passive uncompressed /view/drive observer for SecretVault ONLY (per-connection edit buffer, never logged).
-export function createDriveVaultTap(vault: SecretVault): { feed: (chunk: Buffer) => void; close: () => void } {
+export function createDriveVaultTap(vault: SecretVault, charger?: BudgetCharger): { feed: (chunk: Buffer) => void; close: () => void } {
   let disabled = false
   const driveBuf = vault.createDriveBuffer()
   const parser = new WsFrameParser(
@@ -1119,6 +1123,7 @@ export function createDriveVaultTap(vault: SecretVault): { feed: (chunk: Buffer)
       disabled = true
       driveBuf.clear()
     },
+    charger,
   )
   return {
     feed: (chunk: Buffer) => {

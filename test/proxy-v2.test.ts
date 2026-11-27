@@ -300,7 +300,7 @@ test('byte budgets collapse static GETs, preserve origin+pathname in logCapped m
     collapseGetsAfterBytes: 100,
     collapseGetsAfterEntries: 2,
     maxLogSoftBytes: 1500,
-    maxLogHardBytes: 64 * 1024 + 2800, // 2800 B above 64 KiB tail reserve
+    maxLogHardBytes: 64 * 1024 + 3600, // 3600 B above 64 KiB tail reserve
   })
   // Emit a few static GETs -> should collapse into collapsedGets
   for (let i = 0; i < 6; i++) {

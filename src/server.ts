@@ -58,11 +58,16 @@ const sealSession = (s: Session, scheduleGc = false): Promise<SealSnapshot> => {
     s.closing = s.seal()
   }
   if (scheduleGc && !s.gcTimer) {
-    s.gcTimer = setTimeout(() => {
-      s.reclaim()
-      sessions.delete(s.id)
-    }, postTtlGcMs)
-    s.gcTimer.unref?.()
+    // Start post-TTL GC timer ONLY after seal() finishes publishing the frozen snapshot!
+    void s.closing.then(() => {
+      if (!sessions.has(s.id) || s.gcTimer) return
+      s.gcTimer = setTimeout(() => {
+        if (!sessions.has(s.id) || !s.isSealed()) return
+        s.reclaim()
+        sessions.delete(s.id)
+      }, postTtlGcMs)
+      s.gcTimer.unref?.()
+    }).catch(() => {})
   }
   return s.closing
 }
@@ -358,7 +363,10 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
     const tap = tapExternalCdp
       ? s.cdpTap!.attachConnection()
       : tapDriveVault
-        ? createDriveVaultTap(s.vault)
+        ? createDriveVaultTap(s.vault, {
+            tryAcquire: b => inFlightTracker.tryAcquire(client.name, s.id, b),
+            release: b => inFlightTracker.release(client.name, s.id, b),
+          })
         : undefined
     // Passive zero-mutation attachment: feed head before up.write(head), then pipe, then observe socket data (§3.1.3)
     if (tap && head.length) tap.feed(head)

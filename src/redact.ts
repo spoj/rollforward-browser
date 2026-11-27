@@ -383,20 +383,15 @@ export class SecretVault {
 }
 
 export function normalizePathForAuth(rawPath: string): string {
-  // Split raw segments BEFORE decoding %2F so `;x=%2Flogin` stays inside the segment.
-  // For literal `;x=/login` (matrix param ending in `=` immediately before `/`), skip the matrix-value segment,
-  // while preserving genuine routing segments after ordinary matrix params like `/app;v=1/login`.
+  // Split on '/' BEFORE percent-decoding so %2F inside a matrix parameter (e.g. /formservice;x=%2Flogin) stays in-segment.
+  // Strip ';...' strictly per segment (fail-closed: a real following '/login' segment is preserved).
   const rawSegs = rawPath.split('/')
   const parts: string[] = []
-  for (let i = 0; i < rawSegs.length; i++) {
-    const raw = rawSegs[i]
+  for (const raw of rawSegs) {
     if (!raw) continue
-    const decoded = safeDecodeURIComponent(raw)
-    const semiIdx = decoded.indexOf(';')
-    const swallowsNext = semiIdx >= 0 && /;[^;]*=$/.test(decoded)
-    const clean = (semiIdx >= 0 ? decoded.slice(0, semiIdx) : decoded)
-    if (swallowsNext) i++ // skip next segment treated as matrix param value (e.g. /formservice;x=/login)
-    for (const sub of clean.split('/')) {
+    const preStrip = raw.split(';')[0]
+    const decoded = safeDecodeURIComponent(preStrip)
+    for (const sub of decoded.split('/')) {
       if (!sub || sub === '.') continue
       if (sub === '..') {
         parts.pop()
@@ -996,21 +991,27 @@ export function sanitizeUrl(
   const maxLen = opts.maxLen ?? 2048
   const u = typeof raw === 'string' ? URL.parse(raw) : raw
   if (!u) {
-    const scrubbed = scrubText(String(raw), opts.vault)
+    const rawStr = String(raw)
+    const qIdx = rawStr.indexOf('?')
+    const rawPrefix = qIdx >= 0 ? rawStr.slice(0, qIdx) : rawStr
+    const rawSearch = qIdx >= 0 ? rawStr.slice(qIdx) : ''
+    const scrubbedPrefix = scrubText(rawPrefix, opts.vault)
+    const sq = rawSearch ? sanitizeQueryString(rawSearch, opts.projection, opts.vault) : { search: '', vaultRedactions: 0 }
     return {
-      url: truncateUtf8HeadTail(scrubbed.text, maxLen),
+      url: truncateUtf8HeadTail(scrubbedPrefix.text + sq.search, maxLen),
       path: '/',
       authority: '',
       scheme: 'http',
-      vaultRedactions: scrubbed.vaultRedactions,
+      vaultRedactions: scrubbedPrefix.vaultRedactions + sq.vaultRedactions,
     }
   }
   const scheme: 'http' | 'https' = u.protocol === 'https:' ? 'https' : 'http'
-  const authority = u.host
+  const scrubbedAuth = scrubText(u.host, opts.vault)
+  const authority = scrubbedAuth.text
   const origin = `${scheme}://${authority}`
   const sp = sanitizePath(u.pathname, opts.vault)
   const sq = sanitizeQueryString(u.search, opts.projection, opts.vault)
-  let vaultRedactions = sp.vaultRedactions + sq.vaultRedactions
+  let vaultRedactions = scrubbedAuth.vaultRedactions + sp.vaultRedactions + sq.vaultRedactions
   let full = `${origin}${sp.path}${sq.search}`
   if (opts.vault) {
     const finalScrub = opts.vault.scrub(full)
@@ -1022,7 +1023,7 @@ export function sanitizeUrl(
   return {
     url: truncateUtf8HeadTail(full, maxLen, Math.floor(maxLen * 0.75), Math.floor(maxLen * 0.25)),
     path: truncateUtf8HeadTail(sp.path, 1024, 768, 252),
-    authority,
+    authority: truncateUtf8HeadTail(authority, 256),
     scheme,
     vaultRedactions,
   }
