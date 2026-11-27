@@ -56,6 +56,7 @@ export type SealSnapshot = {
 }
 
 const MAX_SHOTS = 60
+const MAX_SINGLE_SHOT_JPEG_BYTES = 5 * 1024 * 1024 // guarantees base64 + envelope <= 8 MiB
 const SHOT_SETTLE_MS = 500
 const SHOT_MIN_INTERVAL_MS = 1_500
 const SHOT_BG_WRITE_INTERVAL_MS = 10_000
@@ -70,10 +71,6 @@ const spki = crypto.createHash('sha256').update(new crypto.X509Certificate(tlsKe
 const containerFlags = ['--network', 'none', '--userns', 'keep-id', '--read-only', '--tmpfs', '/tmp:size=2g', '--memory', '2g', '--pids-limit', '1024',
   '--cap-drop', 'all', '--security-opt', 'no-new-privileges', '--log-driver', 'none']
 
-// A passkey needs a window of the browser's own, for Windows Hello, a security key or a phone, which a headless browser never
-// shows: a page asking for one waits for good, as Microsoft's sign-in did for an account that has one. So every page, in every tab
-// and before its own scripts, sees a browser without passkeys and signs in another way, and a request for one fails at once, as one
-// a person cancels does.
 const noPasskeys = `(() => {
   delete window.PublicKeyCredential
   const c = navigator.credentials
@@ -128,12 +125,15 @@ export class BrowserSession {
   private shotTimer?: NodeJS.Timeout
   private shotPage?: Page
   private shotTrigger: ShotTrigger = 'nav'
+  private shotPriority = 0
   private shotGen = 0
   private frameGen = 0
   private taintedPages = new WeakSet<Page>()
   private pwCheck?: Promise<{ blocked: boolean; sig: string }>
   private capturing = false
   private pendingShot = false
+  private pendingShotTrigger: ShotTrigger = 'nav'
+  private pendingShotPriority = 0
   private stopped = false
   private sealPromise?: Promise<SealSnapshot>
   private sealedSnapshot?: SealSnapshot
@@ -142,7 +142,6 @@ export class BrowserSession {
   // B1 Activity HUD ring buffer (100 entries)
   private hudEvents: HudEvent[] = []
   private hudCursor = 0
-  private hudDropped = 0
   private hudWriteCount = 0
   private hudBlockedCount = 0
 
@@ -166,14 +165,26 @@ export class BrowserSession {
     }
 
     if (this.auditV2 && this.auditV2.cdp !== false) {
+      const tracker = opts.inFlightTracker
+      const clientId = opts.clientId ?? 'default'
       this.cdpTap = new CdpSessionTap({
         projection: this.auditV2.projection ?? 'semantic',
         vault: this.vault,
         isLive: () => this.isLiveOrCooldown(),
+        charger: tracker
+          ? {
+              tryAcquire: b => tracker.tryAcquire(clientId, this.id, b),
+              release: b => tracker.release(clientId, this.id, b),
+            }
+          : undefined,
         onEvent: e => this.recordHudCdp(e),
-        onFileUpload: () => this.scheduleShot(undefined, 'file-upload'),
+        onFileUpload: () => this.scheduleShot(undefined, 'file-upload', false),
       })
     }
+  }
+
+  isSealed(): boolean {
+    return this.sealedSnapshot !== undefined
   }
 
   isLiveOrCooldown(): boolean {
@@ -193,7 +204,6 @@ export class BrowserSession {
     this.hudEvents.push(item)
     if (this.hudEvents.length > MAX_HUD_EVENTS) {
       this.hudEvents.shift()
-      this.hudDropped++
     }
   }
 
@@ -201,8 +211,8 @@ export class BrowserSession {
     if (!this.auditV2 || this.auditV2.hud === false) return
     const r = rec as any
     if (r.rec === '_summary' || r.rec === 'http_end') return
-    // Suppress live-period details at insertion (§4)
-    if (this.drivers > 0 || r.live) return
+    // Suppress live, liveAtEnd, and 5s cooldown at insertion (§4)
+    if (this.isLiveOrCooldown() || r.live || r.liveAtEnd) return
     const e = rec as V2Entry
     if (e.isWrite) this.hudWriteCount++
     if (e.blocked) this.hudBlockedCount++
@@ -221,7 +231,7 @@ export class BrowserSession {
 
   private recordHudCdp(entry: CdpEntry) {
     if (!this.auditV2 || this.auditV2.hud === false) return
-    if (this.drivers > 0 || entry.live) return
+    if (this.isLiveOrCooldown() || entry.live) return
     let hostPath = ''
     if (typeof entry.summary?.url === 'string') {
       const parsed = URL.parse(entry.summary.url)
@@ -243,12 +253,16 @@ export class BrowserSession {
   getActivity(after: number) {
     const oldestCursor = this.hudEvents.length ? this.hudEvents[0].n : this.hudCursor
     const events = this.hudEvents.filter(e => e.n > after)
+    // Report dropped count strictly relative to caller's `after` cursor!
+    const dropped = this.hudEvents.length > 0
+      ? Math.max(0, (this.hudEvents[0].n - 1) - after)
+      : Math.max(0, this.hudCursor - after)
     const nextCursor = events.length ? events[events.length - 1].n : Math.max(after, oldestCursor)
     return {
       live: this.drivers > 0,
       oldestCursor,
       nextCursor,
-      dropped: this.hudDropped,
+      dropped,
       writeCount: this.hudWriteCount,
       blockedCount: this.hudBlockedCount,
       events,
@@ -301,18 +315,18 @@ export class BrowserSession {
         p.on('framedetached', () => { this.frameGen++ })
         p.on('framenavigated', f => {
           this.frameGen++
-          if (f === p.mainFrame()) this.scheduleShot(p, 'nav')
+          if (f === p.mainFrame()) this.scheduleShot(p, 'nav', false)
         })
         p.on('load', () => {
           if (this.drivers === 0) this.taintedPages.delete(p)
-          this.scheduleShot(p, 'load')
+          this.scheduleShot(p, 'load', false)
         })
-        p.on('download', () => this.scheduleShot(p, 'download'))
+        p.on('download', () => this.scheduleShot(p, 'download', false))
       }
       ctx.on('page', p => {
         if (this.drivers > 0) this.taintedPages.add(p)
         watch(p)
-        this.scheduleShot(p, 'tab')
+        this.scheduleShot(p, 'tab', false)
       })
       for (const p of ctx.pages()) watch(p)
     }
@@ -331,7 +345,9 @@ export class BrowserSession {
     clearTimeout(this.shotTimer)
     this.shotTimer = undefined
     this.shotPage = undefined
+    this.shotPriority = 0
     this.pendingShot = false
+    this.pendingShotPriority = 0
     if (wasIdle) {
       this.pushHudEvent({ t: new Date().toISOString(), kind: 'live_start', detail: 'Human took control' })
     }
@@ -349,20 +365,45 @@ export class BrowserSession {
 
   private scheduleShot(page?: Page, trigger: ShotTrigger = 'nav', bgWrite = false) {
     if (!this.audit || this.stopped || this.drivers > 0) return
+    const priority = bgWrite ? 1 : 2
+    if (this.capturing) {
+      this.pendingShot = true
+      if (priority >= this.pendingShotPriority) {
+        this.pendingShotPriority = priority
+        this.pendingShotTrigger = trigger
+        if (page) this.shotPage = page
+      }
+      return
+    }
+    // Never let a lower-priority background write overwrite a pending high-priority trigger or delay it!
+    if (this.shotTimer) {
+      if (priority < this.shotPriority) return
+      if (priority > this.shotPriority) {
+        // Reschedule earlier for high-priority event (e.g., download/file-upload overriding 10s bg-write timer)
+        clearTimeout(this.shotTimer)
+        this.shotTimer = undefined
+      } else {
+        if (page) this.shotPage = page
+        this.shotTrigger = trigger
+        this.shotGen = this.driverGen
+        return
+      }
+    }
+
     if (page) this.shotPage = page
     this.shotTrigger = trigger
+    this.shotPriority = priority
     this.shotGen = this.driverGen
-    if (this.shotTimer) return
     const minInterval = bgWrite ? SHOT_BG_WRITE_INTERVAL_MS : SHOT_MIN_INTERVAL_MS
     const delay = Math.max(SHOT_SETTLE_MS, minInterval - (Date.now() - this.lastShotAt))
     this.shotTimer = setTimeout(() => {
       this.shotTimer = undefined
+      this.shotPriority = 0
       void this.captureAudit()
     }, delay)
     this.shotTimer.unref?.()
   }
 
-  // Fail closed: blocked if any frame (including open shadow roots) has a visible password field, any DOM/attribute mutation occurs during capture, throws, stalls past 1s, or a prior check is still stalled.
   private async hasVisiblePassword(p: Page, arm = false): Promise<{ blocked: boolean; sig: string }> {
     if (this.pwCheck) return { blocked: true, sig: '' }
     const run = Promise.all(p.frames().map(f => f.evaluate((doArm: boolean) => {
@@ -435,8 +476,7 @@ export class BrowserSession {
       if (pw1.blocked) return
       if (this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg || p.isClosed()) return
       const jpeg = await p.screenshot({ type: 'jpeg', quality: 65, timeout: 3000 }).catch(() => null)
-      if (!jpeg || this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg || p.isClosed() || p.url() !== urlBefore) return
-      // Re-check password fields, mutation epoch, and frame stability after capture so a transient login modal/iframe mid-screenshot is never retained.
+      if (!jpeg || jpeg.length > MAX_SINGLE_SHOT_JPEG_BYTES || this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg || p.isClosed() || p.url() !== urlBefore) return
       const pw2 = await this.hasVisiblePassword(p, false)
       if (pw2.blocked || pw2.sig !== pw1.sig) return
       if (this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg) return
@@ -462,33 +502,39 @@ export class BrowserSession {
     } finally {
       this.capturing = false
       if (this.pendingShot && !this.stopped && this.drivers === 0) {
+        const nextTrigger = this.pendingShotTrigger
+        const nextBg = this.pendingShotPriority === 1
         this.pendingShot = false
-        this.scheduleShot(undefined, this.shotTrigger)
+        this.pendingShotPriority = 0
+        this.scheduleShot(undefined, nextTrigger, nextBg)
       }
     }
   }
 
   getShotsV2(after: number) {
     const oldestSeq = this.shots.length ? this.shots[0].seq : this.shotSeq
+    const dropped = this.shots.length > 0
+      ? Math.max(0, (this.shots[0].seq - 1) - after)
+      : Math.max(0, this.shotSeq - after)
     const items: Array<{ seq: number; at: string; url: string; trigger: ShotTrigger; httpCursor: number; cdpCursor: number; jpeg: string }> = []
-    let pageBytes = 0
+    let pageBytes = 128 // envelope overhead
     let lastIdx = -1
 
     for (let i = 0; i < this.shots.length; i++) {
       const s = this.shots[i]
       if (s.seq <= after) continue
-      const b64 = s.jpeg.toString('base64')
-      const entryBytes = b64.length + 256
-      if (items.length > 0 && pageBytes + entryBytes > MAX_SHOTS_PAGE_BYTES) break
-      items.push({
+      const item = {
         seq: s.seq,
         at: s.at,
         url: s.url,
         trigger: s.trigger,
         httpCursor: s.httpCursor,
         cdpCursor: s.cdpCursor,
-        jpeg: b64,
-      })
+        jpeg: s.jpeg.toString('base64'),
+      }
+      const entryBytes = Buffer.byteLength(JSON.stringify(item), 'utf8') + 1
+      if (items.length > 0 && pageBytes + entryBytes > MAX_SHOTS_PAGE_BYTES) break
+      items.push(item)
       pageBytes += entryBytes
       lastIdx = i
     }
@@ -499,7 +545,7 @@ export class BrowserSession {
       oldestSeq,
       nextSeq,
       hasMore,
-      dropped: this.shotsDropped,
+      dropped,
       items,
     }
   }
@@ -512,7 +558,6 @@ export class BrowserSession {
     return total
   }
 
-  // Idempotent seal: freezes proxy, Chromium, state, and final cursors while retaining logs/shots for draining until DELETE/GC.
   seal(): Promise<SealSnapshot> {
     return (this.sealPromise ??= this.doSeal())
   }
@@ -523,11 +568,11 @@ export class BrowserSession {
     clearTimeout(this.shotTimer)
     this.shotTimer = undefined
 
+    // Stop proxy admission, tunnels, and active upstream requests SYNCHRONOUSLY before awaiting storageState/shutdown!
+    this.proxy?.controller.stopAdmission()
+
     let state: unknown = null
     try {
-      // Stop new proxy traffic immediately
-      this.proxy?.close()
-      this.proxy?.closeAllConnections?.()
       state = this.pw?.isConnected() ? await this.pw.contexts()[0].storageState().catch(() => null) : null
     } finally {
       await this.pw?.close().catch(() => {})
@@ -539,7 +584,7 @@ export class BrowserSession {
     const cSnap = this.cdpTap?.seal() ?? { cdpCursor: 0, droppedCdp: 0 }
 
     if (state) {
-      try { this.stateBytes = Buffer.byteLength(JSON.stringify(state)) } catch {}
+      try { this.stateBytes = Buffer.byteLength(JSON.stringify(state), 'utf8') } catch {}
     }
 
     this.sealedSnapshot = {
@@ -570,7 +615,6 @@ export class BrowserSession {
     if (this.sealedSnapshot) this.sealedSnapshot.state = null
   }
 
-  // Legacy close: seal + return legacy allowlisted { state, log } + reclaim memory.
   async close() {
     const snap = await this.seal()
     const result = { state: snap.state, log: toLegacyLog(this.log) }
@@ -582,14 +626,12 @@ export class BrowserSession {
     return await this.pw!.contexts()[0].pages().at(-1)!.screenshot()
   }
 
-  // The newest tab once loaded: its address, and whether it shows a password field, as a sign-in page does.
   async page() {
     const p = this.pw!.contexts()[0].pages().at(-1)!
     await p.waitForLoadState('load')
     return { url: p.url(), password: await p.isVisible('input[type=password]') }
   }
 
-  // The newest tab loaded again, as a host its page needed is allowed.
   async reload() {
     await this.pw!.contexts()[0].pages().at(-1)!.reload({ waitUntil: 'commit' })
   }

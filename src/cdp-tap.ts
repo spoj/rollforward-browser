@@ -1,8 +1,11 @@
 import crypto from 'node:crypto'
 import {
+  isDataLikeKey,
+  isSensitiveValue,
   sanitizeUrl,
+  scrubStructuralKey,
   scrubText,
-  truncateHeadTail,
+  truncateUtf8HeadTail,
   type ProjectionMode,
   type SecretVault,
 } from './redact.ts'
@@ -10,14 +13,19 @@ import {
 const MAX_MSG_HEAD = 65_536
 const MAX_MSG_TAIL = 4_096
 const MAX_CONTROL_LEN = 125
-const MAX_FRAME_LEN = 256 * 1024 * 1024 // 256 MiB sanity ceiling for 64-bit length field
+const MAX_FRAME_LEN = 256 * 1024 * 1024
 const MAX_METHOD_NAMES = 256
-const MAX_METHOD_NAME_LEN = 64
+const MAX_METHOD_NAME_BYTES = 64
 const MAX_COALESCE_SLOTS = 64
 const MAX_CDP_LOG_BYTES = 2 * 1024 * 1024
 const MAX_OVERFLOW_HIGH_SEV = 32
-const MAX_SAMPLE_EXPR_LEN = 1024
+const MAX_NORMAL_ENTRY_BYTES = 4_096
+const MAX_ANOMALY_ENTRY_BYTES = 2_048
+const CDP_ANOMALY_RESERVE = MAX_OVERFLOW_HIGH_SEV * MAX_ANOMALY_ENTRY_BYTES // 64 KiB
+const CDP_SUMMARY_RESERVE = 32 * 1024 // 32 KiB
+const MAX_SAMPLE_EXPR_BYTES = 1024
 const MAX_PAGE_BYTES = 4 * 1024 * 1024
+const SAFE_CDP_IDENT_RE = /^[A-Za-z0-9_.:-]{1,64}$/
 
 export type CdpEntry = {
   n: number
@@ -57,142 +65,291 @@ export type ParsedWsMessage = {
   sha256: string
 }
 
-// Hardened passive RFC 6455 client->browser frame parser (zero mutation).
+export type BudgetCharger = {
+  tryAcquire: (bytes: number) => boolean
+  release: (bytes: number) => void
+}
+
+// Incremental O(N) RFC 6455 client->browser frame parser (zero mutation, strictly bounded <=70 KiB per connection).
 export class WsFrameParser {
-  private buf: Buffer = Buffer.alloc(0)
   private disabled = false
+  private state: 'hdr2' | 'len16' | 'len64' | 'mask' | 'payload' = 'hdr2'
+  private hdrBuf = Buffer.alloc(8)
+  private hdrPos = 0
+  private hdrNeed = 2
+
+  private frameFin = false
+  private frameOpcode = 0
+  private frameMasked = false
+  private frameIsControl = false
+  private framePayloadRem = 0
+  private maskKey = Buffer.alloc(4)
+  private maskPos = 0
+
   private msgActive = false
   private msgOpcode = 0
-  private msgHeadChunks: Buffer[] = []
-  private msgHeadBytes = 0
-  private msgTail: Buffer = Buffer.alloc(0)
+  private msgHead = Buffer.alloc(0)
+  private msgHeadLen = 0
+  private msgTail = Buffer.alloc(0)
   private msgTotalBytes = 0
   private msgHash: crypto.Hash | null = null
+  private chargedBytes = 0
+
   private onMessage: (msg: ParsedWsMessage) => void
   private onError: (reason: string) => void
+  private charger?: BudgetCharger
 
-  constructor(onMessage: (msg: ParsedWsMessage) => void, onError: (reason: string) => void) {
+  constructor(onMessage: (msg: ParsedWsMessage) => void, onError: (reason: string) => void, charger?: BudgetCharger) {
     this.onMessage = onMessage
     this.onError = onError
+    this.charger = charger
+  }
+
+  private releaseCharge() {
+    if (this.chargedBytes > 0 && this.charger) {
+      this.charger.release(this.chargedBytes)
+      this.chargedBytes = 0
+    }
+  }
+
+  private resetMsg() {
+    this.msgActive = false
+    this.msgHead = Buffer.alloc(0)
+    this.msgHeadLen = 0
+    this.msgTail = Buffer.alloc(0)
+    this.msgTotalBytes = 0
+    this.msgHash = null
+    this.releaseCharge()
   }
 
   private fail(reason: string) {
     if (this.disabled) return
     this.disabled = true
-    this.buf = Buffer.alloc(0)
-    this.msgHeadChunks = []
-    this.msgTail = Buffer.alloc(0)
-    this.msgHash = null
+    this.resetMsg()
     this.onError(reason)
+  }
+
+  close() {
+    this.resetMsg()
   }
 
   private appendMessagePayload(data: Buffer) {
     this.msgTotalBytes += data.length
     this.msgHash!.update(data)
-    if (this.msgHeadBytes < MAX_MSG_HEAD) {
-      const take = Math.min(data.length, MAX_MSG_HEAD - this.msgHeadBytes)
-      this.msgHeadChunks.push(data.subarray(0, take))
-      this.msgHeadBytes += take
+    if (this.msgHeadLen < MAX_MSG_HEAD) {
+      const take = Math.min(data.length, MAX_MSG_HEAD - this.msgHeadLen)
+      if (this.msgHead.length === 0) {
+        const allocSize = Math.min(MAX_MSG_HEAD, Math.max(4096, take))
+        if (this.charger && !this.charger.tryAcquire(allocSize)) {
+          this.fail('capture budget exceeded')
+          return
+        }
+        this.chargedBytes += allocSize
+        this.msgHead = Buffer.allocUnsafe(allocSize)
+      } else if (this.msgHeadLen + take > this.msgHead.length) {
+        const nextSize = Math.min(MAX_MSG_HEAD, Math.max(this.msgHead.length * 2, this.msgHeadLen + take))
+        const delta = nextSize - this.msgHead.length
+        if (this.charger && !this.charger.tryAcquire(delta)) {
+          this.fail('capture budget exceeded')
+          return
+        }
+        this.chargedBytes += delta
+        const next = Buffer.allocUnsafe(nextSize)
+        this.msgHead.copy(next, 0, 0, this.msgHeadLen)
+        this.msgHead = next
+      }
+      data.copy(this.msgHead, this.msgHeadLen, 0, take)
+      this.msgHeadLen += take
     }
     if (this.msgTotalBytes > MAX_MSG_HEAD) {
       if (data.length >= MAX_MSG_TAIL) {
-        this.msgTail = Buffer.from(data.subarray(data.length - MAX_MSG_TAIL))
+        if (this.msgTail.length === 0) {
+          if (this.charger && !this.charger.tryAcquire(MAX_MSG_TAIL)) {
+            this.fail('capture budget exceeded')
+            return
+          }
+          this.chargedBytes += MAX_MSG_TAIL
+          this.msgTail = Buffer.allocUnsafe(MAX_MSG_TAIL)
+        }
+        data.copy(this.msgTail, 0, data.length - MAX_MSG_TAIL, data.length)
       } else {
         const combined = Buffer.concat([this.msgTail, data])
-        this.msgTail = combined.length > MAX_MSG_TAIL ? combined.subarray(combined.length - MAX_MSG_TAIL) : combined
+        const sliced = combined.length > MAX_MSG_TAIL ? combined.subarray(combined.length - MAX_MSG_TAIL) : combined
+        const delta = sliced.length - this.msgTail.length
+        if (delta > 0 && this.charger) {
+          if (!this.charger.tryAcquire(delta)) {
+            this.fail('capture budget exceeded')
+            return
+          }
+          this.chargedBytes += delta
+        }
+        this.msgTail = Buffer.from(sliced)
       }
     }
   }
 
+  private startPayload() {
+    if (this.frameIsControl) {
+      if (this.framePayloadRem === 0) {
+        this.state = 'hdr2'
+        this.hdrPos = 0
+        this.hdrNeed = 2
+      } else {
+        this.state = 'payload'
+      }
+      return
+    }
+
+    if (this.frameOpcode === 0x0) {
+      if (!this.msgActive) {
+        this.fail('unexpected continuation frame')
+        return
+      }
+    } else {
+      if (this.msgActive) {
+        this.fail('new data frame while fragmented message open')
+        return
+      }
+      this.msgActive = true
+      this.msgOpcode = this.frameOpcode
+      this.msgHead = Buffer.alloc(0)
+      this.msgHeadLen = 0
+      this.msgTail = Buffer.alloc(0)
+      this.msgTotalBytes = 0
+      this.msgHash = crypto.createHash('sha256')
+    }
+
+    if (this.framePayloadRem === 0) {
+      this.finishFrame()
+    } else {
+      this.state = 'payload'
+    }
+  }
+
+  private finishFrame() {
+    if (!this.frameIsControl && this.frameFin) {
+      const msg: ParsedWsMessage = {
+        opcode: this.msgOpcode,
+        head: Buffer.from(this.msgHead.subarray(0, this.msgHeadLen)),
+        tail: Buffer.from(this.msgTail),
+        totalBytes: this.msgTotalBytes,
+        truncated: this.msgTotalBytes > MAX_MSG_HEAD,
+        sha256: this.msgHash!.digest('hex'),
+      }
+      this.resetMsg()
+      this.onMessage(msg)
+    }
+    this.state = 'hdr2'
+    this.hdrPos = 0
+    this.hdrNeed = 2
+  }
+
   feed(chunk: Buffer): void {
     if (this.disabled || !chunk.length) return
-    // Copy chunk before concatenating so caller buffers are never mutated.
-    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : Buffer.from(chunk)
+    let off = 0
+    const len = chunk.length
 
-    for (;;) {
-      if (this.buf.length < 2) return
-      const b0 = this.buf[0]
-      const b1 = this.buf[1]
-      const fin = (b0 & 0x80) !== 0
-      const rsv = b0 & 0x70
-      const opcode = b0 & 0x0f
-      const masked = (b1 & 0x80) !== 0
-      const len7 = b1 & 0x7f
+    while (off < len && !this.disabled) {
+      if (this.state === 'hdr2' || this.state === 'len16' || this.state === 'len64' || this.state === 'mask') {
+        const take = Math.min(this.hdrNeed - this.hdrPos, len - off)
+        chunk.copy(this.hdrBuf, this.hdrPos, off, off + take)
+        this.hdrPos += take
+        off += take
+        if (this.hdrPos < this.hdrNeed) return
 
-      if (rsv !== 0) return this.fail(`non-zero RSV bits: 0x${rsv.toString(16)}`)
-      const isControl = opcode >= 0x8
-      if (opcode > 0xa || (opcode >= 0x3 && opcode <= 0x7)) return this.fail(`invalid opcode: ${opcode}`)
-      if (isControl && !fin) return this.fail('fragmented control frame')
+        if (this.state === 'hdr2') {
+          const b0 = this.hdrBuf[0]
+          const b1 = this.hdrBuf[1]
+          this.frameFin = (b0 & 0x80) !== 0
+          const rsv = b0 & 0x70
+          this.frameOpcode = b0 & 0x0f
+          this.frameMasked = (b1 & 0x80) !== 0
+          const len7 = b1 & 0x7f
+          if (rsv !== 0) return this.fail(`non-zero RSV bits: 0x${rsv.toString(16)}`)
+          this.frameIsControl = this.frameOpcode >= 0x8
+          if (this.frameOpcode > 0xa || (this.frameOpcode >= 0x3 && this.frameOpcode <= 0x7)) {
+            return this.fail(`invalid opcode: ${this.frameOpcode}`)
+          }
+          if (this.frameIsControl && !this.frameFin) return this.fail('fragmented control frame')
 
-      let offset = 2
-      let payloadLen = len7
-      if (len7 === 126) {
-        if (this.buf.length < 4) return
-        payloadLen = this.buf.readUInt16BE(2)
-        offset = 4
-      } else if (len7 === 127) {
-        if (this.buf.length < 10) return
-        const big = this.buf.readBigUInt64BE(2)
-        if ((this.buf[2] & 0x80) !== 0 || big > BigInt(MAX_FRAME_LEN)) {
-          return this.fail('64-bit frame length overflow')
+          if (len7 < 126) {
+            this.framePayloadRem = len7
+            if (this.frameIsControl && len7 > MAX_CONTROL_LEN) return this.fail(`control frame too large: ${len7}`)
+            if (this.frameMasked) {
+              this.state = 'mask'
+              this.hdrPos = 0
+              this.hdrNeed = 4
+            } else {
+              this.startPayload()
+            }
+          } else if (len7 === 126) {
+            if (this.frameIsControl) return this.fail('control frame too large')
+            this.state = 'len16'
+            this.hdrPos = 0
+            this.hdrNeed = 2
+          } else {
+            if (this.frameIsControl) return this.fail('control frame too large')
+            this.state = 'len64'
+            this.hdrPos = 0
+            this.hdrNeed = 8
+          }
+        } else if (this.state === 'len16') {
+          this.framePayloadRem = this.hdrBuf.readUInt16BE(0)
+          if (this.frameMasked) {
+            this.state = 'mask'
+            this.hdrPos = 0
+            this.hdrNeed = 4
+          } else {
+            this.startPayload()
+          }
+        } else if (this.state === 'len64') {
+          const big = this.hdrBuf.readBigUInt64BE(0)
+          if ((this.hdrBuf[0] & 0x80) !== 0 || big > BigInt(MAX_FRAME_LEN)) {
+            return this.fail('64-bit frame length overflow')
+          }
+          this.framePayloadRem = Number(big)
+          if (this.frameMasked) {
+            this.state = 'mask'
+            this.hdrPos = 0
+            this.hdrNeed = 4
+          } else {
+            this.startPayload()
+          }
+        } else if (this.state === 'mask') {
+          this.hdrBuf.copy(this.maskKey, 0, 0, 4)
+          this.maskPos = 0
+          this.startPayload()
         }
-        payloadLen = Number(big)
-        offset = 10
-      }
-
-      if (isControl && payloadLen > MAX_CONTROL_LEN) return this.fail(`control frame too large: ${payloadLen}`)
-
-      const maskBytes = masked ? 4 : 0
-      const totalFrameLen = offset + maskBytes + payloadLen
-      if (this.buf.length < totalFrameLen) return
-
-      const payload = Buffer.allocUnsafe(payloadLen)
-      if (masked) {
-        const mask = this.buf.subarray(offset, offset + 4)
-        const src = this.buf.subarray(offset + 4, totalFrameLen)
-        for (let i = 0; i < payloadLen; i++) payload[i] = src[i] ^ mask[i & 3]
-      } else {
-        this.buf.copy(payload, 0, offset, totalFrameLen)
-      }
-      this.buf = this.buf.subarray(totalFrameLen)
-
-      if (isControl) {
-        // Interleaved Ping/Pong/Close allowed cleanly; ignore payload.
-        continue
-      }
-
-      if (opcode === 0x0) {
-        if (!this.msgActive) return this.fail('unexpected continuation frame')
-        this.appendMessagePayload(payload)
-      } else {
-        // 0x1 text or 0x2 binary (treated identically)
-        if (this.msgActive) return this.fail('new data frame while fragmented message open')
-        this.msgActive = true
-        this.msgOpcode = opcode
-        this.msgHeadChunks = []
-        this.msgHeadBytes = 0
-        this.msgTail = Buffer.alloc(0)
-        this.msgTotalBytes = 0
-        this.msgHash = crypto.createHash('sha256')
-        this.appendMessagePayload(payload)
-      }
-
-      if (fin) {
-        const msg: ParsedWsMessage = {
-          opcode: this.msgOpcode,
-          head: Buffer.concat(this.msgHeadChunks),
-          tail: this.msgTail,
-          totalBytes: this.msgTotalBytes,
-          truncated: this.msgTotalBytes > MAX_MSG_HEAD,
-          sha256: this.msgHash!.digest('hex'),
+      } else if (this.state === 'payload') {
+        const avail = Math.min(this.framePayloadRem, len - off)
+        if (this.frameIsControl) {
+          // Control payload discarded without allocation
+          off += avail
+          this.framePayloadRem -= avail
+          this.maskPos = (this.maskPos + avail) & 3
+        } else {
+          // Process in bounded <=4 KiB slices without allocating payload-sized buffers
+          let rem = avail
+          while (rem > 0 && !this.disabled) {
+            const step = Math.min(rem, 4096)
+            const slice = Buffer.allocUnsafe(step)
+            if (this.frameMasked) {
+              for (let i = 0; i < step; i++) {
+                slice[i] = chunk[off + i] ^ this.maskKey[(this.maskPos + i) & 3]
+              }
+              this.maskPos = (this.maskPos + step) & 3
+            } else {
+              chunk.copy(slice, 0, off, off + step)
+            }
+            off += step
+            rem -= step
+            this.framePayloadRem -= step
+            this.appendMessagePayload(slice)
+          }
         }
-        this.msgActive = false
-        this.msgHeadChunks = []
-        this.msgHeadBytes = 0
-        this.msgTail = Buffer.alloc(0)
-        this.msgTotalBytes = 0
-        this.msgHash = null
-        this.onMessage(msg)
+        if (!this.disabled && this.framePayloadRem === 0) {
+          this.finishFrame()
+        }
       }
     }
   }
@@ -277,7 +434,33 @@ const NET_SIMPLE_METHODS = new Set([
 
 const hash64 = (s: string) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 16)
 
-function summarizeArg(arg: unknown, includePreview: boolean, vault?: SecretVault, previewBudget?: { left: number }): { item: Record<string, unknown>; vaultRedactions: number } {
+function scrubCdpIdent(raw: unknown, vault?: SecretVault, maxBytes = 64): { value?: string; vaultRedactions: number } {
+  if (typeof raw !== 'string' || !raw) return { vaultRedactions: 0 }
+  const s = scrubText(raw, vault)
+  if (s.vaultRedactions > 0 || s.text.includes('[REDACTED')) {
+    return { value: '[REDACTED]', vaultRedactions: s.vaultRedactions }
+  }
+  if (isSensitiveValue(s.text)) return { value: '[REDACTED]', vaultRedactions: 0 }
+  return { value: truncateUtf8HeadTail(s.text, maxBytes), vaultRedactions: 0 }
+}
+
+function scrubCdpSessionId(raw: unknown, vault?: SecretVault): { value?: string; vaultRedactions: number } {
+  if (typeof raw !== 'string' || !raw) return { vaultRedactions: 0 }
+  if (vault) {
+    const s = vault.scrub(raw)
+    if (s.count > 0) return { value: '[REDACTED:vault]', vaultRedactions: s.count }
+  }
+  // Standard Chromium target/session IDs are 32-char uppercase hex (or short test IDs); hash anything weird/long
+  if (/^[A-Fa-f0-9_-]{1,40}$/.test(raw) && !isSensitiveValue(raw)) return { value: raw, vaultRedactions: 0 }
+  return { value: `sid:${hash64(raw)}`, vaultRedactions: 0 }
+}
+
+function summarizeArg(
+  arg: unknown,
+  includePreview: boolean,
+  vault?: SecretVault,
+  previewBudgetBytes?: { left: number },
+): { item: Record<string, unknown>; vaultRedactions: number } {
   let vaultRedactions = 0
   if (!arg || typeof arg !== 'object') return { item: { type: typeof arg }, vaultRedactions }
   const a = arg as Record<string, unknown>
@@ -287,21 +470,44 @@ function summarizeArg(arg: unknown, includePreview: boolean, vault?: SecretVault
   if (val === null) return { item: { type: 'null' }, vaultRedactions }
   if (val === undefined) return { item: { type: 'undefined' }, vaultRedactions }
   if (typeof val === 'string') {
-    const item: Record<string, unknown> = { type: 'string', len: val.length }
-    if (includePreview && previewBudget && previewBudget.left > 0) {
+    const item: Record<string, unknown> = { type: 'string', len: Buffer.byteLength(val, 'utf8') }
+    if (includePreview && previewBudgetBytes && previewBudgetBytes.left > 0) {
       const s = scrubText(val, vault)
       vaultRedactions += s.vaultRedactions
-      const take = Math.min(previewBudget.left, 256)
-      const prev = truncateHeadTail(s.text, take, Math.floor(take * 0.75), Math.floor(take * 0.25))
-      item.preview = prev
-      previewBudget.left -= prev.length
+      const take = Math.min(previewBudgetBytes.left, 256)
+      const prev = truncateUtf8HeadTail(s.text, take)
+      const prevBytes = Buffer.byteLength(prev, 'utf8')
+      if (prevBytes <= previewBudgetBytes.left) {
+        item.preview = prev
+        previewBudgetBytes.left -= prevBytes
+      }
     }
     return { item, vaultRedactions }
   }
   if (typeof val === 'number' || typeof val === 'boolean') return { item: { type: typeof val }, vaultRedactions }
   if (Array.isArray(val)) return { item: { type: 'array', len: val.length }, vaultRedactions }
-  if (typeof val === 'object') return { item: { type: 'object', keys: Object.keys(val as Record<string, unknown>).slice(0, 16) }, vaultRedactions }
+  // Type + keyCount ONLY for object arguments (never expose raw property names!)
+  if (typeof val === 'object') return { item: { type: 'object', keyCount: Object.keys(val as Record<string, unknown>).length }, vaultRedactions }
   return { item: { type: typeof val }, vaultRedactions }
+}
+
+function capCdpRecordBytes(entry: CdpEntry, maxBytes: number): { entry: CdpEntry; bytes: number } {
+  let bytes = Buffer.byteLength(JSON.stringify(entry), 'utf8')
+  if (bytes <= maxBytes) return { entry, bytes }
+  const copy: CdpEntry = { ...entry }
+  if (copy.summary) {
+    const slim: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(copy.summary)) {
+      if (k === 'expr' || k === 'fn' || k === 'argSummary') continue
+      slim[k] = typeof v === 'string' ? truncateUtf8HeadTail(v, 256) : v
+    }
+    copy.summary = slim
+    bytes = Buffer.byteLength(JSON.stringify(copy), 'utf8')
+    if (bytes <= maxBytes) return { entry: copy, bytes }
+  }
+  delete copy.summary
+  bytes = Buffer.byteLength(JSON.stringify(copy), 'utf8')
+  return { entry: copy, bytes }
 }
 
 type CoalesceSlot = {
@@ -327,6 +533,7 @@ export type CdpTapOptions = {
   coalesceMs?: number
   maxBytes?: number
   injectedScriptSha256Allowlist?: Set<string>
+  charger?: BudgetCharger
   onEvent?: (entry: CdpEntry) => void
   onFileUpload?: () => void
 }
@@ -349,11 +556,15 @@ export class CdpSessionTap {
   private opts: CdpTapOptions
   private coalesceMs: number
   private maxBytes: number
+  private summaryReserve: number
+  private anomalyReserve: number
 
   constructor(opts: CdpTapOptions) {
     this.opts = opts
     this.coalesceMs = opts.coalesceMs ?? 2_000
     this.maxBytes = opts.maxBytes ?? MAX_CDP_LOG_BYTES
+    this.summaryReserve = Math.min(CDP_SUMMARY_RESERVE, Math.floor(this.maxBytes * 0.1))
+    this.anomalyReserve = Math.min(CDP_ANOMALY_RESERVE, Math.floor(this.maxBytes * 0.15))
   }
 
   get currentCursor(): number {
@@ -368,12 +579,21 @@ export class CdpSessionTap {
     return this.bytes
   }
 
-  private countMethod(method: string) {
-    const safeName = method.length > MAX_METHOD_NAME_LEN ? method.slice(0, MAX_METHOD_NAME_LEN) : method
-    if (safeName in this.methodCounts) {
-      this.methodCounts[safeName]++
+  private countMethod(rawMethod: string) {
+    const vault = this.opts.vault
+    let name = rawMethod
+    if (vault && vault.scrub(name).count > 0) {
+      this.methodCounts._unknown_other = (this.methodCounts._unknown_other ?? 0) + 1
+      return
+    }
+    if (!SAFE_CDP_IDENT_RE.test(name) || Buffer.byteLength(name, 'utf8') > MAX_METHOD_NAME_BYTES || isSensitiveValue(name)) {
+      this.methodCounts._unknown_other = (this.methodCounts._unknown_other ?? 0) + 1
+      return
+    }
+    if (name in this.methodCounts) {
+      this.methodCounts[name]++
     } else if (this.distinctMethods < MAX_METHOD_NAMES) {
-      this.methodCounts[safeName] = 1
+      this.methodCounts[name] = 1
       this.distinctMethods++
     } else {
       this.methodCounts._unknown_other = (this.methodCounts._unknown_other ?? 0) + 1
@@ -382,22 +602,27 @@ export class CdpSessionTap {
 
   private appendRecord(rec: Omit<CdpEntry, 'n'>): CdpEntry | null {
     if (this.sealed) return null
-    const serialized = JSON.stringify({ ...rec, n: this.cursor + 1 })
-    const size = Buffer.byteLength(serialized)
-    if (this.bytes + size > this.maxBytes) {
-      if (rec.severity === 'high' && this.overflowHighSevUsed < MAX_OVERFLOW_HIGH_SEV) {
+    const normalCeiling = Math.max(0, this.maxBytes - this.summaryReserve - this.anomalyReserve)
+    const hardCeiling = Math.max(0, this.maxBytes - this.summaryReserve)
+    const draft: CdpEntry = { n: this.cursor + 1, ...rec }
+    const isHigh = rec.severity === 'high'
+    const capped = capCdpRecordBytes(draft, isHigh && this.bytes >= normalCeiling ? MAX_ANOMALY_ENTRY_BYTES : MAX_NORMAL_ENTRY_BYTES)
+
+    if (this.bytes + capped.bytes > normalCeiling) {
+      if (isHigh && this.overflowHighSevUsed < MAX_OVERFLOW_HIGH_SEV && this.bytes + capped.bytes <= hardCeiling) {
         this.overflowHighSevUsed++
       } else {
         this.droppedCdp++
-        if (rec.severity === 'high') this.droppedHighSeverity++
+        if (isHigh) this.droppedHighSeverity++
         return null
       }
     }
-    const entry: CdpEntry = { n: ++this.cursor, ...rec }
-    this.entries.push(entry)
-    this.bytes += size
-    this.opts.onEvent?.(entry)
-    return entry
+
+    capped.entry.n = ++this.cursor
+    this.entries.push(capped.entry)
+    this.bytes += capped.bytes
+    this.opts.onEvent?.(capped.entry)
+    return capped.entry
   }
 
   private flushSlot(key: string) {
@@ -437,7 +662,6 @@ export class CdpSessionTap {
     const key = `${conn}:${cdpSession ?? ''}:${method}:${sig}`
     const csKey = `${conn}:${cdpSession ?? ''}`
 
-    // Flush previous slot on same (conn, cdpSession) if a different command arrived
     const prevKey = this.lastKeyByConnSession.get(csKey)
     if (prevKey && prevKey !== key) {
       this.flushSlot(prevKey)
@@ -451,7 +675,6 @@ export class CdpSessionTap {
       return
     }
 
-    // Bound active coalescing slots at 64
     if (this.slots.size >= MAX_COALESCE_SLOTS) {
       const oldestKey = this.slots.keys().next().value
       if (oldestKey) this.flushSlot(oldestKey)
@@ -487,20 +710,26 @@ export class CdpSessionTap {
     }
     if (!parsed || typeof parsed !== 'object' || typeof parsed.method !== 'string') return
 
-    const method: string = parsed.method
-    const cdpSession: string | undefined = typeof parsed.sessionId === 'string' ? parsed.sessionId : cdpSessionFallback
+    const vault = this.opts.vault
+    const rawMethod: string = parsed.method
+    const sidScrub = scrubCdpSessionId(typeof parsed.sessionId === 'string' ? parsed.sessionId : cdpSessionFallback, vault)
+    const cdpSession = sidScrub.value
+    let vaultRedactions = sidScrub.vaultRedactions
+
     const params: Record<string, unknown> = parsed.params && typeof parsed.params === 'object' ? parsed.params : {}
     const ambiguous = hasDuplicateTopLevelKeys(rawText)
     const samples = this.opts.projection === 'semantic+samples'
-    const vault = this.opts.vault
 
-    this.countMethod(method)
+    this.countMethod(rawMethod)
+    const methodIdent = scrubCdpIdent(rawMethod, vault, MAX_METHOD_NAME_BYTES)
+    vaultRedactions += methodIdent.vaultRedactions
+    const safeMethod = methodIdent.value ?? '_unknown'
 
     // Recursion for Target.sendMessageToTarget (max depth 2)
-    if (method === 'Target.sendMessageToTarget' && typeof params.message === 'string') {
+    if (rawMethod === 'Target.sendMessageToTarget' && typeof params.message === 'string') {
       if (depth >= 2) {
         this.depthLimited++
-        this.enqueue(conn, cdpSession, method, 'high', ambiguous, { depthLimited: true }, 0)
+        this.enqueue(conn, cdpSession, safeMethod, 'high', ambiguous, { depthLimited: true }, vaultRedactions)
         return
       }
       const innerSession = typeof params.sessionId === 'string' ? params.sessionId : cdpSession
@@ -510,7 +739,6 @@ export class CdpSessionTap {
 
     let severity: 'high' | undefined = ambiguous ? 'high' : undefined
     let summary: Record<string, unknown> | undefined
-    let vaultRedactions = 0
     let capture = false
 
     const scrubUrlField = (u: string): string => {
@@ -522,10 +750,10 @@ export class CdpSessionTap {
     const scrubSampleExpr = (expr: string): string => {
       const s = scrubText(expr, vault)
       vaultRedactions += s.vaultRedactions
-      return truncateHeadTail(s.text, MAX_SAMPLE_EXPR_LEN, 768, 252)
+      return truncateUtf8HeadTail(s.text, MAX_SAMPLE_EXPR_BYTES, 768, 252)
     }
 
-    if (method === 'Runtime.callFunctionOn') {
+    if (rawMethod === 'Runtime.callFunctionOn') {
       capture = true
       const fn = typeof params.functionDeclaration === 'string' ? params.functionDeclaration : ''
       const args = Array.isArray(params.arguments) ? params.arguments : []
@@ -545,11 +773,10 @@ export class CdpSessionTap {
         const expr = (args[3] as any).value as string
         const argc = (args[4] as any).value as number
         const userArgs = args.slice(5)
-        // Exclude fill/type value previews even in semantic+samples
         const isFillOrType = /\b(?:fill|type)\b/i.test(expr)
-        const previewBudget = { left: 1024 }
+        const previewBudgetBytes = { left: 1024 }
         const argSummary = userArgs.slice(0, 16).map(a => {
-          const r = summarizeArg(a, samples && !isFillOrType, vault, previewBudget)
+          const r = summarizeArg(a, samples && !isFillOrType, vault, previewBudgetBytes)
           vaultRedactions += r.vaultRedactions
           return r.item
         })
@@ -558,100 +785,103 @@ export class CdpSessionTap {
           isFunction,
           returnByValue,
           argc,
-          exprLen: expr.length,
+          exprLen: Buffer.byteLength(expr, 'utf8'),
           exprHash64: hash64(expr),
           ...(argSummary.length > 0 && { argSummary }),
           ...(samples && { expr: scrubSampleExpr(expr) }),
         }
-        if ((expr.length > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
+        if ((Buffer.byteLength(expr, 'utf8') > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
           severity = 'high'
         }
       } else {
-        const previewBudget = { left: 1024 }
+        const previewBudgetBytes = { left: 1024 }
         const argSummary = args.slice(0, 16).map(a => {
-          const r = summarizeArg(a, samples, vault, previewBudget)
+          const r = summarizeArg(a, samples, vault, previewBudgetBytes)
           vaultRedactions += r.vaultRedactions
           return r.item
         })
         summary = {
           wrapper: 'custom',
-          fnLen: fn.length,
+          fnLen: Buffer.byteLength(fn, 'utf8'),
           fnHash64: hash64(fn),
           argCount: args.length,
           ...(argSummary.length > 0 && { argSummary }),
           ...(samples && { fn: scrubSampleExpr(fn) }),
         }
-        if ((fn.length > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
+        if ((Buffer.byteLength(fn, 'utf8') > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
           severity = 'high'
         }
       }
-    } else if (method === 'Runtime.evaluate' || method === 'Page.addScriptToEvaluateOnNewDocument') {
+    } else if (rawMethod === 'Runtime.evaluate' || rawMethod === 'Page.addScriptToEvaluateOnNewDocument') {
       capture = true
       const expr = typeof params.expression === 'string' ? params.expression : typeof params.source === 'string' ? params.source : ''
       const isAllowlistedInjected = rawSha256 ? this.opts.injectedScriptSha256Allowlist?.has(rawSha256) === true : false
       summary = {
-        exprLen: expr.length,
+        exprLen: Buffer.byteLength(expr, 'utf8'),
         exprHash64: hash64(expr),
         ...(samples && expr && { expr: scrubSampleExpr(expr) }),
       }
-      if ((expr.length > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
+      if ((Buffer.byteLength(expr, 'utf8') > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
         severity = 'high'
       }
-    } else if (HIGH_SEVERITY_METHODS.has(method)) {
+    } else if (HIGH_SEVERITY_METHODS.has(rawMethod)) {
       capture = true
       severity = 'high'
-      if (method === 'DOM.setAttributeValue') {
-        const name = typeof params.name === 'string' ? params.name : ''
-        summary = { name: name.slice(0, 128) }
-      } else if (method === 'Runtime.addBinding') {
-        summary = { name: typeof params.name === 'string' ? params.name.slice(0, 128) : '' }
-      } else if (method === 'Runtime.compileScript' || method === 'Debugger.evaluateOnCallFrame' || method === 'Debugger.setScriptSource') {
+      if (rawMethod === 'DOM.setAttributeValue') {
+        const n = scrubCdpIdent(params.name, vault, 128)
+        vaultRedactions += n.vaultRedactions
+        summary = { name: n.value ?? '' }
+      } else if (rawMethod === 'Runtime.addBinding') {
+        const n = scrubCdpIdent(params.name, vault, 128)
+        vaultRedactions += n.vaultRedactions
+        summary = { name: n.value ?? '' }
+      } else if (rawMethod === 'Runtime.compileScript' || rawMethod === 'Debugger.evaluateOnCallFrame' || rawMethod === 'Debugger.setScriptSource') {
         const expr = typeof params.expression === 'string' ? params.expression : typeof params.scriptSource === 'string' ? params.scriptSource : ''
-        summary = { exprLen: expr.length, exprHash64: hash64(expr) }
+        summary = { exprLen: Buffer.byteLength(expr, 'utf8'), exprHash64: hash64(expr) }
       } else {
         summary = {}
       }
-    } else if (method.startsWith('Debugger.setBreakpoint') && typeof params.condition === 'string' && params.condition.length > 0) {
+    } else if (rawMethod.startsWith('Debugger.setBreakpoint') && typeof params.condition === 'string' && params.condition.length > 0) {
       capture = true
       severity = 'high'
-      summary = { conditionLen: params.condition.length, conditionHash64: hash64(params.condition) }
-    } else if (method === 'Page.navigate' || method === 'Target.createTarget') {
+      summary = { conditionLen: Buffer.byteLength(params.condition, 'utf8'), conditionHash64: hash64(params.condition) }
+    } else if (rawMethod === 'Page.navigate' || rawMethod === 'Target.createTarget') {
       capture = true
       const rawUrl = typeof params.url === 'string' ? params.url : ''
       if (/^\s*javascript:/i.test(rawUrl)) {
         severity = 'high'
-        summary = { url: 'javascript:[REDACTED]', exprLen: rawUrl.length, exprHash64: hash64(rawUrl) }
+        summary = { url: 'javascript:[REDACTED]', exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
       } else {
         summary = { url: scrubUrlField(rawUrl) }
       }
-    } else if (NAV_SIMPLE_METHODS.has(method)) {
+    } else if (NAV_SIMPLE_METHODS.has(rawMethod)) {
       capture = true
       summary = {}
-    } else if (method === 'DOM.setFileInputFiles') {
+    } else if (rawMethod === 'DOM.setFileInputFiles') {
       capture = true
       const files = Array.isArray(params.files)
         ? params.files.filter((f): f is string => typeof f === 'string').slice(0, 32).map(f => {
             const s = scrubText(f, vault)
             vaultRedactions += s.vaultRedactions
-            return s.text
+            return truncateUtf8HeadTail(s.text, 256)
           })
         : []
       summary = { files }
       this.opts.onFileUpload?.()
-    } else if (method === 'Input.dispatchMouseEvent') {
+    } else if (rawMethod === 'Input.dispatchMouseEvent') {
       if (params.type === 'mousePressed') {
         capture = true
         summary = {
-          button: typeof params.button === 'string' ? params.button : undefined,
+          button: typeof params.button === 'string' ? params.button.slice(0, 16) : undefined,
           x: typeof params.x === 'number' ? Math.round(params.x) : undefined,
           y: typeof params.y === 'number' ? Math.round(params.y) : undefined,
         }
       }
-    } else if (method === 'Input.insertText' || method === 'Input.imeSetComposition') {
+    } else if (rawMethod === 'Input.insertText' || rawMethod === 'Input.imeSetComposition') {
       capture = true
       const text = typeof params.text === 'string' ? params.text : ''
       summary = { len: text.length }
-    } else if (method === 'Input.dispatchKeyEvent') {
+    } else if (rawMethod === 'Input.dispatchKeyEvent') {
       if (params.type === 'char') {
         capture = true
         const text = typeof params.text === 'string' ? params.text : ''
@@ -660,48 +890,56 @@ export class CdpSessionTap {
         capture = true
         summary = { key: params.key }
       }
-    } else if (method === 'Network.setExtraHTTPHeaders') {
+    } else if (rawMethod === 'Network.setExtraHTTPHeaders') {
       capture = true
-      const hdrs = params.headers && typeof params.headers === 'object' ? Object.keys(params.headers as Record<string, unknown>).slice(0, 64) : []
+      const hdrs = params.headers && typeof params.headers === 'object'
+        ? Object.keys(params.headers as Record<string, unknown>).slice(0, 64).map(k => {
+            const sk = scrubStructuralKey(k, vault)
+            vaultRedactions += sk.vaultRedactions
+            return truncateUtf8HeadTail(sk.key, 64)
+          })
+        : []
       summary = { headerNames: hdrs }
-    } else if (method === 'Network.setCookie') {
+    } else if (rawMethod === 'Network.setCookie') {
       capture = true
-      summary = {
-        name: typeof params.name === 'string' ? params.name.slice(0, 128) : undefined,
-        domain: typeof params.domain === 'string' ? params.domain.slice(0, 128) : undefined,
-      }
-    } else if (method === 'Storage.setCookies') {
+      const cn = scrubCdpIdent(params.name, vault, 64)
+      const cd = scrubCdpIdent(params.domain, vault, 128)
+      vaultRedactions += cn.vaultRedactions + cd.vaultRedactions
+      summary = { name: cn.value, domain: cd.value }
+    } else if (rawMethod === 'Storage.setCookies') {
       capture = true
       const cookies = Array.isArray(params.cookies)
-        ? params.cookies.slice(0, 32).map(c => ({
-            name: typeof (c as any)?.name === 'string' ? (c as any).name.slice(0, 128) : undefined,
-            domain: typeof (c as any)?.domain === 'string' ? (c as any).domain.slice(0, 128) : undefined,
-          }))
+        ? params.cookies.slice(0, 32).map(c => {
+            const cn = scrubCdpIdent((c as any)?.name, vault, 64)
+            const cd = scrubCdpIdent((c as any)?.domain, vault, 128)
+            vaultRedactions += cn.vaultRedactions + cd.vaultRedactions
+            return { name: cn.value, domain: cd.value }
+          })
         : []
       summary = { cookies }
-    } else if (method === 'DOMStorage.setDOMStorageItem') {
+    } else if (rawMethod === 'DOMStorage.setDOMStorageItem') {
       capture = true
-      const key = typeof params.key === 'string' ? scrubText(params.key.slice(0, 128), vault) : { text: '', vaultRedactions: 0 }
+      const key = typeof params.key === 'string' ? scrubStructuralKey(params.key, vault) : { key: '', vaultRedactions: 0 }
       vaultRedactions += key.vaultRedactions
-      summary = { key: key.text }
-    } else if (method === 'Storage.setStorageItems') {
+      summary = { key: truncateUtf8HeadTail(key.key, 64) }
+    } else if (rawMethod === 'Storage.setStorageItems') {
       capture = true
       const items = Array.isArray(params.items)
         ? params.items.slice(0, 32).map(it => {
-            const k = typeof (it as any)?.key === 'string' ? (it as any).key.slice(0, 128) : ''
-            const s = scrubText(k, vault)
-            vaultRedactions += s.vaultRedactions
-            return s.text
+            const rawK = typeof (it as any)?.key === 'string' ? (it as any).key : ''
+            const sk = scrubStructuralKey(rawK, vault)
+            vaultRedactions += sk.vaultRedactions
+            return truncateUtf8HeadTail(sk.key, 64)
           })
         : []
       summary = { keys: items }
-    } else if (NET_SIMPLE_METHODS.has(method)) {
+    } else if (NET_SIMPLE_METHODS.has(rawMethod)) {
       capture = true
       summary = {}
     }
 
     if (capture || ambiguous) {
-      this.enqueue(conn, cdpSession, method, severity, ambiguous, summary, vaultRedactions)
+      this.enqueue(conn, cdpSession, safeMethod, severity, ambiguous, summary, vaultRedactions)
     }
   }
 
@@ -712,12 +950,14 @@ export class CdpSessionTap {
       if (connDisabled || this.sealed) return
       connDisabled = true
       this.tapDisabledCount++
+      const s = scrubText(reason, this.opts.vault)
       this.appendRecord({
         t: new Date().toISOString(),
         conn,
         method: '_tap.disabled',
         severity: 'high',
-        summary: { reason: reason.slice(0, 200) },
+        summary: { reason: truncateUtf8HeadTail(s.text, 200) },
+        ...(s.vaultRedactions > 0 && { vaultRedactions: s.vaultRedactions }),
       })
     }
 
@@ -732,19 +972,29 @@ export class CdpSessionTap {
           const headText = msg.head.toString('utf8')
           const methodMatch = /"method"\s*:\s*"([^"]{1,64})"/.exec(headText)
           const sessionMatch = /"sessionId"\s*:\s*"([^"]{1,128})"/.exec(headText)
-          const extractedMethod = methodMatch?.[1]
-          if (extractedMethod) this.countMethod(extractedMethod)
+          const rawInner = methodMatch?.[1]
+          let safeInner: string | undefined
+          let vaultRedactions = 0
+          if (rawInner) {
+            this.countMethod(rawInner)
+            const si = scrubCdpIdent(rawInner, this.opts.vault, MAX_METHOD_NAME_BYTES)
+            vaultRedactions += si.vaultRedactions
+            safeInner = si.value && SAFE_CDP_IDENT_RE.test(si.value) && !isDataLikeKey(si.value) ? si.value : '_unknown'
+          }
+          const sid = scrubCdpSessionId(sessionMatch?.[1], this.opts.vault)
+          vaultRedactions += sid.vaultRedactions
           this.appendRecord({
             t: new Date().toISOString(),
             conn,
-            ...(sessionMatch?.[1] && { cdpSession: sessionMatch[1] }),
+            ...(sid.value && { cdpSession: sid.value }),
             method: '_tap.oversized',
             severity: 'high',
             summary: {
               bytes: msg.totalBytes,
-              ...(extractedMethod && { innerMethod: extractedMethod }),
+              ...(safeInner && { innerMethod: safeInner }),
               sha256: msg.sha256.slice(0, 16),
             },
+            ...(vaultRedactions > 0 && { vaultRedactions }),
           })
           return
         }
@@ -752,6 +1002,7 @@ export class CdpSessionTap {
         this.handleCommand(conn, text, undefined, 0, msg.sha256, msg.totalBytes)
       },
       reason => emitDisabled(reason),
+      this.opts.charger,
     )
 
     return {
@@ -764,6 +1015,7 @@ export class CdpSessionTap {
         }
       },
       close: () => {
+        parser.close()
         for (const [key, slot] of [...this.slots.entries()]) {
           if (slot.conn === conn) this.flushSlot(key)
         }
@@ -774,8 +1026,10 @@ export class CdpSessionTap {
   seal(): { cdpCursor: number; droppedCdp: number } {
     if (this.sealed) return { cdpCursor: this.cursor, droppedCdp: this.droppedCdp }
     for (const key of [...this.slots.keys()]) this.flushSlot(key)
+
+    // Build summary strictly bounded inside summaryReserve (never exceeding maxBytes!)
     const summary: CdpTapSummary = {
-      n: ++this.cursor,
+      n: this.cursor + 1,
       rec: '_tap.summary',
       t: new Date().toISOString(),
       methodCounts: { ...this.methodCounts },
@@ -784,8 +1038,18 @@ export class CdpSessionTap {
       droppedHighSeverity: this.droppedHighSeverity,
       tapDisabledCount: this.tapDisabledCount,
     }
-    this.entries.push(summary)
-    this.bytes += Buffer.byteLength(JSON.stringify(summary))
+    let size = Buffer.byteLength(JSON.stringify(summary), 'utf8')
+    if (this.bytes + size > this.maxBytes) {
+      // Collapse methodCounts into total if tight test cap
+      const total = Object.values(summary.methodCounts).reduce((a, b) => a + b, 0)
+      summary.methodCounts = { _total: total }
+      size = Buffer.byteLength(JSON.stringify(summary), 'utf8')
+    }
+    if (this.bytes + size <= this.maxBytes || this.entries.length === 0) {
+      summary.n = ++this.cursor
+      this.entries.push(summary)
+      this.bytes += size
+    }
     this.sealed = true
     return { cdpCursor: this.cursor, droppedCdp: this.droppedCdp }
   }
@@ -800,13 +1064,13 @@ export class CdpSessionTap {
     const cappedLimit = Math.min(500, Math.max(1, limit))
     const oldestCursor = this.entries.length ? this.entries[0].n : this.cursor
     const out: CdpLogRecord[] = []
-    let pageBytes = 2 // []
+    let pageBytes = 128 // envelope overhead
     let lastCheckedIdx = -1
 
     for (let i = 0; i < this.entries.length; i++) {
       const e = this.entries[i]
       if (e.n <= after) continue
-      const size = Buffer.byteLength(JSON.stringify(e)) + 1
+      const size = Buffer.byteLength(JSON.stringify(e), 'utf8') + 1
       if (out.length > 0 && (out.length >= cappedLimit || pageBytes + size > MAX_PAGE_BYTES)) {
         break
       }
@@ -835,9 +1099,10 @@ export class CdpSessionTap {
   }
 }
 
-// Passive uncompressed /view/drive observer for SecretVault ONLY (never logged).
+// Passive uncompressed /view/drive observer for SecretVault ONLY (per-connection edit buffer, never logged).
 export function createDriveVaultTap(vault: SecretVault): { feed: (chunk: Buffer) => void; close: () => void } {
   let disabled = false
+  const driveBuf = vault.createDriveBuffer()
   const parser = new WsFrameParser(
     msg => {
       if (disabled || msg.truncated) return
@@ -848,10 +1113,11 @@ export function createDriveVaultTap(vault: SecretVault): { feed: (chunk: Buffer)
         return
       }
       if (!parsed || typeof parsed !== 'object' || typeof parsed.method !== 'string') return
-      vault.onDriveEvent(parsed.method, parsed.params)
+      driveBuf.onEvent(parsed.method, parsed.params)
     },
     () => {
       disabled = true
+      driveBuf.clear()
     },
   )
   return {
@@ -861,11 +1127,13 @@ export function createDriveVaultTap(vault: SecretVault): { feed: (chunk: Buffer)
         parser.feed(chunk)
       } catch {
         disabled = true
+        driveBuf.clear()
       }
     },
     close: () => {
+      parser.close()
       try {
-        vault.flushDriveBuffer()
+        driveBuf.flush()
       } catch {}
     },
   }

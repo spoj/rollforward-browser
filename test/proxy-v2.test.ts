@@ -243,7 +243,9 @@ test('forwardUpgrade invokes enforce AdmissionHook and blocks denied upgrades be
     s.on('end', () => resolve(Buffer.concat(chunks).toString()))
   })
 
-  assert.match(await tryUpgrade(), /^HTTP\/1\.1 403/)
+  const r1 = await tryUpgrade()
+  assert.match(r1, /^HTTP\/1\.1 403/)
+  assert.match(r1, /"ruleId":"ws-rule"/, 'upgrade policy denial includes structured JSON ruleId & decisionId')
   assert.equal(upstreamHits.length, 0)
   allow = true
   assert.match(await tryUpgrade(), /^HTTP\/1\.1 101/)

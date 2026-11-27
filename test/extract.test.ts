@@ -177,6 +177,59 @@ test('streaming decompressors cap 1 MiB gzip/deflate/br/zstd at 64 KiB and mark 
   const corrupt = await decompressPrefix(Buffer.from('not-actually-gzip-data'), 'gzip', true)
   assert.equal(corrupt.ok, false)
   assert.equal(corrupt.decode, 'error')
+
+  // Complete HTTP entity with truncated gzip trailer -> MUST error (strict EOF), NOT decodeComplete: true!
+  const smallGz = zlib.gzipSync(Buffer.from('{"ok":true}'))
+  const missingTrailer = smallGz.subarray(0, smallGz.length - 4)
+  const badTrailer = await decompressPrefix(missingTrailer, 'gzip', true)
+  assert.equal(badTrailer.ok, false)
+  assert.equal(badTrailer.decodeComplete, false)
+  assert.equal(badTrailer.decode, 'error')
+})
+
+test('truncated JSON in semantic+samples omits reqBody instead of plaintext fallback, and GraphQL >16 batch detects late mutation', () => {
+  const truncatedJson = '{"password":"my-clear-password","other":"'
+  const res = extractSemantic({
+    url: new URL('https://app.example/api/save'),
+    sanitizedPath: '/api/save',
+    method: 'POST',
+    effectiveMethod: 'POST',
+    kind: 'http',
+    rawHeaders: {},
+    reqType: 'application/json',
+    decodedBuf: Buffer.from(truncatedJson),
+    bodyComplete: false,
+    transport: 'truncated',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+    projection: 'semantic+samples',
+  })
+  assert.equal(res.reqBody, undefined, 'truncated JSON must not fall back to plaintext and leak passwords')
+  assert.equal(res.reqTrunc, true)
+
+  const batch = Array.from({ length: 18 }, (_, i) => ({
+    query: i === 17 ? 'mutation LateWrite { doWrite }' : `query Q${i} { ok }`,
+  }))
+  const gql = extractSemantic({
+    url: new URL('https://app.example/graphql'),
+    sanitizedPath: '/graphql',
+    method: 'POST',
+    effectiveMethod: 'POST',
+    kind: 'http',
+    rawHeaders: {},
+    reqType: 'application/json',
+    decodedBuf: Buffer.from(JSON.stringify(batch)),
+    bodyComplete: true,
+    transport: 'complete',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+    projection: 'semantic',
+  })
+  assert.equal(gql.graphqlOp, 'mixed', 'mutation at index 17 detected despite 16-action cap')
+  assert.equal(gql.actions.length, 16)
+  assert.equal(gql.completeness.extract, 'partial')
 })
 
 test('semantic+samples emits redacted reqBody with JSON.rawJSON numbers and scrubs vault secrets', () => {

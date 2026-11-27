@@ -225,3 +225,14 @@ test('TTL expiry runs seal so v2 logs/cdp-log/shots remain drainable until DELET
   assert.equal((await api('DELETE', `/sessions/${id}?sealed=1`)).status, 200)
   assert.equal(leftovers(), '')
 })
+
+test('auditV2 with cdp: false returns empty zero-cursor envelope on /cdp-log', async () => {
+  const opened = await api('POST', '/sessions', { site, auditV2: { v: 2, cdp: false } })
+  assert.equal(opened.status, 201)
+  const { id, cdpLog } = opened.body
+  const page = await api('GET', `${cdpLog}?after=0`)
+  assert.equal(page.status, 200)
+  assert.deepEqual(page.body, { oldestCursor: 0, nextCursor: 0, hasMore: false, dropped: 0, entries: [] })
+  assert.equal((await api('DELETE', `/sessions/${id}?sealed=1`)).status, 200)
+  assert.equal(leftovers(), '')
+})

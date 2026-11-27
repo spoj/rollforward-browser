@@ -2,12 +2,15 @@ import zlib from 'node:zlib'
 import {
   buildBodyShape,
   buildFormBodyShape,
+  isDataLikeKey,
+  isSensitiveValue,
   parseJsonSafe,
   redactFormBody,
   redactJsonValue,
   redactPlainText,
+  scrubStructuralKey,
   scrubText,
-  truncateHeadTail,
+  truncateUtf8HeadTail,
   type ProjectionMode,
   type SecretVault,
 } from './redact.ts'
@@ -64,14 +67,17 @@ function decompressSingleLayer(
   return new Promise(resolve => {
     let stream: zlib.Gunzip | zlib.Inflate | zlib.InflateRaw | zlib.BrotliDecompress | zlib.ZstdDecompress
     try {
+      // Strict codec EOF when transport is complete (catches truncated trailers!); partial flush ONLY when prefix is already known truncated.
       if (encoding === 'gzip' || encoding === 'x-gzip') {
-        stream = zlib.createGunzip({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
+        stream = inputComplete ? zlib.createGunzip() : zlib.createGunzip({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
       } else if (encoding === 'deflate') {
-        stream = rawDeflateFallback
-          ? zlib.createInflateRaw({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
-          : zlib.createInflate({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
+        if (rawDeflateFallback) {
+          stream = inputComplete ? zlib.createInflateRaw() : zlib.createInflateRaw({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
+        } else {
+          stream = inputComplete ? zlib.createInflate() : zlib.createInflate({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
+        }
       } else if (encoding === 'br') {
-        stream = zlib.createBrotliDecompress({ finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH })
+        stream = inputComplete ? zlib.createBrotliDecompress() : zlib.createBrotliDecompress({ finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH })
       } else if (encoding === 'zstd') {
         stream = zlib.createZstdDecompress()
       } else {
@@ -154,7 +160,6 @@ function decompressSingleLayer(
     stream.on('error', () => {
       const buf = Buffer.concat(chunks)
       if (!inputComplete) {
-        // Premature EOF on a truncated compressed prefix: retain decoded prefix, NEVER decompress-err.
         finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB' })
         return
       }
@@ -263,7 +268,6 @@ export function isBinaryContentType(reqType: string | undefined): boolean {
 export function hasBinaryMagic(buf: Buffer): boolean {
   if (!buf.length) return false
   if (buf.length >= 4) {
-    // PNG, JPEG, GIF, PDF, ZIP, WOFF, WOFF2
     if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true
     if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true
     if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return true
@@ -308,17 +312,14 @@ export function classifyGraphqlQuery(
 
   while (i < len) {
     const ch = query[i]
-    // Whitespace / comma / BOM
     if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n' || ch === ',' || ch === '\ufeff') {
       i++
       continue
     }
-    // Line comment
     if (ch === '#') {
       while (i < len && query[i] !== '\n' && query[i] !== '\r') i++
       continue
     }
-    // Block string """...""" or regular string "..."
     if (ch === '"') {
       if (query.startsWith('"""', i)) {
         i += 3
@@ -358,7 +359,6 @@ export function classifyGraphqlQuery(
           pendingOp = null
           pendingName = undefined
         } else {
-          // Shorthand query `{ field }`
           ops.push({ kind: 'query', name: undefined })
         }
       }
@@ -372,7 +372,6 @@ export function classifyGraphqlQuery(
       continue
     }
     if (ch === '(') {
-      // Skip variable definitions / arguments at depth 0 without confusing variable names with operation name
       let pDepth = 1
       i++
       while (i < len && pDepth > 0) {
@@ -400,7 +399,6 @@ export function classifyGraphqlQuery(
       continue
     }
     if (ch === '@') {
-      // Directive `@dir` — skip name so it's not mistaken for operation name
       i++
       while (i < len && isNameCont(query.charCodeAt(i))) i++
       continue
@@ -444,12 +442,10 @@ export function classifyGraphqlQuery(
   if (ops.length === 1) {
     return { op: ops[0].kind, opNames, opKinds }
   }
-  // Multiple operations without operationName: ambiguous -> mixed
   return { op: 'mixed', opNames, opKinds }
 }
 
 export function extractSoapBodyRoot(xml: string): string | undefined {
-  // Strip XML comments & processing instructions
   const clean = xml.replace(/<!--[\s\S]*?-->/g, '').replace(/<\?[\s\S]*?\?>/g, '')
   const bodyMatch = /<(?:[A-Za-z_][\w.-]*:)?Body(?:\s[^>]*)?>([\s\S]*)/i.exec(clean)
   if (!bodyMatch) return undefined
@@ -495,8 +491,26 @@ export type ExtractOutput = {
   rawBodyText?: string
 }
 
-function capStr(s: string, max = 128): string {
-  return s.length <= max ? s : s.slice(0, max) + '…'
+const E1_ENDPOINTS = new Set(['formservice', 'appstack', 'dataservice', 'orchestrator', 'file', 'tokenrequest', 'discover', 'defaultconfig'])
+const STRUCT_IDENT_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,47}$/
+const E1_CONTROL_ID_RE = /^[A-Za-z0-9_.-]{1,32}$/
+const GQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,47}$/
+
+function validateStructuralIdent(
+  val: unknown,
+  pattern: RegExp,
+  vault?: SecretVault,
+  allowNumeric = false,
+): { value?: string; vaultRedactions: number } {
+  if (typeof val !== 'string' || !val) return { vaultRedactions: 0 }
+  if (vault) {
+    const sv = vault.scrub(val)
+    if (sv.count > 0) return { vaultRedactions: sv.count }
+  }
+  if (!pattern.test(val)) return { vaultRedactions: 0 }
+  if (isSensitiveValue(val)) return { vaultRedactions: 0 }
+  if (!allowNumeric && isDataLikeKey(val)) return { vaultRedactions: 0 }
+  return { value: val, vaultRedactions: 0 }
 }
 
 export function extractSemantic(input: ExtractInput): ExtractOutput {
@@ -515,14 +529,13 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
   try {
     const rawBuf = input.decodedBuf ?? Buffer.alloc(0)
     const decodeRes = input.decodeResult
-    let decodeStatus: Completeness['decode'] = decodeRes?.decode ?? (rawBuf.length ? (input.bodyComplete ? 'complete' : 'truncated') : 'none')
-    let decodeComplete = decodeRes ? decodeRes.decodeComplete : input.bodyComplete
+    const decodeStatus: Completeness['decode'] = decodeRes?.decode ?? (rawBuf.length ? (input.bodyComplete ? 'complete' : 'truncated') : 'none')
+    const decodeComplete = decodeRes ? decodeRes.decodeComplete : input.bodyComplete
 
     if (decodeRes?.reason && !reasons.includes(decodeRes.reason)) reasons.push(decodeRes.reason)
     if (input.isAuth && !reasons.includes('auth-url')) reasons.push('auth-url')
     if (input.isLive && !reasons.includes('live')) reasons.push('live')
 
-    // Handle decompression error
     if (decodeRes && !decodeRes.ok) {
       const actions: SemanticAction[] = input.isWrite
         ? [{ family: 'rest', op: `rest:${input.effectiveMethod}`, resource: input.sanitizedPath, coverage: 'unknown' }]
@@ -555,21 +568,25 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       }
     }
 
-    // Attempt JSON parse regardless of Content-Type (catches text/plain and spoofed types)
     let parsedJson: unknown
     let isJson = false
     let dupKeys = false
+    let structuredJsonParseFailed = false
     if (decodedText !== undefined) {
+      const trimmed = decodedText.trimStart()
+      const looksJson = input.reqType === 'application/json' || Boolean(input.reqType?.endsWith('+json')) || trimmed.startsWith('{') || trimmed.startsWith('[')
       const parsed = parseJsonSafe(decodedText)
       if (parsed.ok) {
         isJson = true
         parsedJson = parsed.value
         dupKeys = parsed.dupKeys
         if (dupKeys) reasons.push('dupKeys')
+      } else if (looksJson) {
+        structuredJsonParseFailed = true
+        reasons.push('json-parse-failed')
       }
     }
 
-    // Build bodyShape (even for auth-url writes; skip for live requests to never parse human passwords)
     let bodyShape: Record<string, string> | undefined
     if (!input.isLive && hasBody && !isBinary) {
       if (isJson && parsedJson !== null && typeof parsedJson === 'object') {
@@ -602,33 +619,38 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
 
     if (isE1Path || isE1Shape) {
       const m = /\/jderest\/(?:v\d+\/)?([^/;?]+)/i.exec(input.url.pathname)
-      const endpoint = m ? m[1].toLowerCase() : 'ais'
-      const actionVerb = typeof obj?.action === 'string' ? obj.action : typeof obj?.formServiceAction === 'string' ? obj.formServiceAction : undefined
-      const formName = typeof obj?.formName === 'string'
+      const rawEndpoint = m ? m[1].toLowerCase() : 'ais'
+      const endpoint = E1_ENDPOINTS.has(rawEndpoint) ? rawEndpoint : 'ais'
+
+      const details: Record<string, unknown> = {}
+      const rawFormName = typeof obj?.formName === 'string'
         ? obj.formName
         : typeof (obj?.formRequest as any)?.formName === 'string'
           ? (obj!.formRequest as any).formName
           : typeof obj?.targetName === 'string'
             ? obj.targetName
             : undefined
-      const details: Record<string, unknown> = {}
-      if (formName) {
-        const s = scrubText(capStr(formName), input.vault)
-        vaultRedactions += s.vaultRedactions
-        details.formName = s.text
-      }
-      if (typeof obj?.version === 'string') {
-        const s = scrubText(capStr(obj.version), input.vault)
-        vaultRedactions += s.vaultRedactions
-        details.version = s.text
-      }
-      if (actionVerb) {
-        const s = scrubText(capStr(actionVerb), input.vault)
-        vaultRedactions += s.vaultRedactions
-        details.action = s.text
-      }
-      if (typeof obj?.targetType === 'string') details.targetType = capStr(obj.targetType)
-      if (typeof obj?.dataServiceType === 'string') details.dataServiceType = capStr(obj.dataServiceType)
+
+      const formIdent = validateStructuralIdent(rawFormName, STRUCT_IDENT_RE, input.vault)
+      vaultRedactions += formIdent.vaultRedactions
+      if (formIdent.value) details.formName = formIdent.value
+
+      const verIdent = validateStructuralIdent(obj?.version, STRUCT_IDENT_RE, input.vault)
+      vaultRedactions += verIdent.vaultRedactions
+      if (verIdent.value) details.version = verIdent.value
+
+      const rawAction = typeof obj?.action === 'string' ? obj.action : typeof obj?.formServiceAction === 'string' ? obj.formServiceAction : undefined
+      const actIdent = validateStructuralIdent(rawAction, /^[A-Za-z][A-Za-z0-9_-]{0,23}$/, input.vault)
+      vaultRedactions += actIdent.vaultRedactions
+      if (actIdent.value) details.action = actIdent.value
+
+      const targetTypeIdent = validateStructuralIdent(obj?.targetType, STRUCT_IDENT_RE, input.vault)
+      vaultRedactions += targetTypeIdent.vaultRedactions
+      if (targetTypeIdent.value) details.targetType = targetTypeIdent.value
+
+      const dsTypeIdent = validateStructuralIdent(obj?.dataServiceType, STRUCT_IDENT_RE, input.vault)
+      vaultRedactions += dsTypeIdent.vaultRedactions
+      if (dsTypeIdent.value) details.dataServiceType = dsTypeIdent.value
 
       const rawActions = Array.isArray(obj?.formActions)
         ? obj.formActions
@@ -642,16 +664,20 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
           if (!a || typeof a !== 'object') return { command: 'unknown' }
           const rec = a as Record<string, unknown>
           const item: Record<string, string> = {}
-          if (typeof rec.command === 'string') item.command = capStr(rec.command, 64)
-          if (typeof rec.controlID === 'string') item.controlID = capStr(rec.controlID, 64)
+          const cmd = validateStructuralIdent(rec.command, STRUCT_IDENT_RE, input.vault)
+          vaultRedactions += cmd.vaultRedactions
+          if (cmd.value) item.command = cmd.value
+          const cid = validateStructuralIdent(rec.controlID, E1_CONTROL_ID_RE, input.vault, true)
+          vaultRedactions += cid.vaultRedactions
+          if (cid.value) item.controlID = cid.value
           return item
         })
         details.formActions = summarized
         if (rawActions.length > 32) details.formActionsTruncated = true
       }
 
-      const op = actionVerb ? `${endpoint}:${capStr(actionVerb, 32)}` : `${endpoint}:${input.effectiveMethod}`
-      const resource = (details.formName as string | undefined) ?? input.sanitizedPath
+      const op = actIdent.value ? `${endpoint}:${actIdent.value}` : `${endpoint}:${input.effectiveMethod}`
+      const resource = formIdent.value ?? input.sanitizedPath
       actions.push({
         family: 'e1-ais',
         op,
@@ -684,12 +710,11 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
           hasRequestDigest: Boolean(input.rawHeaders['x-requestdigest']),
         }
         if (input.hdr?.['x-http-method']) details.override = input.hdr['x-http-method']
-        const metaType = (obj?.__metadata as any)?.type ?? obj?.['@odata.type']
-        if (typeof metaType === 'string') {
-          const s = scrubText(capStr(metaType), input.vault)
-          vaultRedactions += s.vaultRedactions
-          details.metadataType = s.text
-        }
+        const rawMetaType = (obj?.__metadata as any)?.type ?? obj?.['@odata.type']
+        const metaIdent = validateStructuralIdent(rawMetaType, /^[#A-Za-z][A-Za-z0-9_.-]{0,63}$/, input.vault)
+        vaultRedactions += metaIdent.vaultRedactions
+        if (metaIdent.value) details.metadataType = metaIdent.value
+
         actions.push({
           family: 'sharepoint',
           op: `sharepoint:${input.effectiveMethod}`,
@@ -701,65 +726,82 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       }
     }
 
-    // 3. GraphQL
+    // 3. GraphQL (classify ALL items in bounded <=64KiB batch; cap emitted actions at 16!)
     else if (
       lowerPath.includes('/graphql') ||
       (obj && (typeof obj.query === 'string' || (obj.extensions && typeof obj.extensions === 'object' && 'persistedQuery' in (obj.extensions as Record<string, unknown>)))) ||
       (Array.isArray(parsedJson) && parsedJson.length > 0 && parsedJson.every(item => item && typeof item === 'object' && ('query' in (item as any) || 'extensions' in (item as any))))
     ) {
-      const items = Array.isArray(parsedJson) ? parsedJson.slice(0, 16) : obj ? [obj] : []
+      const allItems = Array.isArray(parsedJson) ? parsedJson : obj ? [obj] : []
+      const batchTruncated = allItems.length > 16
+      if (batchTruncated) reasons.push('batch-truncated')
       const opsSeen: GraphqlOp[] = []
-      for (const item of items) {
-        const rec = item as Record<string, unknown>
+
+      for (let idx = 0; idx < allItems.length; idx++) {
+        const rec = allItems[idx] as Record<string, unknown>
         const qStr = typeof rec.query === 'string' ? rec.query : undefined
-        const opName = typeof rec.operationName === 'string' ? rec.operationName : undefined
+        const opNameRaw = typeof rec.operationName === 'string' ? rec.operationName : undefined
         const hasPersisted = Boolean(rec.extensions && typeof rec.extensions === 'object' && 'persistedQuery' in (rec.extensions as Record<string, unknown>))
-        const varKeys = rec.variables && typeof rec.variables === 'object' && !Array.isArray(rec.variables)
-          ? Object.keys(rec.variables as Record<string, unknown>).slice(0, 32)
-          : undefined
+
+        const safeOpName = validateStructuralIdent(opNameRaw, GQL_IDENT_RE, input.vault)
+        vaultRedactions += safeOpName.vaultRedactions
+
+        let varKeys: string[] | undefined
+        if (idx < 16 && rec.variables && typeof rec.variables === 'object' && !Array.isArray(rec.variables)) {
+          varKeys = Object.keys(rec.variables as Record<string, unknown>).slice(0, 32).map(k => {
+            const sk = scrubStructuralKey(k, input.vault)
+            vaultRedactions += sk.vaultRedactions
+            return sk.key
+          })
+        }
 
         if (!qStr && hasPersisted) {
           opsSeen.push('persisted')
-          actions.push({
-            family: 'graphql',
-            op: 'graphql:persisted',
-            resource: opName ? scrubText(capStr(opName), input.vault).text : input.sanitizedPath,
-            details: { ...(varKeys && { variableKeys: varKeys }) },
-            coverage: 'persisted-query-unknown',
-          })
+          if (idx < 16) {
+            actions.push({
+              family: 'graphql',
+              op: 'graphql:persisted',
+              resource: safeOpName.value ?? input.sanitizedPath,
+              details: { ...(varKeys && { variableKeys: varKeys }) },
+              coverage: 'persisted-query-unknown',
+            })
+          }
           continue
         }
         if (qStr) {
-          const res = classifyGraphqlQuery(qStr, opName)
+          const res = classifyGraphqlQuery(qStr, opNameRaw)
           const itemOp: GraphqlOp = dupKeys ? 'mixed' : res.op
           opsSeen.push(itemOp)
-          let resource = input.sanitizedPath
-          if (opName) {
-            const s = scrubText(capStr(opName), input.vault)
-            vaultRedactions += s.vaultRedactions
-            resource = s.text
-          } else if (res.opNames.length === 1 && res.opNames[0] !== '<anonymous>') {
-            resource = capStr(res.opNames[0])
+          if (idx < 16) {
+            const safeNames = res.opNames.slice(0, 16).map(n => {
+              if (n === '<anonymous>') return n
+              const v = validateStructuralIdent(n, GQL_IDENT_RE, input.vault)
+              vaultRedactions += v.vaultRedactions
+              return v.value ?? '<redacted>'
+            })
+            const resource = safeOpName.value ?? (safeNames.length === 1 && safeNames[0] !== '<anonymous>' && safeNames[0] !== '<redacted>' ? safeNames[0] : input.sanitizedPath)
+            actions.push({
+              family: 'graphql',
+              op: `graphql:${itemOp}`,
+              resource,
+              details: {
+                opNames: safeNames,
+                opKinds: res.opKinds.slice(0, 16),
+                ...(varKeys && { variableKeys: varKeys }),
+              },
+              coverage: !fullyIntact || itemOp === 'mixed' || batchTruncated ? 'partial' : 'complete',
+            })
           }
-          actions.push({
-            family: 'graphql',
-            op: `graphql:${itemOp}`,
-            resource,
-            details: {
-              opNames: res.opNames.slice(0, 16),
-              opKinds: res.opKinds.slice(0, 16),
-              ...(varKeys && { variableKeys: varKeys }),
-            },
-            coverage: !fullyIntact || itemOp === 'mixed' ? 'partial' : 'complete',
-          })
         } else {
           opsSeen.push('mixed')
-          actions.push({
-            family: 'graphql',
-            op: 'graphql:mixed',
-            resource: input.sanitizedPath,
-            coverage: 'unknown',
-          })
+          if (idx < 16) {
+            actions.push({
+              family: 'graphql',
+              op: 'graphql:mixed',
+              resource: input.sanitizedPath,
+              coverage: 'unknown',
+            })
+          }
         }
       }
 
@@ -769,15 +811,15 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       } else if (opsSeen.includes('persisted')) {
         graphqlOp = opsSeen.every(o => o === 'persisted') ? 'persisted' : 'mixed'
         extractStatus = 'opaque'
-      } else if (opsSeen.every(o => o === 'query') && fullyIntact) {
+      } else if (opsSeen.every(o => o === 'query') && fullyIntact && !batchTruncated) {
         graphqlOp = 'query'
         extractStatus = 'complete'
       } else if (opsSeen.every(o => o === 'mutation')) {
         graphqlOp = 'mutation'
-        extractStatus = fullyIntact ? 'complete' : 'partial'
+        extractStatus = fullyIntact && !batchTruncated ? 'complete' : 'partial'
       } else if (opsSeen.every(o => o === 'subscription')) {
         graphqlOp = 'subscription'
-        extractStatus = fullyIntact ? 'complete' : 'partial'
+        extractStatus = fullyIntact && !batchTruncated ? 'complete' : 'partial'
       } else {
         graphqlOp = 'mixed'
         extractStatus = 'partial'
@@ -792,13 +834,16 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         /<(?:[A-Za-z_][\w.-]*:)?Envelope[\s>]/i.test(decodedText))
     ) {
       const claimedRaw = input.hdr?.soapaction?.replace(/^"(.*)"$/, '$1')
-      const bodyRoot = decodedText ? extractSoapBodyRoot(decodedText) : undefined
+      const bodyRootRaw = decodedText ? extractSoapBodyRoot(decodedText) : undefined
       let soapAction: string | undefined
       if (claimedRaw) {
-        const s = scrubText(capStr(claimedRaw), input.vault)
+        const s = scrubText(truncateUtf8HeadTail(claimedRaw, 128), input.vault)
         vaultRedactions += s.vaultRedactions
-        soapAction = s.text
+        if (!isSensitiveValue(s.text)) soapAction = s.text
       }
+      const rootIdent = validateStructuralIdent(bodyRootRaw, /^[A-Za-z_][\w.-]{0,47}(?::[A-Za-z_][\w.-]{0,47})?$/, input.vault)
+      vaultRedactions += rootIdent.vaultRedactions
+      const bodyRoot = rootIdent.value
       const rootLocal = bodyRoot?.includes(':') ? bodyRoot.split(':')[1] : bodyRoot
       const actionMismatch = Boolean(soapAction && rootLocal && !soapAction.toLowerCase().includes(rootLocal.toLowerCase()))
       actions.push({
@@ -807,7 +852,7 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         resource: input.sanitizedPath,
         details: {
           ...(soapAction && { soapAction }),
-          ...(bodyRoot && { bodyRootQName: capStr(bodyRoot) }),
+          ...(bodyRoot && { bodyRootQName: bodyRoot }),
           ...(actionMismatch && { actionMismatch: true }),
         },
         coverage: defaultCov,
@@ -821,9 +866,9 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         family: 'rest',
         op: `rest:${input.effectiveMethod}`,
         resource: input.sanitizedPath,
-        coverage: isBinary ? 'partial' : defaultCov,
+        coverage: isBinary || structuredJsonParseFailed ? 'partial' : defaultCov,
       })
-      extractStatus = isBinary ? 'opaque' : fullyIntact ? 'complete' : 'partial'
+      extractStatus = isBinary || structuredJsonParseFailed ? 'opaque' : fullyIntact ? 'complete' : 'partial'
     }
 
     // Compute reqBody / reqOmitted / reqTrunc
@@ -840,6 +885,10 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         reqOmitted = 'binary'
       } else if (input.projection === 'semantic') {
         reqOmitted = 'policy-profile'
+      } else if (structuredJsonParseFailed) {
+        // Never fall back to plaintext on truncated/malformed JSON where sensitive-key inheritance would be lost!
+        reqOmitted = 'policy-profile'
+        reqTrunc = true
       } else if (input.sampleBudgetOk === false) {
         reqOmitted = 'budget'
       } else if (decodedText !== undefined) {
@@ -857,8 +906,8 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
           vaultRedactions += rp.vaultRedactions
           redactedText = rp.text
         }
-        if (Buffer.byteLength(redactedText) > MAX_SAMPLE_BODY_BYTES) {
-          reqBody = truncateHeadTail(redactedText, MAX_SAMPLE_BODY_BYTES, 3072, 1020)
+        if (Buffer.byteLength(redactedText, 'utf8') > MAX_SAMPLE_BODY_BYTES) {
+          reqBody = truncateUtf8HeadTail(redactedText, MAX_SAMPLE_BODY_BYTES, 3072, 1020)
           reqTrunc = true
         } else {
           reqBody = redactedText

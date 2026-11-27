@@ -102,9 +102,9 @@ function enforceRetainedMemoryCeiling(clientName: string) {
   let { clientBytes, processBytes } = usage()
   if (clientBytes < maxClientRetainedBytes && processBytes < maxProcessRetainedBytes) return
 
-  // GC oldest sealed/TTL sessions first (client's own first if client cap hit, then any sealed if process cap hit)
+  // GC ONLY sessions whose seal() snapshot has ALREADY finished publishing (never mid-seal!)
   const sealed = [...sessions.values()]
-    .filter(s => s.closing)
+    .filter(s => s.isSealed())
     .sort((a, b) => (a.sealedAt ?? 0) - (b.sealedAt ?? 0))
 
   for (const s of sealed) {
@@ -227,7 +227,10 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   }
 
   if (rest === '/cdp-log' && req.method === 'GET') {
-    if (!s.cdpTap) throw fail(404, 'cdp log not enabled')
+    if (!s.auditV2) throw fail(404, 'cdp log not enabled')
+    if (!s.cdpTap) {
+      return json(res, 200, { oldestCursor: 0, nextCursor: 0, hasMore: false, dropped: 0, entries: [] })
+    }
     const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
     const limit = Math.min(500, Math.max(1, Number(searchParams.get('limit') ?? '500') || 500))
     return json(res, 200, s.cdpTap.getPage(after, limit))

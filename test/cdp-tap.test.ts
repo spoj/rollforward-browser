@@ -204,10 +204,14 @@ test('unknown CDP method names are bounded to 256 in _tap.summary and createDriv
   assert.equal(nonOverflow.length, 256)
   assert.equal(summary.methodCounts._unknown_other, 44)
 
-  // Drive vault tap
+  // Concurrent drive vault taps keep isolated edit buffers
   const vault = new SecretVault()
-  const drive = createDriveVaultTap(vault)
-  drive.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Input.insertText', params: { text: '654321' } }))))
-  drive.close()
-  assert.equal(vault.scrub('code=654321').text, 'code=[REDACTED:vault]')
+  const drive1 = createDriveVaultTap(vault)
+  const drive2 = createDriveVaultTap(vault)
+  drive1.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Input.insertText', params: { text: '654' } }))))
+  drive2.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 1, method: 'Input.insertText', params: { text: 'AlphaPass' } }))))
+  drive1.feed(encodeWsFrame(Buffer.from(JSON.stringify({ id: 2, method: 'Input.insertText', params: { text: '321' } }))))
+  drive1.close()
+  drive2.close()
+  assert.equal(vault.scrub('code=654321 pw=AlphaPass').text, 'code=[REDACTED:vault] pw=[REDACTED:vault]')
 })

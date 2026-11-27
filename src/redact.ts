@@ -30,7 +30,7 @@ const UNAMBIGUOUS_TOKENS = new Set([
 const SENSITIVE_CONTAINERS = new Set(['credentials', 'cookies', 'tokens', 'secrets'])
 
 const AUTH_HOST_RE = /^(?:login|signin|sso|auth|idp|sts|adfs|oauth|accounts)\.|(?:^|\.)(?:okta|oktapreview|auth0|onelogin|pingidentity|duosecurity|login\.microsoftonline|login\.live)\.com$/i
-const AUTH_PATH_RE = /(?:^|\/)(?:login|log-in|signin|sign-in|sign_in|logout|auth|authenticate|authentication|oauth|oauth2|oidc|saml|saml2|sso|adfs|token|tokenrequest|authorize|mfa|2fa|otp|totp|webauthn|passkey|password|passwd|reset-password|forgot-password|change-password|j_security_check|kmsi)(?:\/|$)/i
+const AUTH_PATH_RE = /(?:^|\/)(?:login|log-in|signin|sign-in|sign_in|logout|auth|authenticate|authentication|oauth|oauth2|oidc|saml|saml2|sso|adfs|token|tokenrequest|authorize|callback|mfa|2fa|otp|totp|webauthn|passkey|password|passwd|reset-password|forgot-password|change-password|j_security_check|kmsi)(?:\/|$)/i
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/i
@@ -96,6 +96,62 @@ export function safeDecodeURIComponent(s: string): string {
   }
 }
 
+// Per-connection human /view/drive input buffer so concurrent drivers never interleave keystrokes.
+export class DriveInputBuffer {
+  private buf = ''
+  private vault: SecretVault
+
+  constructor(vault: SecretVault) {
+    this.vault = vault
+  }
+
+  onEvent(method: string, params?: Record<string, unknown>): void {
+    if (method === 'Input.insertText') {
+      const text = params?.text
+      if (typeof text === 'string' && text.length) {
+        if (this.buf.length + text.length <= 4096) this.buf += text
+      }
+      return
+    }
+    if (method === 'Input.dispatchMouseEvent') {
+      if (params?.type === 'mousePressed') this.flush()
+      return
+    }
+    if (method === 'Input.dispatchKeyEvent') {
+      const type = params?.type
+      const key = typeof params?.key === 'string' ? params.key : ''
+      const text = typeof params?.text === 'string' ? params.text : ''
+      const modifiers = typeof params?.modifiers === 'number' ? params.modifiers : 0
+      if (type === 'keyUp') return
+      if (key === 'Backspace') {
+        if (this.buf.length) this.buf = this.buf.slice(0, -1)
+        return
+      }
+      if (key === 'Enter' || key === 'Tab' || text === '\r' || text === '\n' || text === '\t') {
+        this.flush()
+        return
+      }
+      if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown' || key === 'Home' || key === 'End' || key === 'Delete') {
+        this.buf = ''
+        return
+      }
+      if ((type === 'keyDown' || type === 'char') && text.length > 0 && (modifiers & 6) === 0) {
+        if (this.buf.length + text.length <= 4096) this.buf += text
+      }
+    }
+  }
+
+  flush(): void {
+    const val = this.buf
+    this.buf = ''
+    if (val.length >= MIN_TRUSTED_LEN) this.vault.addTrustedDrive(val)
+  }
+
+  clear(): void {
+    this.buf = ''
+  }
+}
+
 export class SecretVault {
   private trustedHeaders = new Set<string>()
   private trustedHeaderBytes = 0
@@ -103,9 +159,13 @@ export class SecretVault {
   private trustedDriveBytes = 0
   private lru = new Map<string, number>()
   private lruBytes = 0
-  private driveBuf = ''
+  private defaultDriveBuf: DriveInputBuffer
   private dirty = false
   private regex: RegExp | null = null
+
+  constructor() {
+    this.defaultDriveBuf = new DriveInputBuffer(this)
+  }
 
   get empty(): boolean {
     return this.trustedHeaders.size === 0 && this.trustedDrive.size === 0 && this.lru.size === 0
@@ -255,46 +315,16 @@ export class SecretVault {
     }
   }
 
+  createDriveBuffer(): DriveInputBuffer {
+    return new DriveInputBuffer(this)
+  }
+
   onDriveEvent(method: string, params?: Record<string, unknown>): void {
-    if (method === 'Input.insertText') {
-      const text = params?.text
-      if (typeof text === 'string' && text.length) {
-        if (this.driveBuf.length + text.length <= 4096) this.driveBuf += text
-      }
-      return
-    }
-    if (method === 'Input.dispatchMouseEvent') {
-      if (params?.type === 'mousePressed') this.flushDriveBuffer()
-      return
-    }
-    if (method === 'Input.dispatchKeyEvent') {
-      const type = params?.type
-      const key = typeof params?.key === 'string' ? params.key : ''
-      const text = typeof params?.text === 'string' ? params.text : ''
-      const modifiers = typeof params?.modifiers === 'number' ? params.modifiers : 0
-      if (type === 'keyUp') return
-      if (key === 'Backspace') {
-        if (this.driveBuf.length) this.driveBuf = this.driveBuf.slice(0, -1)
-        return
-      }
-      if (key === 'Enter' || key === 'Tab' || text === '\r' || text === '\n' || text === '\t') {
-        this.flushDriveBuffer()
-        return
-      }
-      if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown' || key === 'Home' || key === 'End' || key === 'Delete') {
-        this.driveBuf = ''
-        return
-      }
-      if ((type === 'keyDown' || type === 'char') && text.length > 0 && (modifiers & 6) === 0) {
-        if (this.driveBuf.length + text.length <= 4096) this.driveBuf += text
-      }
-    }
+    this.defaultDriveBuf.onEvent(method, params)
   }
 
   flushDriveBuffer(): void {
-    const val = this.driveBuf
-    this.driveBuf = ''
-    if (val.length >= MIN_TRUSTED_LEN) this.addTrustedDrive(val)
+    this.defaultDriveBuf.flush()
   }
 
   private compile(): RegExp | null {
@@ -346,27 +376,35 @@ export class SecretVault {
     this.trustedDriveBytes = 0
     this.lru.clear()
     this.lruBytes = 0
-    this.driveBuf = ''
+    this.defaultDriveBuf.clear()
     this.dirty = false
     this.regex = null
   }
 }
 
 export function normalizePathForAuth(rawPath: string): string {
-  const decoded = safeDecodeURIComponent(rawPath)
-  // Strip WebLogic/servlet matrix params from the first ';' onward so `/formservice;x=/login` resolves to `/formservice`
-  // while `/login;jsessionid=123` resolves to `/login`.
-  const semiIdx = decoded.indexOf(';')
-  const stripped = semiIdx >= 0 ? decoded.slice(0, semiIdx) : decoded
+  // Split raw segments BEFORE decoding %2F so `;x=%2Flogin` stays inside the segment.
+  // For literal `;x=/login` (matrix param ending in `=` immediately before `/`), skip the matrix-value segment,
+  // while preserving genuine routing segments after ordinary matrix params like `/app;v=1/login`.
+  const rawSegs = rawPath.split('/')
   const parts: string[] = []
-  for (const seg of stripped.split('/')) {
-    if (!seg || seg === '.') continue
-    if (seg === '..') {
-      parts.pop()
-      continue
+  for (let i = 0; i < rawSegs.length; i++) {
+    const raw = rawSegs[i]
+    if (!raw) continue
+    const decoded = safeDecodeURIComponent(raw)
+    const semiIdx = decoded.indexOf(';')
+    const swallowsNext = semiIdx >= 0 && /;[^;]*=$/.test(decoded)
+    const clean = (semiIdx >= 0 ? decoded.slice(0, semiIdx) : decoded)
+    if (swallowsNext) i++ // skip next segment treated as matrix param value (e.g. /formservice;x=/login)
+    for (const sub of clean.split('/')) {
+      if (!sub || sub === '.') continue
+      if (sub === '..') {
+        parts.pop()
+        continue
+      }
+      const base = sub.split(';')[0]
+      if (base) parts.push(base)
     }
-    const cleanSeg = seg.split(';')[0]
-    if (cleanSeg) parts.push(cleanSeg)
   }
   return '/' + parts.join('/')
 }
@@ -374,7 +412,8 @@ export function normalizePathForAuth(rawPath: string): string {
 export function isAuthUrl(raw: string | URL): boolean {
   const u = typeof raw === 'string' ? URL.parse(raw) : raw
   if (!u) return false
-  if (AUTH_HOST_RE.test(u.hostname)) return true
+  const canonicalHost = u.hostname.replace(/\.+$/, '')
+  if (AUTH_HOST_RE.test(canonicalHost)) return true
   const norm = normalizePathForAuth(u.pathname)
   return AUTH_PATH_RE.test(norm)
 }
@@ -528,7 +567,6 @@ export function scanJsonDuplicateKeys(text: string): boolean {
         top.expectColon = true
       }
     } else {
-      // primitive token
       if (top && top.type === '{') top.expectKey = false
       while (i < len) {
         const c = text[i]
@@ -640,6 +678,15 @@ export function isDataLikeKey(key: string): boolean {
   return false
 }
 
+export function scrubStructuralKey(k: string, vault?: SecretVault): { key: string; vaultRedactions: number } {
+  if (vault) {
+    const s = vault.scrub(k)
+    if (s.count > 0) return { key: '<key>', vaultRedactions: s.count }
+  }
+  if (isDataLikeKey(k)) return { key: '<key>', vaultRedactions: 0 }
+  return { key: k, vaultRedactions: 0 }
+}
+
 export function buildBodyShape(
   value: unknown,
   vault?: SecretVault,
@@ -658,18 +705,6 @@ export function buildBodyShape(
     if (count >= maxPaths) return
     shape[path] = type
     count++
-  }
-
-  const scrubKey = (k: string): string => {
-    if (vault) {
-      const s = vault.scrub(k)
-      if (s.count > 0) {
-        vaultRedactions += s.count
-        return '<key>'
-      }
-    }
-    if (isDataLikeKey(k)) return '<key>'
-    return k
   }
 
   const scalarType = (v: unknown): string => {
@@ -722,8 +757,9 @@ export function buildBodyShape(
     }
     for (const [rawKey, child] of entries) {
       if (count >= maxPaths) break
-      const k = scrubKey(rawKey)
-      const nextPath = prefix ? `${prefix}.${k}` : k
+      const sk = scrubStructuralKey(rawKey, vault)
+      vaultRedactions += sk.vaultRedactions
+      const nextPath = prefix ? `${prefix}.${sk.key}` : sk.key
       walk(child, nextPath, depth + 1)
     }
   }
@@ -748,16 +784,11 @@ export function buildFormBodyShape(raw: string, vault?: SecretVault, maxPaths = 
     const eq = pair.indexOf('=')
     const rawK = eq >= 0 ? pair.slice(0, eq) : pair
     const rawV = eq >= 0 ? pair.slice(eq + 1) : ''
-    let k = safeDecodeURIComponent(rawK.replace(/\+/g, ' '))
+    const decK = safeDecodeURIComponent(rawK.replace(/\+/g, ' '))
     const v = safeDecodeURIComponent(rawV.replace(/\+/g, ' '))
-    if (vault) {
-      const s = vault.scrub(k)
-      if (s.count > 0) {
-        vaultRedactions += s.count
-        k = '<key>'
-      }
-    }
-    if (k !== '<key>' && isDataLikeKey(k)) k = '<key>'
+    const sk = scrubStructuralKey(decK, vault)
+    vaultRedactions += sk.vaultRedactions
+    const k = sk.key
     const t = v === '' ? 'empty' : NUMERIC_RE.test(v) ? 'number' : (v === 'true' || v === 'false') ? 'boolean' : 'string'
     if (!(k in shape)) {
       shape[k] = t
@@ -824,6 +855,52 @@ export function truncateHeadTail(str: string, maxLen = 2048, headLen = 1536, tai
 
   if (tailStart <= headEnd) return str.slice(0, maxLen)
   return `${str.slice(0, headEnd)}…${str.slice(tailStart)}`
+}
+
+// Strict UTF-8 byte-bounded head+tail truncation without splitting UTF-16 surrogates or %XX.
+export function truncateUtf8HeadTail(str: string, maxBytes: number, headBytes?: number, tailBytes?: number): string {
+  if (maxBytes <= 0) return ''
+  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str
+  const ellipsis = '…'
+  const ellipsisBytes = Buffer.byteLength(ellipsis, 'utf8') // 3 bytes
+  if (maxBytes <= ellipsisBytes) return ''
+  const avail = maxBytes - ellipsisBytes
+  const targetHead = Math.min(headBytes ?? Math.floor(avail * 0.75), avail)
+  const targetTail = Math.min(tailBytes ?? (avail - targetHead), avail - targetHead)
+
+  // Accumulate head code points up to targetHead UTF-8 bytes
+  let headEnd = 0
+  let hBytes = 0
+  while (headEnd < str.length) {
+    const cp = str.codePointAt(headEnd)!
+    const cuLen = cp > 0xffff ? 2 : 1
+    const bLen = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4
+    if (hBytes + bLen > targetHead) break
+    hBytes += bLen
+    headEnd += cuLen
+  }
+  if (headEnd >= 1 && str[headEnd - 1] === '%') headEnd -= 1
+  else if (headEnd >= 2 && str[headEnd - 2] === '%' && /[0-9a-fA-F]/.test(str[headEnd - 1])) headEnd -= 2
+
+  // Accumulate tail code points backwards up to targetTail UTF-8 bytes
+  let tailStart = str.length
+  let tBytes = 0
+  while (tailStart > headEnd) {
+    let prev = tailStart - 1
+    if (prev > headEnd && isLowSurrogate(str.charCodeAt(prev)) && isHighSurrogate(str.charCodeAt(prev - 1))) {
+      prev--
+    }
+    const cp = str.codePointAt(prev)!
+    const bLen = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4
+    if (tBytes + bLen > targetTail) break
+    tBytes += bLen
+    tailStart = prev
+  }
+  if (tailStart >= 1 && str[tailStart - 1] === '%') tailStart = Math.min(str.length, tailStart + 2)
+  else if (tailStart >= 2 && str[tailStart - 2] === '%' && /[0-9a-fA-F]/.test(str[tailStart - 1])) tailStart = Math.min(str.length, tailStart + 1)
+
+  if (tailStart <= headEnd) return str.slice(0, headEnd)
+  return `${str.slice(0, headEnd)}${ellipsis}${str.slice(tailStart)}`
 }
 
 export function sanitizePath(pathname: string, vault?: SecretVault): { path: string; vaultRedactions: number } {
@@ -907,7 +984,6 @@ function sanitizeQueryString(
       const templated = inferQueryScalarType(decV)
       return `${outK}=${templated}`
     }
-    // semantic+samples: preserve raw span untouched (keeps %20, etc.)
     return `${outK}=${rawV}`
   })
   return { search: '?' + parts.join('&'), vaultRedactions }
@@ -922,7 +998,7 @@ export function sanitizeUrl(
   if (!u) {
     const scrubbed = scrubText(String(raw), opts.vault)
     return {
-      url: truncateHeadTail(scrubbed.text, maxLen),
+      url: truncateUtf8HeadTail(scrubbed.text, maxLen),
       path: '/',
       authority: '',
       scheme: 'http',
@@ -944,8 +1020,8 @@ export function sanitizeUrl(
     }
   }
   return {
-    url: truncateHeadTail(full, maxLen),
-    path: truncateHeadTail(sp.path, 1024, 768, 256),
+    url: truncateUtf8HeadTail(full, maxLen, Math.floor(maxLen * 0.75), Math.floor(maxLen * 0.25)),
+    path: truncateUtf8HeadTail(sp.path, 1024, 768, 252),
     authority,
     scheme,
     vaultRedactions,
