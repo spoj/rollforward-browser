@@ -943,18 +943,38 @@ export class CdpSessionTap {
         navUrl = `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}`
       } else if (/^blob:/i.test(schemeProbe)) {
         const rawInner = schemeProbe.slice(5)
-        const inner = URL.parse(rawInner)
-        let origin = inner ? inner.origin : ''
-        // Scrub mixed-case authority BEFORE URL.parse lowercases hostname
-        const authMatch = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(rawInner)
-        if (vault && authMatch) {
-          const sa = vault.scrub(authMatch[1])
-          if (sa.count > 0) {
-            vaultRedactions += sa.count
-            origin = `${inner ? inner.protocol : 'https:'}//${sa.text}`
+        const rawScrub = vault ? vault.scrub(rawInner) : { count: 0, text: rawInner }
+        if (rawScrub.count > 0) {
+          vaultRedactions += rawScrub.count
+          navUrl = 'blob:[REDACTED]'
+        } else {
+          const inner = URL.parse(rawInner)
+          if (!inner) {
+            navUrl = 'blob:[REDACTED]'
+          } else if (inner.origin === 'null') {
+            navUrl = 'blob:null'
+          } else {
+            const originScrub = vault ? vault.scrub(inner.origin) : { count: 0, text: inner.origin }
+            if (originScrub.count > 0) {
+              vaultRedactions += originScrub.count
+              navUrl = 'blob:[REDACTED]'
+            } else {
+              // Require canonical scheme://[userinfo@]host[:port] matching inner.hostname; fail closed on weird spellings (e.g. http:\host)
+              const canon = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]+)/i.exec(rawInner)
+              let hostMatches = false
+              if (canon) {
+                const auth = canon[1]
+                const at = auth.lastIndexOf('@')
+                const hostPort = at >= 0 ? auth.slice(at + 1) : auth
+                const rawHost = hostPort.startsWith('[')
+                  ? hostPort.slice(0, hostPort.indexOf(']') + 1)
+                  : hostPort.split(':')[0]
+                hostMatches = rawHost.length > 0 && rawHost.toLowerCase() === inner.hostname.toLowerCase()
+              }
+              navUrl = hostMatches ? `blob:${inner.origin}` : 'blob:[REDACTED]'
+            }
           }
         }
-        navUrl = origin ? `blob:${origin}/[REDACTED]` : 'blob:[REDACTED]'
       } else if (/^https?:/i.test(schemeProbe)) {
         navUrl = scrubUrlField(strippedUrl)
       } else {

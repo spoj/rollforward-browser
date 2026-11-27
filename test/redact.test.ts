@@ -263,6 +263,8 @@ test('P1-5 valueless query params and query key names are templated/redacted in 
   assert.deepEqual(tokenizeKey('APIKey'), ['api', 'key'])
   assert.deepEqual(tokenizeKey('userID'), ['user', 'id'])
   assert.deepEqual(tokenizeKey('oauth2Token'), ['oauth2', 'token'])
+  assert.deepEqual(tokenizeKey('\u212Aey'), ['key'])
+  assert.equal(isSensitiveKey('\u212Aey'), true)
   const t0 = performance.now()
   assert.deepEqual(tokenizeKey('A'.repeat(65_536)), ['a'.repeat(65_536)])
   assert.ok(performance.now() - t0 < 20, 'tokenizeKey must stay linear on 64 KiB uppercase run')

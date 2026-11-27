@@ -423,39 +423,59 @@ const isAsciiLower = (c: number) => c >= 97 && c <= 122
 const isAsciiDigit = (c: number) => c >= 48 && c <= 57
 const isAsciiAlnum = (c: number) => isAsciiUpper(c) || isAsciiLower(c) || isAsciiDigit(c)
 
-// Single-pass O(N) identifier tokenizer (handles camelCase, PascalCase, acronyms like XMLHttpRequest/APIKey/userID, delimiters).
+// Single-pass O(N) identifier tokenizer (ASCII camelCase/acronym boundaries + Unicode case folding, e.g. U+212A -> 'k').
 export function tokenizeKey(key: string): string[] {
   const tokens: string[] = []
   const len = key.length
-  let tokStart = -1
+  let cur = ''
+  let asciiStart = -1
+  const flushAscii = (end: number) => {
+    if (asciiStart >= 0) {
+      cur += key.slice(asciiStart, end).toLowerCase()
+      asciiStart = -1
+    }
+  }
+  const flushToken = (end: number) => {
+    flushAscii(end)
+    if (cur.length > 0) {
+      tokens.push(cur)
+      cur = ''
+    }
+  }
+
   for (let i = 0; i < len; i++) {
     const c = key.charCodeAt(i)
-    if (!isAsciiAlnum(c)) {
-      if (tokStart >= 0) {
-        tokens.push(key.slice(tokStart, i).toLowerCase())
-        tokStart = -1
+    if (c < 0x80) {
+      if (!isAsciiAlnum(c)) {
+        flushToken(i)
+        continue
       }
-      continue
-    }
-    if (tokStart < 0) {
-      tokStart = i
-      continue
-    }
-    if (isAsciiUpper(c)) {
-      const prev = key.charCodeAt(i - 1)
-      if (
-        isAsciiLower(prev) ||
-        isAsciiDigit(prev) ||
-        (isAsciiUpper(prev) && i + 1 < len && isAsciiLower(key.charCodeAt(i + 1)))
-      ) {
-        tokens.push(key.slice(tokStart, i).toLowerCase())
-        tokStart = i
+      if (isAsciiUpper(c) && (asciiStart >= 0 || cur.length > 0) && i > 0) {
+        const prev = key.charCodeAt(i - 1)
+        if (
+          isAsciiLower(prev) ||
+          isAsciiDigit(prev) ||
+          (isAsciiUpper(prev) && i + 1 < len && isAsciiLower(key.charCodeAt(i + 1)))
+        ) {
+          flushToken(i)
+        }
+      }
+      if (asciiStart < 0) asciiStart = i
+    } else {
+      flushAscii(i)
+      const folded = key[i].toLowerCase()
+      for (let j = 0; j < folded.length; j++) {
+        const fc = folded.charCodeAt(j)
+        if (isAsciiLower(fc) || isAsciiDigit(fc)) {
+          cur += folded[j]
+        } else if (cur.length > 0) {
+          tokens.push(cur)
+          cur = ''
+        }
       }
     }
   }
-  if (tokStart >= 0) {
-    tokens.push(key.slice(tokStart).toLowerCase())
-  }
+  flushToken(len)
   return tokens
 }
 
