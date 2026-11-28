@@ -339,7 +339,7 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
       : tapDriveVault
         ? (s.cdpTap
             ? s.cdpTap.attachConnection({ live: true, driveVault: true, onError: onTapError })
-            : createDriveVaultTap(s.vault, undefined, onTapError))
+            : createDriveVaultTap(s.vault, onTapError))
         : undefined
     if (tap && head.length) {
       tap.feed(head)
