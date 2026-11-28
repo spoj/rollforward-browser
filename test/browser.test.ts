@@ -494,19 +494,20 @@ test('audit: true captures best-effort JPEGs on new tabs/navigations/writes, ski
     let got: any[] = []
     for (let i = 0; i < 20 && !got.length; i++) {
       await new Promise(r => setTimeout(r, 250))
-      got = (await api('GET', `${shots}?after=0`)).body
+      got = (await api('GET', `${shots}?after=0`)).body.items
     }
     assert.ok(got.length >= 1, 'captured at least one audit JPEG from the session')
     assert.ok(got.every(s => !s.url.endsWith('/login')), 'never captured the /login password page')
     assert.ok(Buffer.from(got[0].jpeg, 'base64').subarray(0, 2).equals(Buffer.from([0xff, 0xd8])), 'valid JPEG header')
     const lastSeq = got.at(-1).seq
-    assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body, [], 'cursor after= returns only newer shots')
+    assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body.items, [], 'cursor after= returns only newer shots')
+    assert.equal(await tab.evaluate(() => '__rfPwEpoch' in window), false, 'isolated-world password check injects no main-world globals')
 
     // Password page must not be captured (fail closed)
     await tab.setContent('<form><input type="password" value="secret" style="width:100px;height:20px"></form>')
     await tab.evaluate(() => fetch('/update', { method: 'POST', body: 'p=1' }))
     await new Promise(r => setTimeout(r, 3200))
-    assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body, [], 'visible password field skipped')
+    assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body.items, [], 'visible password field skipped')
 
     // Driving over view/drive must not be captured
     const driver = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${view}/drive`, { headers })
@@ -514,7 +515,7 @@ test('audit: true captures best-effort JPEGs on new tabs/navigations/writes, ski
       await tab.setContent('<h1>Driver typing</h1>')
       await tab.evaluate(() => fetch('/update', { method: 'POST', body: 'd=1' }))
       await new Promise(r => setTimeout(r, 3200))
-      assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body, [], 'active driver skipped')
+      assert.deepEqual((await api('GET', `${shots}?after=${lastSeq}`)).body.items, [], 'active driver skipped')
     } finally {
       await driver.close()
     }

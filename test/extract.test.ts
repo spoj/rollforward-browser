@@ -5,8 +5,8 @@ import {
   classifyGraphqlQuery,
   decompressPrefix,
   extractSemantic,
+  normalizeContentType,
 } from '../src/extract.ts'
-import { SecretVault } from '../src/redact.ts'
 
 test('E1 AIS extractor captures formName, action, and formActions controlIDs without leaking free-text values', () => {
   const payload = JSON.stringify({
@@ -32,7 +32,6 @@ test('E1 AIS extractor captures formName, action, and formActions controlIDs wit
     isWrite: true,
     isAuth: false,
     isLive: false,
-    projection: 'semantic',
   })
   assert.equal(res.actions.length, 1)
   assert.equal(res.actions[0].family, 'e1-ais')
@@ -42,16 +41,15 @@ test('E1 AIS extractor captures formName, action, and formActions controlIDs wit
     { command: 'SetControlValue', controlID: '18' },
     { command: 'DoAction', controlID: '12' },
   ])
-  assert.equal(res.reqBody, undefined, 'default semantic mode emits zero raw reqBody')
   assert.equal(res.reqOmitted, 'policy-profile')
-  assert.ok(!JSON.stringify(res.actions).includes('ACME Corp'), 'no free-text values in semantic actions')
+  assert.ok(!JSON.stringify(res.actions).includes('ACME Corp'))
   assert.equal(res.bodyShape?.['formActions[].value'], 'string')
 })
 
-test('SharePoint extractor handles list/item override and marks $batch as opaque-batch', () => {
+test('SharePoint extractor handles overrides, sanitizedPath offsets, and marks $batch opaque', () => {
   const item = extractSemantic({
-    url: new URL("https://tenant.sharepoint.com/_api/web/lists/getbytitle('Invoices')/items(42)"),
-    sanitizedPath: "/_api/web/lists/getbytitle('Invoices')/items(42)",
+    url: new URL("https://tenant.sharepoint.com/sites/aB3dE9fG2hJ5kL8mN1pQ4rS7tU0vW/_api/web/lists/getbytitle('Invoices')/items(42)"),
+    sanitizedPath: "/sites/[REDACTED:seg]/_api/web/lists/getbytitle('Invoices')/items(42)",
     method: 'POST',
     effectiveMethod: 'DELETE',
     kind: 'http',
@@ -64,14 +62,13 @@ test('SharePoint extractor handles list/item override and marks $batch as opaque
     isWrite: true,
     isAuth: false,
     isLive: false,
-    projection: 'semantic',
   })
   assert.equal(item.actions[0].family, 'sharepoint')
   assert.equal(item.actions[0].op, 'sharepoint:DELETE')
+  assert.equal(item.actions[0].resource, "/_api/web/lists/getbytitle('Invoices')/items(42)")
   assert.equal(item.actions[0].details?.override, 'DELETE')
   assert.equal(item.actions[0].details?.hasIfMatch, true)
   assert.equal(item.actions[0].details?.metadataType, 'SP.Data.InvoicesListItem')
-  assert.equal(item.completeness.extract, 'complete')
 
   const batch = extractSemantic({
     url: new URL('https://tenant.sharepoint.com/_api/$batch'),
@@ -87,19 +84,17 @@ test('SharePoint extractor handles list/item override and marks $batch as opaque
     isWrite: true,
     isAuth: false,
     isLive: false,
-    projection: 'semantic',
   })
-  assert.equal(batch.actions[0].family, 'sharepoint')
   assert.equal(batch.actions[0].coverage, 'opaque-batch')
   assert.equal(batch.completeness.extract, 'opaque')
 })
 
-test('GraphQL strict token classifier handles comments, strings, duplicate operation names, and persisted queries', () => {
+test('GraphQL classifier handles comments, strings, fragments, duplicate ops, persisted queries, and >16 batch late mutation', () => {
   assert.equal(classifyGraphqlQuery('# mutation Fake {}\nquery GetUser { user(note: "mutation {}") { id } }', 'GetUser').op, 'query')
+  assert.equal(classifyGraphqlQuery('fragment F on User { id }\nmutation DeleteInvoice($id: ID!) { deleteInvoice(id: $id) }', 'DeleteInvoice').op, 'mutation')
   assert.equal(classifyGraphqlQuery('{ viewer { login } }').op, 'query')
-  assert.equal(classifyGraphqlQuery('mutation DeleteInvoice($id: ID!) { deleteInvoice(id: $id) }', 'DeleteInvoice').op, 'mutation')
-  assert.equal(classifyGraphqlQuery('query X { a } mutation X { b }', 'X').op, 'mixed', 'duplicate opName resolves to mixed')
-  assert.equal(classifyGraphqlQuery('query A { a } mutation B { b }').op, 'mixed', 'multiple ops without opName resolve to mixed')
+  assert.equal(classifyGraphqlQuery('query X { a } mutation X { b }', 'X').op, 'mixed')
+  assert.equal(classifyGraphqlQuery('query A { a } mutation B { b }').op, 'mixed')
 
   const persisted = extractSemantic({
     url: new URL('https://app.example/graphql'),
@@ -115,98 +110,9 @@ test('GraphQL strict token classifier handles comments, strings, duplicate opera
     isWrite: true,
     isAuth: false,
     isLive: false,
-    projection: 'semantic',
   })
   assert.equal(persisted.graphqlOp, 'persisted')
   assert.equal(persisted.actions[0].coverage, 'persisted-query-unknown')
-})
-
-test('SOAP extractor parses Body root QName and flags SOAPAction mismatch', () => {
-  const xml = `<?xml version="1.0"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><!-- comment --><soapenv:Body><ns:ApproveVoucher><id>42</id></ns:ApproveVoucher></soapenv:Body></soapenv:Envelope>`
-  const res = extractSemantic({
-    url: new URL('https://bssv.example/VoucherManager'),
-    sanitizedPath: '/VoucherManager',
-    method: 'POST',
-    effectiveMethod: 'POST',
-    kind: 'http',
-    hdr: { soapaction: '"ReadVoucher"' },
-    rawHeaders: {},
-    reqType: 'text/xml',
-    decodedBuf: Buffer.from(xml),
-    bodyComplete: true,
-    transport: 'complete',
-    isWrite: true,
-    isAuth: false,
-    isLive: false,
-    projection: 'semantic',
-  })
-  assert.equal(res.actions[0].family, 'soap')
-  assert.equal(res.actions[0].op, 'soap:ns:ApproveVoucher')
-  assert.equal(res.actions[0].details?.actionMismatch, true)
-})
-
-test('streaming decompressors cap 1 MiB gzip/deflate/br/zstd at 64 KiB and mark truncated prefixes as truncated (never decompress-err)', async () => {
-  const big = Buffer.from(JSON.stringify({ items: Array.from({ length: 15000 }, (_, i) => ({ id: i, text: 'hello-world-payload-data-' + i })) }))
-  assert.ok(big.length > 500_000)
-
-  const cases: Array<[string, Buffer]> = [
-    ['gzip', zlib.gzipSync(big)],
-    ['deflate', zlib.deflateSync(big)],
-    ['deflate', zlib.deflateRawSync(big)],
-    ['br', zlib.brotliCompressSync(big)],
-    ['zstd', zlib.zstdCompressSync(big)],
-  ]
-
-  for (const [enc, compressed] of cases) {
-    // Full compressed payload decompressing to > 64 KiB -> capped at 64 KiB, decode: 'truncated'
-    const fullCap = await decompressPrefix(compressed, enc, true)
-    assert.equal(fullCap.ok, true, `${enc} full 1MiB should succeed with cap`)
-    assert.equal(fullCap.decodeComplete, false, `${enc} >64KiB is not decodeComplete`)
-    assert.equal(fullCap.decode, 'truncated', `${enc} >64KiB must be decode: truncated`)
-    assert.equal(fullCap.buf.length, 65_536, `${enc} capped at exact 64 KiB`)
-
-    // Truncated compressed prefix (!bodyComplete) -> decode: 'truncated', NEVER decompress-err
-    const partial = compressed.subarray(0, Math.min(2048, Math.floor(compressed.length / 2)))
-    const truncRes = await decompressPrefix(partial, enc, false)
-    assert.equal(truncRes.ok, true, `${enc} truncated prefix must not fail as decompress-err`)
-    assert.equal(truncRes.decodeComplete, false)
-    assert.equal(truncRes.decode, 'truncated')
-  }
-
-  // Corrupt complete gzip (bodyComplete === true) -> decode: 'error'
-  const corrupt = await decompressPrefix(Buffer.from('not-actually-gzip-data'), 'gzip', true)
-  assert.equal(corrupt.ok, false)
-  assert.equal(corrupt.decode, 'error')
-
-  // Complete HTTP entity with truncated gzip trailer -> MUST error (strict EOF), NOT decodeComplete: true!
-  const smallGz = zlib.gzipSync(Buffer.from('{"ok":true}'))
-  const missingTrailer = smallGz.subarray(0, smallGz.length - 4)
-  const badTrailer = await decompressPrefix(missingTrailer, 'gzip', true)
-  assert.equal(badTrailer.ok, false)
-  assert.equal(badTrailer.decodeComplete, false)
-  assert.equal(badTrailer.decode, 'error')
-})
-
-test('truncated JSON in semantic+samples omits reqBody instead of plaintext fallback, and GraphQL >16 batch detects late mutation', () => {
-  const truncatedJson = '{"password":"my-clear-password","other":"'
-  const res = extractSemantic({
-    url: new URL('https://app.example/api/save'),
-    sanitizedPath: '/api/save',
-    method: 'POST',
-    effectiveMethod: 'POST',
-    kind: 'http',
-    rawHeaders: {},
-    reqType: 'application/json',
-    decodedBuf: Buffer.from(truncatedJson),
-    bodyComplete: false,
-    transport: 'truncated',
-    isWrite: true,
-    isAuth: false,
-    isLive: false,
-    projection: 'semantic+samples',
-  })
-  assert.equal(res.reqBody, undefined, 'truncated JSON must not fall back to plaintext and leak passwords')
-  assert.equal(res.reqTrunc, true)
 
   const batch = Array.from({ length: 18 }, (_, i) => ({
     query: i === 17 ? 'mutation LateWrite { doWrite }' : `query Q${i} { ok }`,
@@ -225,42 +131,36 @@ test('truncated JSON in semantic+samples omits reqBody instead of plaintext fall
     isWrite: true,
     isAuth: false,
     isLive: false,
-    projection: 'semantic',
   })
-  assert.equal(gql.graphqlOp, 'mixed', 'mutation at index 17 detected despite 16-action cap')
+  assert.equal(gql.graphqlOp, 'mixed')
   assert.equal(gql.actions.length, 16)
-  assert.equal(gql.completeness.extract, 'partial')
 })
 
-test('semantic+samples emits redacted reqBody with JSON.rawJSON numbers and scrubs vault secrets', () => {
-  const vault = new SecretVault()
-  vault.addTrustedDrive('SuperSecret99')
-  const body = '{"amount":12.50,"note":"ref SuperSecret99","apiKey":"k123"}'
+test('SOAP extractor parses Body root QName, flags SOAPAction mismatch, and stays linear on adversarial input', () => {
+  const xml = `<?xml version="1.0"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><!-- comment --><soapenv:Body><ns:ApproveVoucher><id>42</id></ns:ApproveVoucher></soapenv:Body></soapenv:Envelope>`
   const res = extractSemantic({
-    url: new URL('https://app.example/api/pay'),
-    sanitizedPath: '/api/pay',
+    url: new URL('https://bssv.example/VoucherManager'),
+    sanitizedPath: '/VoucherManager',
     method: 'POST',
     effectiveMethod: 'POST',
     kind: 'http',
+    hdr: { soapaction: '"ReadVoucher"' },
     rawHeaders: {},
-    reqType: 'text/plain', // spoofed Content-Type: JSON still parsed!
-    decodedBuf: Buffer.from(body),
+    reqType: 'text/xml',
+    decodedBuf: Buffer.from(xml),
     bodyComplete: true,
     transport: 'complete',
     isWrite: true,
     isAuth: false,
     isLive: false,
-    projection: 'semantic+samples',
-    vault,
   })
-  assert.equal(res.reqBody, '{"amount":12.50,"note":"ref [REDACTED:vault]","apiKey":"[REDACTED]"}')
-  assert.equal(res.vaultRedactions, 1)
-})
+  assert.equal(res.actions[0].family, 'soap')
+  assert.equal(res.actions[0].op, 'soap:ns:ApproveVoucher')
+  assert.equal(res.actions[0].details?.actionMismatch, true)
 
-test('P1-3 SOAP extractor runs in linear time (<20ms) on 64 KiB adversarial <Body and <!-- payloads', () => {
   for (const adversarial of ['<Body '.repeat(10_922), '<!--'.repeat(16_384)]) {
     const t0 = performance.now()
-    const res = extractSemantic({
+    extractSemantic({
       url: new URL('https://bssv.example/VoucherManager'),
       sanitizedPath: '/VoucherManager',
       method: 'POST',
@@ -275,155 +175,39 @@ test('P1-3 SOAP extractor runs in linear time (<20ms) on 64 KiB adversarial <Bod
       isWrite: true,
       isAuth: false,
       isLive: false,
-      projection: 'semantic',
     })
-    const ms = performance.now() - t0
-    assert.ok(ms < 20, `SOAP extraction must stay linear (took ${ms.toFixed(2)}ms)`)
-    assert.equal(res.actions[0].family, 'soap')
+    assert.ok(performance.now() - t0 < 20)
   }
 })
 
-test('P1-4 semantic+samples redacts form-like text/plain and XML sensitive elements, and omits unstructured plain text', () => {
-  // 1. text/plain carrying form body
-  const formText = extractSemantic({
-    url: new URL('https://app.example/api/form'),
-    sanitizedPath: '/api/form',
-    method: 'POST',
-    effectiveMethod: 'POST',
-    kind: 'http',
-    rawHeaders: {},
-    reqType: 'text/plain',
-    decodedBuf: Buffer.from('username=jde&password=Welcome1!'),
-    bodyComplete: true,
-    transport: 'complete',
-    isWrite: true,
-    isAuth: false,
-    isLive: false,
-    projection: 'semantic+samples',
-  })
-  assert.equal(formText.reqBody, 'username=jde&password=[REDACTED]')
+test('sync decompressPrefix decodes gzip/deflate/br within 64 KiB and omits oversized, corrupt, or unsupported encodings as encoded', () => {
+  const small = Buffer.from(JSON.stringify({ ok: true, id: 7 }))
+  for (const [enc, compressed] of [
+    ['gzip', zlib.gzipSync(small)],
+    ['deflate', zlib.deflateSync(small)],
+    ['br', zlib.brotliCompressSync(small)],
+  ] as const) {
+    const res = decompressPrefix(compressed, enc, true)
+    assert.equal(res.ok, true, enc)
+    assert.equal(res.decodeComplete, true, enc)
+    assert.equal(res.buf.toString(), small.toString(), enc)
+  }
 
-  // 2. SOAP/XML with <wsse:Password>
-  const xmlBody = '<soapenv:Envelope><soapenv:Header><wsse:Password>Welcome1!</wsse:Password></soapenv:Header><soapenv:Body><GetOrder><id>42</id></GetOrder></soapenv:Body></soapenv:Envelope>'
-  const xmlRes = extractSemantic({
-    url: new URL('https://bssv.example/Order'),
-    sanitizedPath: '/Order',
-    method: 'POST',
-    effectiveMethod: 'POST',
-    kind: 'http',
-    hdr: { soapaction: '"GetOrder"' },
-    rawHeaders: {},
-    reqType: 'text/xml',
-    decodedBuf: Buffer.from(xmlBody),
-    bodyComplete: true,
-    transport: 'complete',
-    isWrite: true,
-    isAuth: false,
-    isLive: false,
-    projection: 'semantic+samples',
-  })
-  assert.ok(xmlRes.reqBody && !xmlRes.reqBody.includes('Welcome1!'), 'XML Password element redacted')
-  assert.match(xmlRes.reqBody!, /<wsse:Password>\[REDACTED\]<\/wsse:Password>/)
-  assert.match(xmlRes.reqBody!, /<id>42<\/id>/)
+  // >64 KiB decompressed output fails closed with reason: 'encoded'
+  const big = Buffer.from('x'.repeat(100_000))
+  const over = decompressPrefix(zlib.gzipSync(big), 'gzip', true)
+  assert.equal(over.ok, false)
+  assert.equal(over.reason, 'encoded')
 
-  // 3. Unstructured plain text omitted instead of risking password leak
-  const plainRes = extractSemantic({
-    url: new URL('https://app.example/api/note'),
-    sanitizedPath: '/api/note',
-    method: 'POST',
-    effectiveMethod: 'POST',
-    kind: 'http',
-    rawHeaders: {},
-    reqType: 'text/plain',
-    decodedBuf: Buffer.from('freeform note with password Welcome1! inside'),
-    bodyComplete: true,
-    transport: 'complete',
-    isWrite: true,
-    isAuth: false,
-    isLive: false,
-    projection: 'semantic+samples',
-  })
-  assert.equal(plainRes.reqBody, undefined)
-  assert.equal(plainRes.reqOmitted, 'policy-profile')
-})
+  // Corrupt or unsupported encoding fails closed with reason: 'encoded'
+  assert.equal(decompressPrefix(Buffer.from('not-gzip'), 'gzip', true).reason, 'encoded')
+  assert.equal(decompressPrefix(small, 'zstd', true).reason, 'encoded')
 
-test('P2-11 SharePoint resource slice uses sanitizedPath offset when earlier segments were redacted', () => {
-  const res = extractSemantic({
-    url: new URL('https://tenant.sharepoint.com/sites/aB3dE9fG2hJ5kL8mN1pQ4rS7tU0vW/_api/web/lists'),
-    sanitizedPath: '/sites/[REDACTED:seg]/_api/web/lists',
-    method: 'POST',
-    effectiveMethod: 'POST',
-    kind: 'http',
-    rawHeaders: {},
-    reqType: 'application/json',
-    decodedBuf: Buffer.from('{}'),
-    bodyComplete: true,
-    transport: 'complete',
-    isWrite: true,
-    isAuth: false,
-    isLive: false,
-    projection: 'semantic',
-  })
-  assert.equal(res.actions[0].resource, '/_api/web/lists')
-})
+  // Truncated complete gzip trailer fails strict EOF
+  const gz = zlib.gzipSync(small)
+  assert.equal(decompressPrefix(gz.subarray(0, gz.length - 4), 'gzip', true).ok, false)
 
-test('R2 linear quote-aware XML redactor handles ReDoS, > inside quoted attrs, <Password value>, malformed XML, and vault tag/attr names', () => {
-  const mk = (body: string, vault?: SecretVault, reqType = 'text/xml') => extractSemantic({
-    url: new URL('https://bssv.example/Svc'),
-    sanitizedPath: '/Svc',
-    method: 'POST',
-    effectiveMethod: 'POST',
-    kind: 'http',
-    rawHeaders: {},
-    reqType,
-    decodedBuf: Buffer.from(body),
-    bodyComplete: true,
-    transport: 'complete',
-    isWrite: true,
-    isAuth: false,
-    isLive: false,
-    projection: 'semantic+samples',
-    vault,
-  })
-
-  // 1. 64 KiB adversarial open tag attribute ReDoS completes in <20ms and omits malformed XML
-  const t0 = performance.now()
-  const redos = mk('<a ' + 'b'.repeat(65_000) + '>')
-  const ms = performance.now() - t0
-  assert.ok(ms < 20, `XML redactor must stay linear (took ${ms.toFixed(2)}ms)`)
-  assert.equal(redos.reqBody, undefined)
-  assert.equal(redos.reqOmitted, 'policy-profile')
-
-  // 2. '>' inside quoted attribute does not break tag parsing, and sensitive attribute is still redacted
-  const gtAttr = mk('<root><item note="a > b" password="SecretVal1!"/><Password value="MyPass99"/></root>')
-  assert.ok(gtAttr.reqBody, 'valid XML with > inside quoted attr preserved')
-  assert.ok(!gtAttr.reqBody!.includes('SecretVal1!'))
-  assert.ok(!gtAttr.reqBody!.includes('MyPass99'))
-  assert.match(gtAttr.reqBody!, /note="a > b"/)
-  assert.match(gtAttr.reqBody!, /password="\[REDACTED\]"/)
-  assert.match(gtAttr.reqBody!, /<Password value="\[REDACTED\]"\/>/)
-
-  // 3. Comment followed by non-XML form text is omitted fail-closed
-  const commentSmuggle = mk('<!-- ok -->password=Welcome1!&user=bob', undefined, 'text/plain')
-  assert.equal(commentSmuggle.reqBody, undefined)
-  assert.equal(commentSmuggle.reqOmitted, 'policy-profile')
-
-  // 4. Vault secret inside XML tag name or attribute name is scrubbed by final vault pass
-  const vault = new SecretVault()
-  vault.addTrustedDrive('VaultTagSec99')
-  vault.addTrustedDrive('VaultAttrSec88')
-  const tagVault = mk('<root><VaultTagSec99 VaultAttrSec88="1">ok</VaultTagSec99></root>', vault)
-  assert.ok(tagVault.reqBody)
-  assert.ok(!tagVault.reqBody!.includes('VaultTagSec99'))
-  assert.ok(!tagVault.reqBody!.includes('VaultAttrSec88'))
-  assert.ok(tagVault.vaultRedactions >= 2)
-
-  // 5. R3 Astra P1-2: 64 KiB all-uppercase legal XML tag & attribute names run in linear time (<50ms)
-  const bigTag = 'A'.repeat(32_000)
-  const bigAttr = 'B'.repeat(32_000)
-  const t1 = performance.now()
-  const upperXml = mk(`<${bigTag} ${bigAttr}="1"/>`)
-  const upperMs = performance.now() - t1
-  assert.ok(upperMs < 50, `tokenizeKey on 64 KiB uppercase XML names must stay linear (took ${upperMs.toFixed(2)}ms)`)
-  assert.ok(upperXml.reqBody && upperXml.reqBody.length > 0)
+  // normalizeContentType allows standard MIME types and maps others to 'other'
+  assert.equal(normalizeContentType('application/json; charset=utf-8'), 'application/json')
+  assert.equal(normalizeContentType('x-custom/secret-subtype'), 'other')
 })

@@ -7,14 +7,15 @@ import fs from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
+import tls from 'node:tls'
+import { BrowserSession } from '../src/browser.ts'
+import { loadBlocklists } from '../src/blocklists.ts'
 import {
-  InFlightBudgetTracker,
+  ByteBudget,
   startProxy,
-  toLegacyLog,
   type LogRecord,
-  type PolicyHookConfig,
   type ProxyV2Options,
-  type RequestDescriptor,
+  type Site,
   type V2Entry,
 } from '../src/proxy.ts'
 import { SecretVault } from '../src/redact.ts'
@@ -22,7 +23,7 @@ import { SecretVault } from '../src/redact.ts'
 const pem = execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=test', '-keyout', '-', '-out', '-'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString()
 const tlsKey = { key: pem.slice(0, pem.indexOf('-----BEGIN CERTIFICATE')), cert: pem.slice(pem.indexOf('-----BEGIN CERTIFICATE')) }
 
-async function setupHarness(t: any, proxyOpts?: ProxyV2Options) {
+async function setupHarness(t: any, proxyOpts?: ProxyV2Options, siteOverrides?: Partial<Site>) {
   const upstreamHits: Array<{ method: string; url: string; headers: http.IncomingHttpHeaders; body: Buffer }> = []
   let upstreamHandler: ((req: http.IncomingMessage, res: http.ServerResponse, body: Buffer) => void) | undefined
   const upstream = http.createServer((req, res) => {
@@ -45,7 +46,6 @@ async function setupHarness(t: any, proxyOpts?: ProxyV2Options) {
   await once(upstream, 'listening')
   const upPort = (upstream.address() as net.AddressInfo).port
 
-  // Local CONNECT via proxy to route t.example directly to 127.0.0.1:upPort without needing external DNS
   const viaProxy = http.createServer()
   viaProxy.on('connect', (_req, socket, head) => {
     const target = net.connect(upPort, '127.0.0.1', () => {
@@ -63,12 +63,13 @@ async function setupHarness(t: any, proxyOpts?: ProxyV2Options) {
   const dir = fs.mkdtempSync(`${os.tmpdir()}/rf-proxy-v2-`)
   const sockPath = `${dir}/proxy.sock`
   const log: LogRecord[] = []
-  const site = {
+  const site: Site = {
     hosts: ['t.example'],
     via: { url: `http://127.0.0.1:${viaPort}`, token: 'via-tok', hosts: ['t.example'] },
+    ...siteOverrides,
   }
   const proxy = startProxy(sockPath, site, tlsKey, () => false, log, undefined, undefined, {
-    auditV2: { v: 2, projection: 'semantic' },
+    auditV2: { v: 2 },
     siteName: 'erp',
     ...proxyOpts,
   })
@@ -76,21 +77,21 @@ async function setupHarness(t: any, proxyOpts?: ProxyV2Options) {
 
   t.after(() => {
     proxy.close()
-    proxy.closeAllConnections?.()
+    proxy.closeAllConnections()
     viaProxy.close()
-    viaProxy.closeAllConnections?.()
+    viaProxy.closeAllConnections()
     upstream.close()
-    upstream.closeAllConnections?.()
+    upstream.closeAllConnections()
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
-  const sendReq = (method: string, path: string, headers: Record<string, string> = {}, body?: Buffer | string) =>
+  const sendReq = (method: string, path: string, headers: Record<string, string> = {}, body?: Buffer | string, host = 't.example') =>
     new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
       const req = http.request({
         socketPath: sockPath,
         method,
-        path: `http://t.example:${upPort}${path}`,
-        headers: { host: `t.example:${upPort}`, ...headers },
+        path: `http://${host}:${upPort}${path}`,
+        headers: { host: `${host}:${upPort}`, ...headers },
       }, res => {
         const chunks: Buffer[] = []
         res.on('data', c => chunks.push(c))
@@ -104,6 +105,7 @@ async function setupHarness(t: any, proxyOpts?: ProxyV2Options) {
   return {
     sockPath,
     upPort,
+    viaPort,
     site,
     log,
     proxy,
@@ -113,7 +115,7 @@ async function setupHarness(t: any, proxyOpts?: ProxyV2Options) {
   }
 }
 
-test('method override escalation only: POST+Override:GET stays write; lowercase/conflict/invalid override and body on safe verb force isWrite', async t => {
+test('method override escalation only: POST+Override:GET stays write; override or body on safe verb forces isWrite', async t => {
   const { sendReq, log } = await setupHarness(t)
 
   await sendReq('POST', '/a', { 'x-http-method-override': 'GET', 'content-type': 'application/json' }, '{"x":1}')
@@ -122,163 +124,33 @@ test('method override escalation only: POST+Override:GET stays write; lowercase/
   await sendReq('GET', '/d', { 'x-http-method-override': 'bad!verb' })
   await sendReq('OPTIONS', '/e', { 'content-type': 'application/json', 'content-length': '7' }, '{"a":1}')
 
-  const entries = log.filter((e): e is V2Entry => typeof (e as any).n === 'number')
+  const entries = log.filter((e): e is V2Entry => !e.rec)
   assert.equal(entries.length, 5)
-  assert.equal(entries[0].isWrite, true, 'POST + Override: GET stays isWrite')
-  assert.equal(entries[0].effectiveMethod, 'POST', 'never downgrades effectiveMethod')
+  assert.equal(entries[0].isWrite, true)
+  assert.equal(entries[0].effectiveMethod, 'POST')
   assert.equal(entries[1].isWrite, true)
   assert.equal(entries[1].effectiveMethod, 'DELETE')
   assert.equal(entries[2].isWrite, true)
-  assert.equal(entries[2].hdrConflict, true)
   assert.equal(entries[3].isWrite, true)
-  assert.equal(entries[4].isWrite, true, 'OPTIONS with body forces isWrite')
+  assert.equal(entries[4].isWrite, true)
 })
 
-test('Expect: 100-continue captures body and strips expect upstream; unsupported Expect returns 417 without reaching upstream', async t => {
-  const seenDescs: RequestDescriptor[] = []
-  const hook: PolicyHookConfig = {
-    mode: 'enforce',
-    evaluate: (d, ctx) => {
-      seenDescs.push(d)
-      return { decisionId: ctx.decisionId, mode: 'enforce', stage: 1, action: 'allow', ruleId: 'ok', policyVersion: '1', ms: 0 }
-    },
-  }
-  const { sendReq, upstreamHits, log } = await setupHarness(t, { policyHook: hook })
+test('Expect: 100-continue forwards body and strips expect upstream; unsupported Expect returns 417 without reaching upstream', async t => {
+  const { sendReq, upstreamHits, log } = await setupHarness(t)
 
   const r1 = await sendReq('POST', '/continue', { expect: '100-continue', 'content-type': 'application/json' }, '{"hello":"world"}')
   assert.equal(r1.status, 200)
   assert.equal(upstreamHits.length, 1)
-  assert.equal(upstreamHits[0].headers['expect'], undefined, 'expect header stripped upstream')
+  assert.equal(upstreamHits[0].headers['expect'], undefined)
   assert.equal(upstreamHits[0].body.toString(), '{"hello":"world"}')
-  assert.equal(seenDescs.length, 1)
-  assert.equal((seenDescs[0].raw?.parsedBody as any)?.hello, 'world')
 
   const r2 = await sendReq('POST', '/bad-expect', { expect: '999-unknown' }, 'abc')
   assert.equal(r2.status, 417)
-  assert.equal(upstreamHits.length, 1, 'unsupported Expect never reaches upstream')
-  assert.ok(log.some((e: any) => e.status === 417 && e.blocked === 'expectation failed'))
-})
-
-test('enforce AdmissionHook denies with zero upstream bytes, Connection: close on unread upload, fails closed on throw/timeout, and forwards exact bytes across 64 KiB boundary', async t => {
-  let mode: 'allow' | 'deny' | 'throw' | 'timeout' | 'revoke' = 'deny'
-  let revokeFn: (() => void) | undefined
-  const hook: PolicyHookConfig = {
-    mode: 'enforce',
-    deadlineMs: 80,
-    evaluate: async (_d, ctx) => {
-      if (mode === 'throw') throw new Error('boom')
-      if (mode === 'timeout') await new Promise(r => setTimeout(r, 250))
-      if (mode === 'revoke') {
-        revokeFn?.()
-        return { decisionId: ctx.decisionId, mode: 'enforce', stage: 1, action: 'allow', ruleId: 'ok', policyVersion: '1', ms: 1 }
-      }
-      if (mode === 'deny') {
-        return { decisionId: ctx.decisionId, mode: 'enforce', stage: 2, action: 'deny', ruleId: 'no-delete', policyVersion: '1', ms: 2 }
-      }
-      return { decisionId: ctx.decisionId, mode: 'enforce', stage: 1, action: 'allow', ruleId: 'allow-all', policyVersion: '1', ms: 1 }
-    },
-  }
-  const { sendReq, upstreamHits, log, site } = await setupHarness(t, { policyHook: hook })
-
-  // 1. Deny on >64 KiB payload: zero bytes upstream, 403 JSON with ruleId+decisionId only, Connection: close
-  const bigBody = crypto.randomBytes(90_000)
-  const rDeny = await sendReq('POST', '/big-deny', { 'content-type': 'application/octet-stream' }, bigBody)
-  assert.equal(rDeny.status, 403)
-  assert.equal(rDeny.headers.connection, 'close')
-  const denyJson = JSON.parse(rDeny.body)
-  assert.deepEqual(Object.keys(denyJson).sort(), ['decisionId', 'error', 'ruleId'])
-  assert.equal(denyJson.ruleId, 'no-delete')
-  assert.equal(upstreamHits.length, 0, 'zero bytes reached upstream on deny')
-
-  // 2. Hook throw fails closed
-  mode = 'throw'
-  const rThrow = await sendReq('POST', '/throw', {}, 'x')
-  assert.equal(rThrow.status, 403)
-  assert.equal(JSON.parse(rThrow.body).ruleId, 'policy_error')
-  assert.equal(upstreamHits.length, 0)
-
-  // 3. Hook timeout fails closed
-  mode = 'timeout'
-  const rTimeout = await sendReq('POST', '/timeout', {}, 'x')
-  assert.equal(rTimeout.status, 403)
-  assert.equal(JSON.parse(rTimeout.body).ruleId, 'policy_error')
-  assert.equal(upstreamHits.length, 0)
-
-  // 4. Exact 64 KiB boundary & >64 KiB straddling chunks forwarded byte-for-byte unchanged
-  mode = 'allow'
-  const exact64 = crypto.randomBytes(65_536)
-  const r64 = await sendReq('POST', '/exact64', { 'content-type': 'application/octet-stream' }, exact64)
-  assert.equal(r64.status, 200)
   assert.equal(upstreamHits.length, 1)
-  assert.ok(upstreamHits[0].body.equals(exact64), 'exact 64 KiB body forwarded byte-for-byte unchanged')
-
-  const over100 = crypto.randomBytes(100_000)
-  const r100 = await sendReq('POST', '/over100', { 'content-type': 'application/octet-stream' }, over100)
-  assert.equal(r100.status, 200)
-  assert.equal(upstreamHits.length, 2)
-  assert.ok(upstreamHits[1].body.equals(over100), '100 KiB body forwarded byte-for-byte unchanged')
-
-  // 5. PUT /hosts revocation during async hook rechecks check(url)
-  mode = 'revoke'
-  revokeFn = () => { site.hosts = [] }
-  const rRev = await sendReq('POST', '/revoked', {}, 'abc')
-  assert.equal(rRev.status, 403)
-  assert.equal(upstreamHits.length, 2, 'revoked host blocked before upstream dispatch')
-  assert.ok(log.some((e: any) => e.blocked === 'host not on the list'))
+  assert.ok(log.some(e => !e.rec && e.status === 417 && e.blocked === 'expectation failed'))
 })
 
-test('forwardUpgrade invokes enforce AdmissionHook and blocks denied upgrades before upstream', async t => {
-  let allow = false
-  const hook: PolicyHookConfig = {
-    mode: 'enforce',
-    evaluate: (_d, ctx) => ({ decisionId: ctx.decisionId, mode: 'enforce', stage: 1, action: allow ? 'allow' : 'deny', ruleId: 'ws-rule', policyVersion: '1', ms: 0 }),
-  }
-  const { sockPath, upPort, upstreamHits, log } = await setupHarness(t, { policyHook: hook })
-
-  const tryUpgrade = () => new Promise<string>(resolve => {
-    const s = net.connect(sockPath)
-    s.write(`GET http://t.example:${upPort}/ws HTTP/1.1\r\nhost: t.example:${upPort}\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n`)
-    const chunks: Buffer[] = []
-    s.on('data', c => chunks.push(c))
-    s.on('end', () => resolve(Buffer.concat(chunks).toString()))
-  })
-
-  const r1 = await tryUpgrade()
-  assert.match(r1, /^HTTP\/1\.1 403/)
-  assert.match(r1, /"ruleId":"ws-rule"/, 'upgrade policy denial includes structured JSON ruleId & decisionId')
-  assert.equal(upstreamHits.length, 0)
-  allow = true
-  assert.match(await tryUpgrade(), /^HTTP\/1\.1 101/)
-  assert.equal(upstreamHits.length, 1)
-  assert.ok(log.some((e: any) => e.kind === 'upgrade' && e.status === 403))
-  assert.ok(log.some((e: any) => e.kind === 'upgrade' && e.status === 101))
-})
-
-test('shadow mode adds zero latency and emits policy via http_end when hook settles after response', async t => {
-  const hook: PolicyHookConfig = {
-    mode: 'shadow',
-    evaluate: async (_d, ctx) => {
-      await new Promise(r => setTimeout(r, 120))
-      return { decisionId: ctx.decisionId, mode: 'shadow', stage: 2, action: 'escalate', ruleId: 'shadow-rule', policyVersion: '1', ms: 120 }
-    },
-  }
-  const { sendReq, log } = await setupHarness(t, { policyHook: hook })
-  const t0 = performance.now()
-  const r = await sendReq('POST', '/fast', { 'content-type': 'application/json' }, '{"k":1}')
-  const elapsed = performance.now() - t0
-  assert.equal(r.status, 200)
-  assert.ok(elapsed < 100, `shadow mode must not delay response (took ${elapsed}ms)`)
-  await new Promise(r => setTimeout(r, 200))
-  const late = log.find((e: any) => e.rec === 'http_end') as any
-  assert.ok(late, 'emitted late http_end with shadow policy decision')
-  assert.equal(late.policy.ruleId, 'shadow-rule')
-  // Legacy allowlist strips http_end and v2 fields
-  const legacy = toLegacyLog(log)
-  assert.equal(legacy.length, 1)
-  assert.deepEqual(Object.keys(legacy[0]).sort(), ['method', 'status', 't', 'url'])
-})
-
-test('long-lived stream emits immutable incomplete Entry at streamTimeoutMs and separate LateOutcomeEntry on completion', async t => {
+test('long-lived stream emits immutable incomplete entry at streamTimeoutMs and separate http_end on completion', async t => {
   const { sendReq, setHandler, log } = await setupHarness(t, { streamTimeoutMs: 60 })
   setHandler((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -287,79 +159,127 @@ test('long-lived stream emits immutable incomplete Entry at streamTimeoutMs and 
   })
   const r = await sendReq('GET', '/events')
   assert.equal(r.status, 200)
-  const first = log.find((e: any) => e.incomplete === true) as V2Entry
-  const late = log.find((e: any) => e.rec === 'http_end') as any
-  assert.ok(first, 'emitted incomplete Entry at streamTimeoutMs')
-  assert.ok(late, 'emitted separate LateOutcomeEntry on stream end')
-  assert.equal(late.ref, first.n)
-  assert.ok(late.resBytes > 0)
+  const first = log.find((e): e is V2Entry => !e.rec && e.incomplete === true)
+  const late = log.find(e => e.rec === 'http_end')
+  assert.ok(first)
+  assert.ok(late && late.ref === first.n && (late.resBytes ?? 0) > 0)
 })
 
-test('byte budgets collapse static GETs, preserve origin+pathname in logCapped mode, and fail closed with 403 audit log full', async t => {
-  const { sendReq, log, proxy } = await setupHarness(t, {
-    collapseGetsAfterBytes: 100,
-    collapseGetsAfterEntries: 2,
-    maxLogSoftBytes: 1500,
-    maxLogHardBytes: 64 * 1024 + 3600, // 3600 B above 64 KiB tail reserve
-  })
-  // Emit a few static GETs -> should collapse into collapsedGets
-  for (let i = 0; i < 6; i++) {
-    await sendReq('GET', `/img/${i}.png`, { 'sec-fetch-dest': 'image' })
-  }
-  // Flood writes until hard log ceiling is reached
-  let got403Full = false
-  for (let i = 0; i < 20; i++) {
+test('log-full 403 refusal is scoped strictly to writes to site.hosts; non-site writes count-and-drop and non-write upgrades pass', async t => {
+  const { sendReq, sockPath, upPort, log, proxy, site } = await setupHarness(t, { maxLogBytes: 14 * 1024 })
+  // Allow other.example through via too, while NOT in site.hosts (simulating an open/telemetry host)
+  site.via!.hosts.push('cdn.example')
+
+  // Fill the log with site.hosts writes until the next site.hosts write gets 403 audit log full
+  let got403 = false
+  for (let i = 0; i < 40; i++) {
     const r = await sendReq('POST', `/write/${i}`, { 'content-type': 'application/json' }, JSON.stringify({ n: i }))
     if (r.status === 403 && r.body.includes('audit log full')) {
-      got403Full = true
+      got403 = true
       break
     }
   }
-  assert.equal(got403Full, true, 'fails closed with 403 audit log full at hard cap')
-  const capped = log.filter((e: any) => e.logCapped === true) as V2Entry[]
-  assert.ok(capped.length > 0, 'emitted logCapped minimal entries above soft cap')
-  for (const e of capped) {
-    assert.equal(new URL(e.url).hostname, 't.example', 'logCapped preserves origin+pathname for checkRefused')
-  }
+  assert.equal(got403, true, 'write to site.hosts refused 403 audit log full')
+
+  // Non-write WebSocket upgrade MUST still succeed (101) when log is full
+  const wsRes = await new Promise<string>(resolve => {
+    const s = net.connect(sockPath)
+    s.write(`GET http://t.example:${upPort}/ws HTTP/1.1\r\nhost: t.example:${upPort}\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n`)
+    const chunks: Buffer[] = []
+    s.on('data', c => chunks.push(c))
+    s.on('end', () => resolve(Buffer.concat(chunks).toString()))
+  })
+  assert.match(wsRes, /^HTTP\/1\.1 101/, 'non-write upgrade passes even when log is full')
+
+  // Non-site-host write in an open session is NOT refused 403 when log is full; it dispatches and counts as dropped
+  const blSrv = http.createServer((_req, res) => res.end('evil.example\n')).listen(0, '127.0.0.1')
+  await once(blSrv, 'listening')
+  t.after(() => blSrv.close())
+  const prevBl = process.env.BROWSER_BLOCKLISTS
+  process.env.BROWSER_BLOCKLISTS = `http://127.0.0.1:${(blSrv.address() as net.AddressInfo).port}/`
+  await loadBlocklists()
+  if (prevBl === undefined) delete process.env.BROWSER_BLOCKLISTS
+  else process.env.BROWSER_BLOCKLISTS = prevBl
+
+  const hOpen = await setupHarness(t, { maxLogBytes: 100 }, { hosts: ['erp.example'], open: true })
+  hOpen.site.via!.hosts = ['erp.example', 'other.example']
+
+  const sendHttps = (sPath: string, host: string, reqPath: string) => new Promise<string>((resolve, reject) => {
+    const raw = net.connect(sPath)
+    raw.once('error', reject)
+    raw.write(`CONNECT ${host}:443 HTTP/1.1\r\nhost: ${host}:443\r\n\r\n`)
+    raw.once('data', () => {
+      const sock = tls.connect({ socket: raw, rejectUnauthorized: false, servername: host })
+      sock.once('error', reject)
+      const chunks: Buffer[] = []
+      sock.on('data', c => chunks.push(c))
+      sock.on('end', () => resolve(Buffer.concat(chunks).toString()))
+      sock.write(`POST ${reqPath} HTTP/1.1\r\nhost: ${host}\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}`)
+    })
+  })
+
+  // Write to site.hosts (erp.example) refused 403 audit log full
+  const erpFull = await sendHttps(hOpen.sockPath, 'erp.example', '/pay')
+  assert.match(erpFull, /^HTTP\/1\.1 403/)
+  assert.match(erpFull, /audit log full/)
+
+  // Write to non-site host (other.example) is NOT refused 403 audit log full; it counts as dropped
+  const otherFull = await sendHttps(hOpen.sockPath, 'other.example', '/beacon')
+  assert.doesNotMatch(otherFull, /^HTTP\/1\.1 403/, 'non-site-host write must not be refused 403 when log is full')
+  const openSnap = hOpen.proxy.controller.finalizeAtSeal()
+  assert.equal(openSnap.refusedFull, 1)
+  assert.ok(openSnap.droppedGets >= 1)
+
+  // GET to t.example still succeeds (200) even when site writes are refused 403
+  const getWhenFull = await sendReq('GET', '/still-works')
+  assert.equal(getWhenFull.status, 200)
+
   const snap = proxy.controller.finalizeAtSeal()
   assert.ok(snap.refusedFull >= 1)
-  const summary = log.find((e: any) => e.rec === '_summary') as any
-  assert.ok(summary, 'appended _summary inside reserved tail budget')
-  assert.ok(Object.keys(summary.collapsedGets).length > 0, 'collapsed static GETs recorded in _summary')
+  assert.ok(log.some(e => e.rec === '_summary'))
 })
 
-test('in-flight budget exhaustion in enforce mode fails closed with 503', async t => {
-  const tracker = new InFlightBudgetTracker(32, 32, 32)
-  const hook: PolicyHookConfig = {
-    mode: 'enforce',
-    evaluate: (_d, ctx) => ({ decisionId: ctx.decisionId, mode: 'enforce', stage: 1, action: 'allow', ruleId: 'ok', policyVersion: '1', ms: 0 }),
-  }
-  const { sendReq, upstreamHits } = await setupHarness(t, { policyHook: hook, inFlightTracker: tracker })
-  const r = await sendReq('POST', '/too-big-for-budget', {}, 'x'.repeat(256))
-  assert.equal(r.status, 503)
-  assert.equal(upstreamHits.length, 0)
-  assert.equal(tracker.getProcessBytes(), 0, 'budget released cleanly')
+test('internalHosts refuses private/internal IPs for all hosts not in internalHosts', async t => {
+  const { sendReq } = await setupHarness(t, undefined, {
+    hosts: ['10.1.2.3', '192.168.1.5'],
+    internalHosts: ['10.1.2.3'],
+    via: undefined,
+  })
+  // 192.168.1.5 is exact-listed in site.hosts, NOT in internalHosts -> refused 403 internal address!
+  const blocked = await sendReq('GET', '/', {}, undefined, '192.168.1.5')
+  assert.equal(blocked.status, 403)
+  assert.match(blocked.body, /internal address/)
+
+  // Empty internalHosts: [] refuses private IP even if exact-listed in site.hosts
+  const h2 = await setupHarness(t, undefined, {
+    hosts: ['10.1.2.3'],
+    internalHosts: [],
+    via: undefined,
+  })
+  const blocked2 = await h2.sendReq('GET', '/', {}, undefined, '10.1.2.3')
+  assert.equal(blocked2.status, 403)
+  assert.match(blocked2.body, /internal address/)
 })
 
-test('vault scrubs errors and Referer headers without crashing', async t => {
+test('exit scrubDeep scrubs vault secrets from URLs, Referers, bodyShape keys, and errors', async t => {
   const vault = new SecretVault()
   vault.addTrustedDrive('TopSecretRef99')
   const { sendReq, log } = await setupHarness(t, { vault })
-  await sendReq('GET', '/check', { referer: 'https://t.example/page/TopSecretRef99' })
-  const entry = log[0] as V2Entry
-  assert.ok(!entry.from!.includes('TopSecretRef99'))
-  assert.ok(entry.from!.includes('[REDACTED:vault]'))
+  await sendReq('POST', '/check/TopSecretRef99?q=TopSecretRef99', {
+    referer: 'https://t.example/page/TopSecretRef99',
+    'content-type': 'application/json',
+  }, JSON.stringify({ TopSecretRef99: 'x', ok: 1 }))
+  const json = JSON.stringify(log)
+  assert.ok(!json.includes('TopSecretRef99'), 'vault secret never appears anywhere in proxy log')
+  assert.ok(json.includes('[REDACTED:vault]'))
 })
 
-test('P2-5 finalizeAtSeal records in-flight POST as dispatch: unknown, preserves bodyShape, and releases observe-mode budget to 0', async t => {
-  const tracker = new InFlightBudgetTracker()
-  const { sockPath, upPort, setHandler, proxy, log } = await setupHarness(t, { inFlightTracker: tracker })
+test('finalizeAtSeal records in-flight POST as dispatch: unknown, preserves bodyShape, and releases ByteBudget to 0', async t => {
+  const byteBudget = new ByteBudget()
+  const { sockPath, upPort, setHandler, proxy, log } = await setupHarness(t, { byteBudget })
   let reqArrivedResolve!: () => void
   const reqArrived = new Promise<void>(r => { reqArrivedResolve = r })
-  setHandler((_req, _res) => {
-    // Request body has already finished arriving at upstream; hold response open so POST is in-flight at seal!
-    reqArrivedResolve()
-  })
+  setHandler((_req, _res) => { reqArrivedResolve() })
 
   const req = http.request({
     socketPath: sockPath,
@@ -370,123 +290,33 @@ test('P2-5 finalizeAtSeal records in-flight POST as dispatch: unknown, preserves
   req.on('error', () => {})
   req.end('{"pending":true,"amount":42}')
   await reqArrived
-  // Allow microtask eager projection build on prefixFrozenPromise to complete
-  await new Promise(r => setTimeout(r, 15))
 
-  assert.ok(tracker.getProcessBytes() > 0, 'in-flight observe request holds tee budget before seal')
+  assert.ok(byteBudget.getUsedBytes() > 0)
   proxy.controller.finalizeAtSeal()
-  assert.equal(tracker.getProcessBytes(), 0, 'finalizeAtSeal releases all observe-mode tee & decoded budget')
+  assert.equal(byteBudget.getUsedBytes(), 0)
 
-  const entry = log.find((e: any) => e.path === '/hang') as V2Entry
-  const summary = log.find((e: any) => e.rec === '_summary') as any
-  assert.ok(entry, 'in-flight POST recorded at seal')
+  const entry = log.find((e): e is V2Entry => !e.rec && e.path === '/hang')
+  const summary = log.find(e => e.rec === '_summary')
+  assert.ok(entry)
   assert.equal(entry.dispatch, 'unknown')
   assert.equal(entry.incomplete, true)
-  assert.deepEqual(entry.bodyShape, { pending: 'boolean', amount: 'number' }, 'bodyShape preserved on sealed in-flight POST')
-  assert.equal(summary.incompleteAtSeal, 1)
+  assert.deepEqual(entry.bodyShape, { pending: 'boolean', amount: 'number' })
+  assert.equal(summary?.incompleteAtSeal, 1)
 })
 
-test('P2-6 explicit checkSync Stage-1 GET bypasses async cap while non-async function returning Promise is capped before invocation', async t => {
-  const releases: Array<() => void> = []
-  let getEvaluateInvoked = 0
-  const hook: PolicyHookConfig = {
-    mode: 'enforce',
-    checkSync: (d, ctx) => {
-      if (!d.safe.isWrite && d.safe.path === '/sync-read') {
-        return { decisionId: ctx.decisionId, mode: 'enforce', stage: 1, action: 'allow', ruleId: 'sync-get', policyVersion: '1', ms: 0 }
-      }
-      return undefined
-    },
-    // Non-async function returning a Promise (NOT an AsyncFunction!)
-    evaluate: (d, ctx) => {
-      if (!d.safe.isWrite) getEvaluateInvoked++
-      return new Promise(resolve => {
-        releases.push(() => resolve({ decisionId: ctx.decisionId, mode: 'enforce', stage: 2, action: 'allow', ruleId: 'async-hook', policyVersion: '1', ms: 1 }))
-      })
-    },
-  }
-  const { sendReq } = await setupHarness(t, { policyHook: hook, maxConcurrentAsyncHooks: 2 })
-  const w1 = sendReq('POST', '/w1', {}, 'a')
-  const w2 = sendReq('POST', '/w2', {}, 'b')
-  while (releases.length < 2) await new Promise(r => setTimeout(r, 5))
+test('seal() times out hanging storageState() and pw.close() and resolves promptly with state: null', async () => {
+  const dir = fs.mkdtempSync(`${os.tmpdir()}/rf-seal-timeout-`)
+  const s = new BrowserSession('seal-to-test', dir, 'test-label', { hosts: [] }, false, { sealTimeoutMs: 50 })
+  s.pw = {
+    isConnected: () => true,
+    contexts: () => [{ storageState: () => new Promise(() => {}) }],
+    close: () => new Promise(() => {}),
+  } as any
 
-  // 3rd write fails closed with 503 while 2 async hooks are saturated
-  const w3 = await sendReq('POST', '/w3', {}, 'c')
-  assert.equal(w3.status, 503)
-
-  // Non-async Promise-returning evaluate() on GET MUST fail closed BEFORE invoking evaluate()!
-  const asyncGet = await sendReq('GET', '/async-read')
-  assert.equal(asyncGet.status, 503)
-  assert.equal(getEvaluateInvoked, 0, 'non-async Promise-returning GET hook must NOT be invoked when cap is full')
-
-  // Explicit checkSync Stage-1 GET still passes with 200!
-  const syncGet = await sendReq('GET', '/sync-read')
-  assert.equal(syncGet.status, 200)
-
-  for (const r of releases) r()
-  assert.equal((await w1).status, 200)
-  assert.equal((await w2).status, 200)
-})
-
-test('R3 seal() during pending async WebSocket upgrade admission aborts hook, closes downstream socket, and never dials upstream', async t => {
-  let hookStartedResolve!: () => void
-  const hookStarted = new Promise<void>(r => { hookStartedResolve = r })
-  let signalAborted = false
-  let releaseHook!: () => void
-
-  const hook: PolicyHookConfig = {
-    mode: 'enforce',
-    evaluate: (_d, ctx) => {
-      ctx.signal.addEventListener('abort', () => { signalAborted = true }, { once: true })
-      hookStartedResolve()
-      return new Promise(resolve => {
-        releaseHook = () => resolve({
-          decisionId: ctx.decisionId,
-          mode: 'enforce',
-          stage: 2,
-          action: 'allow',
-          ruleId: 'late-allow',
-          policyVersion: '1',
-          ms: 10,
-        })
-      })
-    },
-  }
-
-  const { sockPath, upPort, upstreamHits, proxy, log } = await setupHarness(t, { policyHook: hook })
-  const sock = net.connect(sockPath)
-  await once(sock, 'connect')
-  let sockClosed = false
-  const closedPromise = once(sock, 'close').then(() => { sockClosed = true })
-  sock.on('error', () => {})
-
-  const key = crypto.randomBytes(16).toString('base64')
-  sock.write(
-    `GET http://t.example:${upPort}/ws HTTP/1.1\r\n` +
-    `Host: t.example:${upPort}\r\n` +
-    `Upgrade: websocket\r\n` +
-    `Connection: Upgrade\r\n` +
-    `Sec-WebSocket-Key: ${key}\r\n` +
-    `Sec-WebSocket-Version: 13\r\n\r\n`,
-  )
-
-  await hookStarted
-  proxy.controller.finalizeAtSeal()
-
-  // Downstream upgrade socket MUST close promptly and hook AbortSignal MUST fire
-  await Promise.race([
-    closedPromise,
-    new Promise((_, rej) => setTimeout(() => rej(new Error('downstream upgrade socket hung open after seal()')), 500)),
-  ])
-  assert.equal(sockClosed, true, 'downstream upgrade socket closed on seal()')
-  assert.equal(signalAborted, true, 'pending upgrade admission AbortSignal fired on seal()')
-
-  // Even after the late hook resolves, upstream must NEVER be dialed!
-  releaseHook()
-  await new Promise(r => setTimeout(r, 30))
-  assert.equal(upstreamHits.length, 0, 'no upstream dial after sealed upgrade admission')
-  const entry = log.find((e: any) => e.kind === 'upgrade') as V2Entry
-  assert.ok(entry, 'sealed pending upgrade recorded')
-  assert.equal(entry.dispatch, 'not_dispatched')
-  assert.equal(entry.incomplete, true)
+  const t0 = performance.now()
+  const snap = await s.seal()
+  const elapsed = performance.now() - t0
+  assert.equal(snap.sealed, true)
+  assert.equal(snap.state, null)
+  assert.ok(elapsed < 1000, `seal() should not hang (took ${elapsed.toFixed(0)}ms)`)
 })

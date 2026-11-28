@@ -16,6 +16,12 @@ function boot(search = '') {
     tabs: { replaceChildren: (...els: any[]) => { buttons.length = 0; buttons.push(...els) } },
     drive: { textContent: '', hidden: false },
     kb: { value: '', focus() {}, blur() {} },
+    hud: { hidden: true, classList: { toggle() {} } },
+    'hud-bar': { onclick: null },
+    'hud-summary': { textContent: '' },
+    'hud-counts': { textContent: '' },
+    'hud-toggle': { textContent: 'Expand' },
+    'hud-list': { replaceChildren() {} },
   }
   class FakeWS {
     url: string
@@ -36,6 +42,9 @@ function boot(search = '') {
     },
     location: { href: `http://localhost/sessions/s1/view${search}`, search },
     URL, URLSearchParams, WebSocket: FakeWS,
+    fetch: async () => ({ status: 404, ok: false, json: async () => ({}) }),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
   })
   vm.runInContext(script, ctx)
   ws.onopen()

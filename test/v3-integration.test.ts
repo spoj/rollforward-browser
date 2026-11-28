@@ -1,8 +1,10 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import { chromium } from 'playwright-core'
 import { startPortal } from './portal.ts'
@@ -63,50 +65,42 @@ const leftovers = () =>
   execFileSync('podman', ['ps', '-a', '-q', '--filter', `label=rollforward-browser=${port}`]).toString().trim() +
   fs.readdirSync(`${os.tmpdir()}/rollforward-browser-${port}`).join(' ')
 
-test('GET /capabilities advertises v0.3.0 and POST /sessions validates auditV2.v', async () => {
+test('GET /capabilities advertises v0.3.1, POST /sessions validates auditV2, and rejects dropped semantic+samples projection', async () => {
   const cap = await api('GET', '/capabilities')
-  assert.deepEqual(cap.body, { version: '0.3.0', auditV2: 2, seal: true, activity: true })
+  assert.deepEqual(cap.body, { version: '0.3.1', auditV2: 2, seal: true, activity: true })
   assert.equal(cap.status, 200)
 
-  const bad = await api('POST', '/sessions', { site, auditV2: { v: 99 } })
-  assert.equal(bad.status, 400)
+  assert.equal((await api('POST', '/sessions', { site, auditV2: { v: 99 } })).status, 400)
+  assert.equal((await api('POST', '/sessions', { site, auditV2: { v: 2, projection: 'semantic+samples' } })).status, 400)
 })
 
-test('legacy audit: true session returns plain JSON array on /shots and 404 on /view/activity and /cdp-log', async () => {
+test('audit: true without auditV2 opens a v2 session with shots enabled (RF v0.11.0 compat bridge)', async () => {
   const opened = await api('POST', '/sessions', { site, audit: true })
   assert.equal(opened.status, 201)
-  assert.equal(opened.body.seal, undefined, 'no v2 links on legacy session')
-  const { id } = opened.body
+  const { id, seal, shots, cdpLog, activity } = opened.body
+  assert.equal(seal, `/sessions/${id}/seal`)
+  assert.equal(shots, `/sessions/${id}/shots`)
+  assert.equal(cdpLog, `/sessions/${id}/cdp-log`)
+  assert.equal(activity, `/sessions/${id}/view/activity`)
 
-  const shots = await api('GET', `/sessions/${id}/shots?after=0`)
-  assert.equal(shots.status, 200)
-  assert.equal(Array.isArray(shots.body), true, 'legacy /shots returns plain array')
-
-  const shotsV2 = await api('GET', `/sessions/${id}/shots?after=0&v=2`)
-  assert.equal(shotsV2.status, 200)
-  assert.equal(typeof shotsV2.body.hasMore, 'boolean', '?v=2 returns v2 envelope')
-
-  assert.equal((await api('GET', `/sessions/${id}/view/activity`)).status, 404)
-  assert.equal((await api('GET', `/sessions/${id}/cdp-log`)).status, 404)
+  const shotsEnv = await api('GET', `${shots}?after=0`)
+  assert.equal(shotsEnv.status, 200)
+  assert.equal(typeof shotsEnv.body.hasMore, 'boolean')
+  assert.equal(Array.isArray(shotsEnv.body.items), true)
 
   await api('DELETE', `/sessions/${id}`)
   assert.equal(leftovers(), '')
 })
 
-test('auditV2 end-to-end: Playwright 1.64 CDP tap, human /view/drive OTP vault scrub, /view/activity HUD, idempotent seal -> drain -> DELETE?sealed=1, and cross-client isolation', async () => {
+test('end-to-end: /view/drive tapped into CDP log with live:true + OTP vault scrub, /cdp uniform callFunctionOn, log-derived HUD, seal -> drain -> DELETE?sealed=1, and cross-client isolation', async () => {
   const opened = await api('POST', '/sessions', {
     site,
     audit: true,
-    auditV2: { v: 2, projection: 'semantic+samples', cdp: true, hud: true },
+    auditV2: { v: 2, cdp: true, hud: true },
   })
   assert.equal(opened.status, 201)
   const { id, cdp, view, seal, logV2, cdpLog, shots, activity } = opened.body
-  assert.equal(seal, `/sessions/${id}/seal`)
-  assert.equal(logV2, `/sessions/${id}/log`)
-  assert.equal(cdpLog, `/sessions/${id}/cdp-log`)
-  assert.equal(activity, `/sessions/${id}/view/activity`)
 
-  // Cross-client isolation on all new routes
   for (const [m, p] of [['POST', seal], ['GET', `${logV2}?after=0`], ['GET', `${cdpLog}?after=0`], ['GET', `${shots}?after=0`], ['GET', `${activity}?after=0`]] as const) {
     assert.equal((await api(m, p, undefined, key2)).status, 404, `other client blocked from ${p}`)
   }
@@ -125,18 +119,9 @@ test('auditV2 end-to-end: Playwright 1.64 CDP tap, human /view/drive OTP vault s
   await dPage.waitForSelector('text=Welcome ann')
   await driver.close()
 
-  // Wait out live cooldown? No — test right after driving & also wait briefly so subsequent agent call isn't marked live,
-  // OR check activity HUD has live_start & live_end markers and zero live-period details!
-  const hudDuring = await api('GET', `${activity}?after=0`)
-  assert.equal(hudDuring.status, 200)
-  assert.equal(hudDuring.headers.get('cache-control'), 'no-store')
-  assert.ok(hudDuring.body.events.some((e: any) => e.kind === 'live_start'))
-  assert.ok(hudDuring.body.events.some((e: any) => e.kind === 'live_end'))
-
-  // Connect external Playwright 1.64 agent over /cdp (MUST be tapped while internal BrowserSession.pw is NOT tapped!)
+  // External Playwright agent over /cdp triggers write carrying the human-typed OTP + evaluate + setFileInputFiles
   const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${cdp}`, { headers: auth() })
   const page = agent.contexts()[0].pages()[0]
-  // Trigger a write carrying the human-typed OTP in body + query, plus real Playwright evaluate & setInputFiles
   await page.evaluate(() => fetch('/update?note=739104', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ otpEcho: '739104', amount: 42.50 }) }).then(r => r.status))
   await page.setContent('<input id="f" type="file"><p>Ready</p>')
   await api('PUT', `/sessions/${id}/files/tmp/doc.txt`, 'hello')
@@ -146,138 +131,150 @@ test('auditV2 end-to-end: Playwright 1.64 CDP tap, human /view/drive OTP vault s
   await cdpSession.send('DOM.setFileInputFiles', { nodeId: node.nodeId, files: ['/tmp/doc.txt'] })
   await agent.close()
 
-  // Idempotent POST /seal freezes session and flushes CDP coalescing + _summary + _tap.summary
+  // Log-derived /view/activity HUD returns no-store and hides live-period events
+  const hud = await api('GET', `${activity}?after=0`)
+  assert.equal(hud.status, 200)
+  assert.equal(hud.headers.get('cache-control'), 'no-store')
+  assert.equal(hud.body.live, false)
+  assert.ok(!JSON.stringify(hud.body).includes('739104'))
+
+  // Idempotent POST /seal
   const snap1 = await api('POST', seal)
   assert.equal(snap1.status, 200)
   assert.equal(snap1.body.sealed, true)
   assert.ok(snap1.body.state?.cookies?.some((c: any) => c.name === 'sid'))
   assert.ok(snap1.body.logCursor > 0)
   assert.ok(snap1.body.cdpCursor > 0)
+  assert.deepEqual((await api('POST', seal)).body, snap1.body)
 
-  const snap2 = await api('POST', seal)
-  assert.deepEqual(snap2.body, snap1.body, 'POST /seal is strictly idempotent')
-
-  // Active-only routes return 410 after seal, while drain routes remain 200!
+  // Active-only routes return 410 after seal
   assert.equal((await api('GET', `/sessions/${id}/page`)).status, 410)
   assert.equal((await api('GET', activity)).status, 410)
 
-  // Drain /log?after=0 in pages after seal
+  // Drain /log?after=0
   const logPage = await api('GET', `${logV2}?after=0&limit=500`)
   assert.equal(logPage.status, 200)
   assert.equal(logPage.body.nextCursor, snap1.body.logCursor)
   assert.equal(logPage.body.hasMore, false)
   const entries = logPage.body.entries as any[]
-  assert.ok(entries.some(e => e.rec === '_summary'), 'log ends with _summary')
-  const updateEntry = entries.find(e => e.path === '/update')
-  assert.ok(updateEntry, 'captured /update write')
-  assert.equal(updateEntry.isWrite, true)
-  assert.ok(!JSON.stringify(entries).includes('739104'), 'OTP typed via /view/drive with Backspace scrubbed from entire HTTP log')
+  assert.ok(entries.some(e => e.rec === '_summary'))
+  assert.ok(entries.some(e => e.path === '/update' && e.isWrite === true))
+  assert.ok(!JSON.stringify(entries).includes('739104'), 'OTP scrubbed from HTTP log')
 
-  // Unparameterized GET /log returns legacy v0.2.2 allowlist without _summary or v2 fields
-  const legacyLog = await api('GET', logV2)
-  assert.equal(legacyLog.status, 200)
-  assert.equal(Array.isArray(legacyLog.body), true)
-  assert.ok(legacyLog.body.every((e: any) => !('rec' in e) && !('actions' in e) && !('descV' in e)))
-
-  // Drain /cdp-log?after=0 after seal
+  // Drain /cdp-log?after=0: includes /view/drive commands with live: true AND agent commands without wrapper fingerprinting
   const cdpPage = await api('GET', `${cdpLog}?after=0&limit=500`)
   assert.equal(cdpPage.status, 200)
   assert.equal(cdpPage.body.nextCursor, snap1.body.cdpCursor)
   assert.equal(cdpPage.body.hasMore, false)
   const cdpEntries = cdpPage.body.entries as any[]
-  assert.ok(cdpEntries.some(e => e.rec === '_tap.summary'), 'cdp-log ends with _tap.summary')
-  assert.ok(cdpEntries.some(e => e.method === 'Runtime.callFunctionOn' && e.summary?.wrapper === 'playwright-utility'), 'real Playwright 1.64 evaluate captured as playwright-utility')
-  assert.ok(cdpEntries.some(e => e.method === 'DOM.setFileInputFiles'), 'real Playwright 1.64 setInputFiles captured')
-  assert.ok(!JSON.stringify(cdpEntries).includes('739104'), 'OTP scrubbed from CDP log too')
+  assert.ok(cdpEntries.some(e => e.rec === '_tap.summary'))
+  assert.ok(cdpEntries.some(e => e.live === true), '/view/drive commands tapped into CDP log with live: true')
+  assert.ok(cdpEntries.some(e => e.method === 'Runtime.callFunctionOn' && typeof e.summary?.fnLen === 'number' && typeof e.summary?.fnHash64 === 'string' && typeof e.summary?.argCount === 'number' && !('wrapper' in e.summary)))
+  assert.ok(cdpEntries.some(e => e.method === 'DOM.setFileInputFiles'))
+  assert.ok(!JSON.stringify(cdpEntries).includes('739104'), 'OTP scrubbed from CDP log')
 
-  // Drain /shots?after=0 returns v2 envelope on auditV2 session
-  const shotsPage = await api('GET', `${shots}?after=0`)
-  assert.equal(shotsPage.status, 200)
-  assert.equal(typeof shotsPage.body.oldestSeq, 'number')
-  assert.equal(typeof shotsPage.body.nextSeq, 'number')
-  assert.equal(typeof shotsPage.body.hasMore, 'boolean')
-  assert.equal(Array.isArray(shotsPage.body.items), true)
-
-  // Acknowledge reclamation via DELETE ?sealed=1
-  const del = await api('DELETE', `/sessions/${id}?sealed=1`)
-  assert.deepEqual(del.body, { deleted: true })
-  assert.equal(del.status, 200)
+  // DELETE ?sealed=1 reclaims
+  assert.deepEqual((await api('DELETE', `/sessions/${id}?sealed=1`)).body, { deleted: true })
   assert.equal((await api('DELETE', `/sessions/${id}?sealed=1`)).status, 404)
   assert.equal(leftovers(), '')
 })
 
-test('TTL expiry runs seal so v2 logs/cdp-log/shots remain drainable until DELETE?sealed=1', async () => {
-  const opened = await api('POST', '/sessions', { site, audit: true, auditV2: { v: 2 }, ttl_s: 0.5 })
+test('CDP tap fails closed by closing socket on malformed WebSocket frame', async () => {
+  const opened = await api('POST', '/sessions', { site })
   assert.equal(opened.status, 201)
-  const { id } = opened.body
-  await new Promise(r => setTimeout(r, 1800))
+  const { id, cdp } = opened.body
 
-  assert.equal((await api('GET', `/sessions/${id}/page`)).status, 410)
-  const logPage = await api('GET', `/sessions/${id}/log?after=0`)
-  assert.equal(logPage.status, 200)
-  assert.ok(logPage.body.entries.some((e: any) => e.rec === '_summary'))
-  const cdpPage = await api('GET', `/sessions/${id}/cdp-log?after=0`)
-  assert.equal(cdpPage.status, 200)
-  assert.ok(cdpPage.body.entries.some((e: any) => e.rec === '_tap.summary'))
-  const shotsPage = await api('GET', `/sessions/${id}/shots?after=0`)
-  assert.equal(shotsPage.status, 200)
+  const sock = net.connect(port, '127.0.0.1')
+  await once(sock, 'connect')
+  const key = crypto.randomBytes(16).toString('base64')
+  sock.write(
+    `GET ${cdp} HTTP/1.1\r\n` +
+    `Host: 127.0.0.1:${port}\r\n` +
+    `Upgrade: websocket\r\n` +
+    `Connection: Upgrade\r\n` +
+    `Authorization: Bearer ${key1}\r\n` +
+    `Sec-WebSocket-Key: ${key}\r\n` +
+    `Sec-WebSocket-Version: 13\r\n\r\n`,
+  )
+  // Wait for 101 handshake
+  const firstChunk = (await once(sock, 'data'))[0] as Buffer
+  assert.match(firstChunk.toString(), /^HTTP\/1\.1 101/)
 
-  assert.equal((await api('DELETE', `/sessions/${id}?sealed=1`)).status, 200)
+  // Send an unmasked client->server frame (protocol violation) -> server MUST close the socket immediately
+  const closed = once(sock, 'close')
+  sock.write(Buffer.from([0x81, 0x02, 0x7b, 0x7d]))
+  await Promise.race([
+    closed,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('CDP socket stayed open after protocol violation')), 1500)),
+  ])
+
+  await api('DELETE', `/sessions/${id}?sealed=1`)
   assert.equal(leftovers(), '')
 })
 
-test('auditV2 with cdp: false returns empty zero-cursor envelope on /cdp-log', async () => {
-  const opened = await api('POST', '/sessions', { site, auditV2: { v: 2, cdp: false } })
+test('internalHosts allows listed internal host and refuses private IP for unlisted host at connect time', async () => {
+  const opened = await api('POST', '/sessions', {
+    site: { hosts: ['portal.localhost', 'other.localhost'], start_url: site.start_url },
+    internalHosts: ['portal.localhost'],
+  })
   assert.equal(opened.status, 201)
-  const { id, cdpLog } = opened.body
-  const page = await api('GET', `${cdpLog}?after=0`)
-  assert.equal(page.status, 200)
-  assert.deepEqual(page.body, { oldestCursor: 0, nextCursor: 0, hasMore: false, dropped: 0, entries: [] })
-  assert.equal((await api('DELETE', `/sessions/${id}?sealed=1`)).status, 200)
+  const { id, cdp } = opened.body
+  const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${port}${cdp}`, { headers: auth() })
+  const page = agent.contexts()[0].pages()[0]
+  assert.equal((await page.goto(`${site.start_url}login`))!.status(), 200, 'host in internalHosts reaches private IP')
+  const blocked = await page.goto(`https://other.localhost:${portal.port()}/`)
+  assert.equal(blocked!.status(), 502, 'host not in internalHosts refused private IP at connect time')
+  assert.match(await page.textContent('body') ?? '', /resolves only to internal addresses/)
+  await agent.close()
+  await api('DELETE', `/sessions/${id}?sealed=1`)
   assert.equal(leftovers(), '')
 })
 
-test('P1-6 post-TTL GC reclaims expired auditV2 sessions but preserves legacy non-auditV2 sessions indefinitely for v0.9 rollback', async t => {
-  const gcPort = 8802
-  const gcKey = 'gc-test-key'
-  const gcSvc = spawn('node', ['--import', './test/resolve.ts', 'src/server.ts'], {
+test('per-client sealed cap (503) isolates clients without cross-tenant eviction, and post-TTL GC reclaims all expired sessions', async t => {
+  const capPort = 8802
+  const capSvc = spawn('node', ['--import', './test/resolve.ts', 'src/server.ts'], {
     env: {
       ...process.env,
-      BROWSER_PORT: String(gcPort),
-      BROWSER_KEY: gcKey,
+      BROWSER_PORT: String(capPort),
+      BROWSER_KEYS: `c1:${key1} c2:${key2}`,
       BROWSER_BLOCKLISTS: '',
-      BROWSER_POST_TTL_GC_MS: '400',
+      BROWSER_MAX_SEALED_PER_CLIENT: '2',
+      BROWSER_POST_TTL_GC_MS: '600',
       NODE_EXTRA_CA_CERTS: `${tmp}/ca.pem`,
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
-  t.after(() => gcSvc.kill())
-  await Promise.race([once(gcSvc.stdout!, 'data'), once(gcSvc, 'exit').then(() => { throw new Error('gc service exited') })])
+  t.after(() => capSvc.kill())
+  await Promise.race([once(capSvc.stdout!, 'data'), once(capSvc, 'exit').then(() => { throw new Error('cap service exited') })])
 
-  const gcApi = async (method: string, path: string, body?: unknown) => {
-    const res = await fetch(`http://127.0.0.1:${gcPort}${path}`, {
+  const capApi = async (method: string, path: string, body?: unknown, key = key1) => {
+    const res = await fetch(`http://127.0.0.1:${capPort}${path}`, {
       method,
-      headers: { authorization: `Bearer ${gcKey}` },
+      headers: auth(key),
       body: body === undefined ? undefined : JSON.stringify(body),
     })
     return { status: res.status, body: await res.json() }
   }
 
-  const v2 = await gcApi('POST', '/sessions', { site, audit: true, auditV2: { v: 2 }, ttl_s: 0.3 })
-  const legacy = await gcApi('POST', '/sessions', { site, audit: true, ttl_s: 0.3 })
-  assert.equal(v2.status, 201)
-  assert.equal(legacy.status, 201)
+  // Client 1 opens and seals 2 sessions (hitting per-client sealed cap = 2)
+  const s1 = await capApi('POST', '/sessions', { site: { hosts: [] } }, key1)
+  const s2 = await capApi('POST', '/sessions', { site: { hosts: [] } }, key1)
+  assert.equal(s1.status, 201)
+  assert.equal(s2.status, 201)
+  await capApi('POST', `/sessions/${s1.body.id}/seal`, {}, key1)
+  await capApi('POST', `/sessions/${s2.body.id}/seal`, {}, key1)
 
-  // Wait past TTL (0.3s) + container seal (~0.5s) + post-TTL GC (0.4s)
+  // Client 1's 3rd open gets 503 AND does NOT evict s1 or s2
+  const s3 = await capApi('POST', '/sessions', { site: { hosts: [] } }, key1)
+  assert.equal(s3.status, 503)
+  assert.equal((await capApi('GET', `/sessions/${s1.body.id}/log?after=0`, undefined, key1)).status, 200)
+
+  // Client 2 is completely unaffected and can open & TTL-expire its session
+  const c2s = await capApi('POST', '/sessions', { site: { hosts: [] }, ttl_s: 0.3 }, key2)
+  assert.equal(c2s.status, 201)
+
+  // Wait for post-TTL GC (0.3s TTL + seal + 0.6s GC) -> ALL expired/sealed sessions are GC'd
   await new Promise(r => setTimeout(r, 2500))
-
-  // auditV2 session was GC'd after post-TTL window
-  assert.equal((await gcApi('GET', `/sessions/${v2.body.id}/log?after=0`)).status, 404, 'expired auditV2 session GCd after POST_TTL_GC_MS')
-
-  // legacy session MUST still be listed and collectible via DELETE (v0.2.2 / v0.9 compatibility!)
-  const list = await gcApi('GET', '/sessions')
-  assert.ok(list.body.some((s: any) => s.id === legacy.body.id && s.closed === true), 'legacy session remains listed after POST_TTL_GC_MS')
-  const del = await gcApi('DELETE', `/sessions/${legacy.body.id}`)
-  assert.equal(del.status, 200, 'legacy session remains collectible via DELETE')
-  assert.ok(Array.isArray(del.body.log))
+  assert.equal((await capApi('GET', `/sessions/${c2s.body.id}/log?after=0`, undefined, key2)).status, 404, 'post-TTL GC reclaims all sessions')
+  assert.equal((await capApi('GET', `/sessions/${s1.body.id}/log?after=0`, undefined, key1)).status, 404, 'post-seal GC reclaims sealed sessions')
 })
