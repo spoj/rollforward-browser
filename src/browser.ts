@@ -7,7 +7,6 @@ import { CdpSessionTap, type CdpEntry } from './cdp-tap.ts'
 import {
   InFlightBudgetTracker,
   startProxy,
-  toLegacyLog,
   type AuditV2Config,
   type LogRecord,
   type ProxyServer,
@@ -119,7 +118,7 @@ export class BrowserSession {
   label: string
   site: Site
   audit: boolean
-  auditV2?: AuditV2Config
+  auditV2: AuditV2Config
   cdpSocket: string
   container: string
   internalNonce: string
@@ -157,8 +156,8 @@ export class BrowserSession {
     this.dir = dir
     this.label = label
     this.site = site
-    this.audit = audit
-    this.auditV2 = opts.auditV2
+    this.auditV2 = opts.auditV2 ?? { v: 2, projection: 'semantic', cdp: true, hud: true }
+    this.audit = audit || this.auditV2.shots === true
     this.opts = opts
     this.cdpSocket = `${dir}/cdp.sock`
     this.container = `rollforward-browser-${id}`
@@ -171,8 +170,7 @@ export class BrowserSession {
       }
     }
 
-    if (this.auditV2 && this.auditV2.cdp !== false) {
-      // Dedicated per-session CDP parser budget (isolated from HTTP proxy & /view/drive tap so unfinished frames cannot starve proxy!)
+    if (this.auditV2.cdp !== false) {
       this.cdpTap = new CdpSessionTap({
         projection: this.auditV2.projection ?? 'semantic',
         vault: this.vault,
@@ -272,19 +270,17 @@ export class BrowserSession {
   async start(state: unknown, cdpUrl: string, headers: Record<string, string>) {
     if (state) this.vault.ingestStorageState(state)
     fs.mkdirSync(this.dir, { mode: 0o700 })
-    const proxyOpts = this.auditV2
-      ? {
-          sessionId: this.id,
-          clientId: this.opts.clientId ?? 'default',
-          auditV2: this.auditV2,
-          vault: this.vault,
-          getCdpCursor: () => this.cdpTap?.currentCursor ?? 0,
-          isLiveOrCooldown: () => this.isLiveOrCooldown(),
-          onEntry: (entry: LogRecord) => this.recordHudHttp(entry),
-          onWriteDetail: this.audit ? ({ dest }: { dest?: string }) => this.scheduleShot(undefined, 'write', dest === 'empty') : undefined,
-          inFlightTracker: this.opts.inFlightTracker,
-        }
-      : undefined
+    const proxyOpts = {
+      sessionId: this.id,
+      clientId: this.opts.clientId ?? 'default',
+      auditV2: this.auditV2,
+      vault: this.vault,
+      getCdpCursor: () => this.cdpTap?.currentCursor ?? 0,
+      isLiveOrCooldown: () => this.isLiveOrCooldown(),
+      onEntry: (entry: LogRecord) => this.recordHudHttp(entry),
+      onWriteDetail: this.audit ? ({ dest }: { dest?: string }) => this.scheduleShot(undefined, 'write', dest === 'empty') : undefined,
+      inFlightTracker: this.opts.inFlightTracker,
+    }
     this.proxy = startProxy(
       `${this.dir}/proxy.sock`,
       this.site,
@@ -432,7 +428,7 @@ export class BrowserSession {
       this.lastShotAt = Date.now()
       if (this.lastJpeg?.equals(jpeg)) return
       this.lastJpeg = jpeg
-      const sanUrl = this.auditV2 ? sanitizeUrl(urlBefore, { projection: this.auditV2.projection ?? 'semantic', vault: this.vault }).url : urlBefore
+      const sanUrl = sanitizeUrl(urlBefore, { projection: this.auditV2.projection ?? 'semantic', vault: this.vault }).url
       this.shots.push({
         seq: ++this.shotSeq,
         at: new Date().toISOString(),
@@ -557,7 +553,7 @@ export class BrowserSession {
 
   async close() {
     const snap = await this.seal()
-    const result = { state: snap.state, log: toLegacyLog(this.log) }
+    const result = { state: snap.state, log: this.log.filter((e): e is V2Entry => !e.rec) }
     this.reclaim()
     return result
   }

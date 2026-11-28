@@ -7,12 +7,11 @@ import { domainToASCII } from 'node:url'
 import { BrowserSession, podman, type SealSnapshot } from './browser.ts'
 import { blocklist, isBlocked, loadBlocklists } from './blocklists.ts'
 import { createDriveVaultTap } from './cdp-tap.ts'
-import { InFlightBudgetTracker, toLegacyLog, type AuditV2Config } from './proxy.ts'
+import { InFlightBudgetTracker, type AuditV2Config, type V2Entry } from './proxy.ts'
 
 const VERSION = '0.3.0'
 const port = Number(process.env.BROWSER_PORT ?? 8797)
 const host = process.env.BROWSER_HOST ?? '127.0.0.1'
-const auditV2Enabled = process.env.BROWSER_AUDIT_V2 !== '0'
 const postTtlGcMs = Number(process.env.BROWSER_POST_TTL_GC_MS ?? 25 * 60_000)
 const maxSealedPerClient = Number(process.env.BROWSER_MAX_SEALED_PER_CLIENT ?? 8)
 
@@ -73,8 +72,10 @@ const sealSession = (s: Session, scheduleGc = false): Promise<SealSnapshot> => {
   return s.closing
 }
 
-function validateAuditV2(raw: unknown): AuditV2Config | undefined {
-  if (raw === undefined || raw === null) return undefined
+function validateAuditV2(raw: unknown): AuditV2Config {
+  if (raw === undefined || raw === null) {
+    return { v: 2, projection: 'semantic', cdp: true, hud: true }
+  }
   if (typeof raw !== 'object' || Array.isArray(raw)) throw fail(400, 'auditV2 must be an object')
   const cfg = raw as Record<string, unknown>
   if (cfg.v !== 2) throw fail(400, 'auditV2.v must be 2')
@@ -83,12 +84,13 @@ function validateAuditV2(raw: unknown): AuditV2Config | undefined {
   }
   if (cfg.cdp !== undefined && typeof cfg.cdp !== 'boolean') throw fail(400, 'auditV2.cdp must be boolean')
   if (cfg.hud !== undefined && typeof cfg.hud !== 'boolean') throw fail(400, 'auditV2.hud must be boolean')
-  if (!auditV2Enabled) return undefined
+  if (cfg.shots !== undefined && typeof cfg.shots !== 'boolean') throw fail(400, 'auditV2.shots must be boolean')
   return {
     v: 2,
     projection: (cfg.projection as AuditV2Config['projection']) ?? 'semantic',
     cdp: (cfg.cdp as boolean | undefined) ?? true,
     hud: (cfg.hud as boolean | undefined) ?? true,
+    ...(cfg.shots !== undefined && { shots: cfg.shots as boolean }),
     ...(cfg.intent && typeof cfg.intent === 'object' ? { intent: cfg.intent as AuditV2Config['intent'] } : {}),
   }
 }
@@ -149,13 +151,11 @@ async function open(spec: any, client: typeof clients[number]) {
     id,
     cdp: `/sessions/${id}/cdp`,
     view: `/sessions/${id}/view`,
+    seal: `/sessions/${id}/seal`,
+    logV2: `/sessions/${id}/log`,
+    cdpLog: `/sessions/${id}/cdp-log`,
+    ...(s.auditV2.hud !== false && { activity: `/sessions/${id}/view/activity` }),
     ...(s.audit && { shots: `/sessions/${id}/shots` }),
-    ...(s.auditV2 && {
-      seal: `/sessions/${id}/seal`,
-      logV2: `/sessions/${id}/log`,
-      cdpLog: `/sessions/${id}/cdp-log`,
-      activity: `/sessions/${id}/view/activity`,
-    }),
   }
 }
 
@@ -167,7 +167,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   if (!url) throw fail(400, 'invalid url')
   const { pathname, searchParams } = url
   if (pathname === '/capabilities' && req.method === 'GET') {
-    return json(res, 200, { version: VERSION, auditV2: auditV2Enabled ? 2 : 0, seal: true, activity: true })
+    return json(res, 200, { version: VERSION, auditV2: 2, seal: true, activity: true })
   }
   if (pathname === '/blocked' && req.method === 'GET') {
     if (!blocklist) throw fail(503, 'blocklists not loaded yet')
@@ -191,7 +191,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
       return json(res, 200, { deleted: true })
     }
     const snap = await sealSession(s)
-    const result = { state: snap.state, log: toLegacyLog(s.log) }
+    const result = { state: snap.state, log: s.log.filter((e): e is V2Entry => !e.rec) }
     s.reclaim()
     sessions.delete(id)
     return json(res, 200, result)
@@ -203,16 +203,15 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   }
 
   if (rest === '/log' && req.method === 'GET') {
-    if (s.auditV2 && (searchParams.has('after') || searchParams.get('v') === '2')) {
+    if (searchParams.has('after') || searchParams.has('limit')) {
       const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
       const limit = Math.min(500, Math.max(1, Number(searchParams.get('limit') ?? '500') || 500))
       return json(res, 200, s.proxy!.controller.getLogPage(after, limit))
     }
-    return json(res, 200, toLegacyLog(s.log))
+    return json(res, 200, s.log.filter((e): e is V2Entry => !e.rec))
   }
 
   if (rest === '/cdp-log' && req.method === 'GET') {
-    if (!s.auditV2) throw fail(404, 'cdp log not enabled')
     if (!s.cdpTap) {
       return json(res, 200, { oldestCursor: 0, nextCursor: 0, hasMore: false, dropped: 0, entries: [] })
     }
@@ -223,11 +222,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
 
   if (rest === '/shots' && req.method === 'GET') {
     const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
-    if (s.auditV2 || searchParams.get('v') === '2') {
-      return json(res, 200, s.getShotsV2(after))
-    }
-    const items = s.shots.filter(x => x.seq > after).slice(0, 20)
-    return json(res, 200, items.map(x => ({ seq: x.seq, at: x.at, url: x.url, jpeg: x.jpeg.toString('base64') })))
+    return json(res, 200, s.getShotsV2(after))
   }
 
   // ---- Active-session-only routes ----
@@ -235,7 +230,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
 
   if (rest === '/view' && req.method === 'GET') return res.writeHead(200, { 'content-type': 'text/html' }).end(viewPage)
   if (rest === '/view/activity' && req.method === 'GET') {
-    if (!s.auditV2 || s.auditV2.hud === false) throw fail(404, 'activity hud not enabled')
+    if (s.auditV2.hud === false) throw fail(404, 'activity hud not enabled')
     const after = Math.max(0, Number(searchParams.get('after') ?? '0') || 0)
     return json(res, 200, s.getActivity(after), { 'cache-control': 'no-store' })
   }

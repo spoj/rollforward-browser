@@ -33,6 +33,7 @@ export type AuditV2Config = {
   projection?: ProjectionMode
   cdp?: boolean
   hud?: boolean
+  shots?: boolean
   intent?: { run: number; series?: string; taskSummary?: string }
 }
 
@@ -76,18 +77,6 @@ export type SafeRequestProjection = {
   reqOmitted?: BodyOmittedReason
 }
 
-export type LegacyEntry = {
-  t: string
-  method: string
-  url: string
-  status: number
-  dest?: string
-  from?: string
-  blocked?: string
-  error?: string
-  live?: true
-}
-
 export type V2Entry = SafeRequestProjection & {
   n: number
   rec?: 'http'
@@ -128,8 +117,8 @@ export type SummaryEntry = {
   droppedLateOutcomes?: number
 }
 
-export type LogRecord = LegacyEntry | V2Entry | LateOutcomeEntry | SummaryEntry
-export type Entry = LegacyEntry & Partial<V2Entry>
+export type LogRecord = V2Entry | LateOutcomeEntry | SummaryEntry
+export type Entry = V2Entry
 
 export class InFlightBudgetTracker {
   private processBytes = 0
@@ -250,27 +239,6 @@ export const isInternal = (address: string, family: number, list = internal) => 
 export const isNever = (address: string, family: number) => isInternal(address, family, never)
 
 const hopByHop = ['connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'proxy-authenticate', 'te', 'trailer', 'transfer-encoding', 'upgrade']
-
-export function toLegacyLog(entries: LogRecord[]): LegacyEntry[] {
-  const out: LegacyEntry[] = []
-  for (const e of entries) {
-    const rec = (e as any).rec
-    if (rec === '_summary' || rec === 'http_end') continue
-    const le = e as LegacyEntry
-    out.push({
-      t: le.t,
-      method: le.method,
-      url: le.url,
-      status: le.status,
-      ...(le.dest !== undefined && { dest: le.dest }),
-      ...(le.from !== undefined && { from: le.from }),
-      ...(le.blocked !== undefined && { blocked: le.blocked }),
-      ...(le.error !== undefined && { error: le.error }),
-      ...(le.live && { live: true as const }),
-    })
-  }
-  return out
-}
 
 const plain = (socket: net.Socket) => {
   const d = new Duplex({
@@ -511,7 +479,6 @@ export function startProxy(
   liveGen?: () => number,
   opts?: ProxyV2Options,
 ): ProxyServer {
-  const v2Enabled = Boolean(opts?.auditV2)
   const projection: ProjectionMode = opts?.auditV2?.projection ?? 'semantic'
   const vault = opts?.vault
   const siteName = opts?.siteName ?? (site.start_url ? URL.parse(site.start_url)?.hostname : undefined) ?? site.hosts[0] ?? 'site'
@@ -670,7 +637,6 @@ export function startProxy(
   const normalLimit = () => Math.max(0, maxLogHardBytes - TAIL_RESERVE_BYTES)
 
   const tryReserveLogSpace = (): number => {
-    if (!v2Enabled) return 0
     const avail = normalLimit() - logBytes - reservedBytes
     if (avail < MINIMAL_RESERVE_BYTES) return -1
     const want = logBytes < maxLogSoftBytes && avail >= MAX_ENTRY_BYTES ? MAX_ENTRY_BYTES : MINIMAL_RESERVE_BYTES
@@ -683,7 +649,6 @@ export function startProxy(
   }
 
   const shouldCollapseGet = (entry: V2Entry): boolean => {
-    if (!v2Enabled) return false
     if (entry.isWrite || entry.blocked || entry.error || entry.kind !== 'http') return false
     if (entry.status < 200 || entry.status >= 400) return false
     if (logBytes < collapseGetsAfterBytes && log.length < collapseGetsAfterEntries) return false
@@ -765,10 +730,9 @@ export function startProxy(
   }
 
   const appendLateOutcome = (rec: Omit<LateOutcomeEntry, 'n'>): void => {
-    if (sealed || !v2Enabled) return
+    if (sealed) return
     const preview: LateOutcomeEntry = { n: cursorCounter + 1, ...rec }
     const bytes = Buffer.byteLength(JSON.stringify(preview), 'utf8')
-    // Late outcomes draw strictly from TAIL_RESERVE_BYTES (leaving 8 KiB for _summary) so they can NEVER displace reserved normal writes!
     const summaryFloor = Math.min(8192, Math.floor(TAIL_RESERVE_BYTES / 2))
     if (tailLogBytes + bytes > TAIL_RESERVE_BYTES - summaryFloor) {
       droppedLateOutcomes++
@@ -778,25 +742,6 @@ export function startProxy(
     log.push(full)
     tailLogBytes += bytes
     opts?.onEntry?.(full)
-  }
-
-  const recordLegacy = (req: http.IncomingMessage, url: URL | null, status: number, extra: Partial<LegacyEntry> = {}) => {
-    if (sealed) return
-    const dest = req.headers['sec-fetch-dest'] as string | undefined
-    const from = req.headers.referer
-    const entry: LegacyEntry = {
-      t: new Date().toISOString(),
-      method: req.method!,
-      url: url?.href ?? req.url!,
-      status,
-      ...(dest && { dest }),
-      ...(from && { from }),
-      ...extra,
-      ...(isLiveNow() ? { live: true as const } : {}),
-    }
-    log.push(entry)
-    logBytes += Buffer.byteLength(JSON.stringify(entry), 'utf8')
-    opts?.onEntry?.(entry)
   }
 
   const buildFallbackProjection = (params: {
@@ -987,38 +932,6 @@ export function startProxy(
     const startMs = performance.now()
     const t = new Date().toISOString()
     const url = urlOf(req)
-
-    if (!v2Enabled) {
-      const blocked = check(url)
-      if (blocked) {
-        recordLegacy(req, url, 403, { blocked })
-        res.writeHead(403, { 'content-type': 'text/plain' }).end(`rollforward-browser: ${blocked}: ${req.method} ${url?.href ?? req.url}\n`)
-        return
-      }
-      const liveAtStart = isLive(), genAtStart = liveGen?.()
-      const up = (url!.protocol === 'https:' ? https : http).request(url!, buildOutboundSnapshot(req, url!), r => {
-        recordLegacy(req, url, r.statusCode!)
-        if (onWrite && !liveAtStart && !SAFE_METHODS.has(req.method!.toUpperCase())) {
-          r.on('end', () => { if (!isLive() && liveGen?.() === genAtStart) onWrite() })
-        }
-        const headers = { ...r.headers }
-        for (const h of hopByHop) delete headers[h]
-        res.writeHead(r.statusCode!, headers)
-        r.pipe(res)
-      })
-      activeUpstreams.add(up)
-      up.on('close', () => activeUpstreams.delete(up))
-      res.on('close', () => { if (!res.writableFinished) up.destroy() })
-      up.on('error', e => {
-        recordLegacy(req, url, 502, { error: e.message })
-        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' }).end(`rollforward-browser: ${e.message}\n`)
-        else res.destroy()
-      })
-      req.pipe(up)
-      return
-    }
-
-    // ---- auditV2 / policyHook path ----
     const seq = ++seqCounter
     void handleV2Request(req, res, url, seq, t, startMs).catch(() => {
       const inflight = activeInFlight.get(seq)
@@ -1534,46 +1447,6 @@ export function startProxy(
     const t = new Date().toISOString()
     const url = urlOf(req)
 
-    if (!v2Enabled) {
-      const blocked = check(url)
-      if (blocked) {
-        recordLegacy(req, url, 403, { blocked })
-        socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n')
-        return
-      }
-      const uOpts = buildOutboundSnapshot(req, url!)
-      uOpts.headers.connection = 'upgrade'
-      uOpts.headers.upgrade = req.headers.upgrade
-      const up = (url!.protocol === 'https:' ? https : http).request(url!, uOpts)
-      activeUpstreams.add(up)
-      up.on('close', () => activeUpstreams.delete(up))
-      socket.on('close', () => up.destroy())
-      up.on('upgrade', (r, upSocket, upHead) => {
-        if (socket.destroyed) { upSocket.destroy(); return }
-        activeUpstreams.add(upSocket)
-        upSocket.on('close', () => activeUpstreams.delete(upSocket))
-        upSocket.on('error', () => socket.destroy())
-        socket.on('close', () => upSocket.destroy())
-        recordLegacy(req, url, 101)
-        socket.write(`HTTP/1.1 101 Switching Protocols\r\n${Object.entries(r.headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`)
-        upSocket.write(head)
-        socket.write(upHead)
-        upSocket.pipe(socket).pipe(upSocket)
-      })
-      up.on('response', r => {
-        r.resume()
-        recordLegacy(req, url, r.statusCode!)
-        socket.end(`HTTP/1.1 ${r.statusCode} ${r.statusMessage}\r\nconnection: close\r\n\r\n`)
-      })
-      up.on('error', e => {
-        recordLegacy(req, url, 502, { error: e.message })
-        socket.end('HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n')
-      })
-      up.end()
-      return
-    }
-
-    // ---- auditV2 upgrade path ----
     const seq = ++seqCounter
     void (async () => {
       const httpCursorAtArrival = cursorCounter
@@ -1723,25 +1596,21 @@ export function startProxy(
 
   const handleExpectation = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const url = urlOf(req)
-    if (!v2Enabled) {
-      recordLegacy(req, url, 417, { blocked: 'expectation failed' })
-    } else {
-      const seq = ++seqCounter
-      const arrival = classifyArrival(req, url)
-      const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
-      appendV2Entry({
-        descV: DESC_V, redactV: REDACT_V, extractorV: EXTRACTOR_V,
-        surface: 'browser', target: { site: siteName }, seq, t: new Date().toISOString(),
-        kind: 'http', scheme: sanUrl.scheme, authority: sanUrl.authority, path: sanUrl.path, url: sanUrl.url,
-        method: arrival.sem.wireMethod, effectiveMethod: arrival.sem.effectiveMethod, methodSource: arrival.sem.methodSource,
-        isWrite: arrival.isWrite,
-        ...(arrival.sem.hdr && { hdr: arrival.sem.hdr }),
-        ...(arrival.sem.hdrConflict && { hdrConflict: true as const }),
-        prefixBytes: 0, bodyComplete: false, decodeComplete: false,
-        completeness: { transport: 'not-read', decode: 'none', extract: 'none', reasons: ['expectation-failed'] },
-        actions: [], status: 417, blocked: 'expectation failed', dispatch: 'not_dispatched',
-      })
-    }
+    const seq = ++seqCounter
+    const arrival = classifyArrival(req, url)
+    const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
+    appendV2Entry({
+      descV: DESC_V, redactV: REDACT_V, extractorV: EXTRACTOR_V,
+      surface: 'browser', target: { site: siteName }, seq, t: new Date().toISOString(),
+      kind: 'http', scheme: sanUrl.scheme, authority: sanUrl.authority, path: sanUrl.path, url: sanUrl.url,
+      method: arrival.sem.wireMethod, effectiveMethod: arrival.sem.effectiveMethod, methodSource: arrival.sem.methodSource,
+      isWrite: arrival.isWrite,
+      ...(arrival.sem.hdr && { hdr: arrival.sem.hdr }),
+      ...(arrival.sem.hdrConflict && { hdrConflict: true as const }),
+      prefixBytes: 0, bodyComplete: false, decodeComplete: false,
+      completeness: { transport: 'not-read', decode: 'none', extract: 'none', reasons: ['expectation-failed'] },
+      actions: [], status: 417, blocked: 'expectation failed', dispatch: 'not_dispatched',
+    })
     res.writeHead(417, { 'content-type': 'text/plain', connection: 'close' }).end('rollforward-browser: 417 Expectation Failed\n')
   }
 
@@ -1813,20 +1682,18 @@ export function startProxy(
       for (const ac of pendingAborts) ac.abort()
       for (const ac of activeAbortControllers) ac.abort()
       activeAbortControllers.clear()
-      if (v2Enabled) {
-        const summary: SummaryEntry = {
-          n: ++cursorCounter,
-          rec: '_summary',
-          t: new Date().toISOString(),
-          collapsedGets: { ...collapsedGets },
-          droppedGets,
-          refusedFullCount,
-          incompleteAtSeal,
-          ...(droppedLateOutcomes > 0 && { droppedLateOutcomes }),
-        }
-        log.push(summary)
-        tailLogBytes += Buffer.byteLength(JSON.stringify(summary), 'utf8')
+      const summary: SummaryEntry = {
+        n: ++cursorCounter,
+        rec: '_summary',
+        t: new Date().toISOString(),
+        collapsedGets: { ...collapsedGets },
+        droppedGets,
+        refusedFullCount,
+        incompleteAtSeal,
+        ...(droppedLateOutcomes > 0 && { droppedLateOutcomes }),
       }
+      log.push(summary)
+      tailLogBytes += Buffer.byteLength(JSON.stringify(summary), 'utf8')
       sealed = true
       outer.closeAllConnections?.()
       inner.closeAllConnections?.()
@@ -1840,13 +1707,12 @@ export function startProxy(
     },
     getLogPage: (after: number, limit = 500) => {
       const cappedLimit = Math.min(500, Math.max(1, limit))
-      const v2Entries = log.filter((e): e is V2Entry | LateOutcomeEntry | SummaryEntry => typeof (e as any).n === 'number')
-      const oldestCursor = v2Entries.length ? v2Entries[0].n : cursorCounter
+      const oldestCursor = log.length ? log[0].n : cursorCounter
       const out: LogRecord[] = []
-      let pageBytes = 128 // envelope metadata overhead
+      let pageBytes = 128
       let lastIdx = -1
-      for (let i = 0; i < v2Entries.length; i++) {
-        const e = v2Entries[i]
+      for (let i = 0; i < log.length; i++) {
+        const e = log[i]
         if (e.n <= after) continue
         const size = Buffer.byteLength(JSON.stringify(e), 'utf8') + 1
         if (out.length > 0 && (out.length >= cappedLimit || pageBytes + size > MAX_PAGE_BYTES)) break
@@ -1854,8 +1720,8 @@ export function startProxy(
         pageBytes += size
         lastIdx = i
       }
-      const hasMore = lastIdx >= 0 && lastIdx < v2Entries.length - 1
-      const nextCursor = out.length > 0 ? (out[out.length - 1] as any).n : Math.max(after, oldestCursor)
+      const hasMore = lastIdx >= 0 && lastIdx < log.length - 1
+      const nextCursor = out.length > 0 ? out[out.length - 1].n : Math.max(after, oldestCursor)
       return { oldestCursor, nextCursor, hasMore, dropped: droppedGets, entries: out }
     },
     getCurrentCursor: () => cursorCounter,
