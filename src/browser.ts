@@ -10,7 +10,6 @@ import {
   toLegacyLog,
   type AuditV2Config,
   type LogRecord,
-  type PolicyHookConfig,
   type ProxyServer,
   type Site,
   type V2Entry,
@@ -101,7 +100,6 @@ export type BrowserSessionOptions = {
   auditV2?: AuditV2Config
   inFlightTracker?: InFlightBudgetTracker
   clientId?: string
-  policyHook?: PolicyHookConfig
   sealTimeoutMs?: number
 }
 
@@ -113,7 +111,6 @@ export class BrowserSession {
   drivers = 0
   driverGen = 0
   lastDriverEndedAt = 0
-  siteConfigRev = 0
   wsPath = ''
   proxy?: ProxyServer
   pw?: Browser
@@ -275,14 +272,12 @@ export class BrowserSession {
   async start(state: unknown, cdpUrl: string, headers: Record<string, string>) {
     if (state) this.vault.ingestStorageState(state)
     fs.mkdirSync(this.dir, { mode: 0o700 })
-    const proxyOpts = this.auditV2 || this.opts.policyHook
+    const proxyOpts = this.auditV2
       ? {
           sessionId: this.id,
           clientId: this.opts.clientId ?? 'default',
           auditV2: this.auditV2,
           vault: this.vault,
-          policyHook: this.opts.policyHook,
-          getSiteConfigRev: () => this.siteConfigRev,
           getCdpCursor: () => this.cdpTap?.currentCursor ?? 0,
           isLiveOrCooldown: () => this.isLiveOrCooldown(),
           onEntry: (entry: LogRecord) => this.recordHudHttp(entry),

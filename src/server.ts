@@ -244,7 +244,6 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     const { hosts } = JSON.parse((await body(req)).toString())
     if (!names(hosts)) throw fail(400, 'hosts: names such as sso.example.com, or *.example.com for any under it')
     s.site.hosts = hosts
-    s.siteConfigRev++
     return json(res, 200, { hosts })
   }
   if (rest === '/reload' && req.method === 'POST') return (await s.reload(), json(res, 200, {}))

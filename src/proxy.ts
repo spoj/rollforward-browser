@@ -1,4 +1,3 @@
-import crypto from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
 import tls from 'node:tls'
@@ -37,17 +36,6 @@ export type AuditV2Config = {
   intent?: { run: number; series?: string; taskSummary?: string }
 }
 
-export type PolicyDecision = {
-  decisionId: string
-  mode: 'observe' | 'shadow' | 'enforce'
-  stage: 1 | 2
-  action: 'allow' | 'deny' | 'escalate' | 'requireApproval'
-  ruleId: string
-  policyVersion: string
-  ms: number
-  approvalRef?: string
-}
-
 export type SafeRequestProjection = {
   descV: 1
   redactV: 1
@@ -82,7 +70,6 @@ export type SafeRequestProjection = {
   vaultRedactions?: number
   cdpCursor?: number
   httpCursor?: number
-  siteConfigRev?: number
   live?: true
   reqBody?: string
   reqTrunc?: true
@@ -113,7 +100,6 @@ export type V2Entry = SafeRequestProjection & {
   headerMs?: number
   ms?: number
   dispatch: 'not_dispatched' | 'dispatched' | 'unknown'
-  policy?: PolicyDecision
   liveAtEnd?: true
   incomplete?: true
   logCapped?: true
@@ -129,7 +115,6 @@ export type LateOutcomeEntry = {
   ms: number
   error?: string
   incomplete?: true
-  policy?: PolicyDecision
 }
 
 export type SummaryEntry = {
@@ -145,37 +130,6 @@ export type SummaryEntry = {
 
 export type LogRecord = LegacyEntry | V2Entry | LateOutcomeEntry | SummaryEntry
 export type Entry = LegacyEntry & Partial<V2Entry>
-
-export type RequestDescriptor = {
-  safe: SafeRequestProjection
-  raw?: {
-    url: string
-    parsedBody?: unknown
-    rawBodyText?: string
-    declaredBytes?: number
-  }
-}
-
-export type PolicyContext = {
-  decisionId: string
-  signal: AbortSignal
-  deadlineMs: number
-  intent?: AuditV2Config['intent']
-  recentCdpCursor?: number
-  recentHttpCursor?: number
-}
-
-export type PolicyHookConfig = {
-  mode: 'shadow' | 'enforce'
-  liveMode?: 'enforce' | 'shadow' | 'allow'
-  deadlineMs?: number
-  // Optional fast synchronous Stage-1 pre-check (never consumes async hook capacity).
-  // Return undefined to fall through to evaluate().
-  checkSync?: (d: RequestDescriptor, ctx: PolicyContext) => PolicyDecision | undefined
-  // Set true ONLY when evaluate() is guaranteed synchronous (non-Promise); returning a Promise fails closed.
-  sync?: true
-  evaluate: (d: RequestDescriptor, ctx: PolicyContext) => PolicyDecision | Promise<PolicyDecision>
-}
 
 export class InFlightBudgetTracker {
   private processBytes = 0
@@ -234,8 +188,6 @@ export type ProxyV2Options = {
   clientId?: string
   auditV2?: AuditV2Config
   vault?: SecretVault
-  policyHook?: PolicyHookConfig
-  getSiteConfigRev?: () => number
   getCdpCursor?: () => number
   isLiveOrCooldown?: () => boolean
   onEntry?: (entry: LogRecord) => void
@@ -248,7 +200,6 @@ export type ProxyV2Options = {
   maxSampleBytes?: number
   collapseGetsAfterBytes?: number
   collapseGetsAfterEntries?: number
-  maxConcurrentAsyncHooks?: number
 }
 
 export type ProxyController = {
@@ -422,15 +373,6 @@ function parseDeclaredBytes(headers: Record<string, string | string[] | undefine
   return Number.isInteger(n) && n >= 0 ? n : undefined
 }
 
-function selectActiveHook(policyHook: PolicyHookConfig | undefined, liveAtStart: boolean): PolicyHookConfig | undefined {
-  if (!policyHook) return undefined
-  if (!liveAtStart) return policyHook
-  const liveMode = policyHook.liveMode ?? 'enforce'
-  if (liveMode === 'allow') return undefined
-  if (liveMode === 'shadow') return { ...policyHook, mode: 'shadow' }
-  return policyHook
-}
-
 function capEntryTo12KiB(entry: V2Entry): { entry: V2Entry; bytes: number } {
   let bytes = Buffer.byteLength(JSON.stringify(entry), 'utf8')
   if (bytes <= MAX_ENTRY_BYTES) return { entry, bytes }
@@ -559,184 +501,6 @@ function toMinimalCappedEntry(e: V2Entry): V2Entry {
   }
 }
 
-type PrefixReadResult = {
-  prefixBuf: Buffer
-  overflowChunks: Buffer[]
-  bodyComplete: boolean
-  transport: 'complete' | 'truncated'
-  reasons: string[]
-  totalReadBytes: number
-  aborted: boolean
-  budgetExceeded: boolean
-  releaseBudget: () => void
-  onEndFlag: () => boolean
-}
-
-function readBoundedPrefix(
-  req: http.IncomingMessage,
-  tracker: InFlightBudgetTracker,
-  clientId: string,
-  sessionId: string,
-  prefixTimeoutMs: number,
-  abortSignal: AbortSignal,
-): Promise<PrefixReadResult> {
-  return new Promise(resolve => {
-    const prefixChunks: Buffer[] = []
-    const overflowChunks: Buffer[] = []
-    let prefixLen = 0
-    let totalReadBytes = 0
-    let acquiredBytes = 0
-    let settled = false
-    let reqEnded = req.readableEnded
-    const reasons: string[] = []
-
-    const releaseBudget = () => {
-      if (acquiredBytes > 0) {
-        tracker.release(clientId, sessionId, acquiredBytes)
-        acquiredBytes = 0
-      }
-    }
-
-    const cleanup = () => {
-      clearTimeout(timer)
-      req.off('data', onData)
-      req.off('end', onEnd)
-      req.off('error', onError)
-      abortSignal.removeEventListener('abort', onAbort)
-    }
-
-    const done = (resObj: Omit<PrefixReadResult, 'prefixBuf' | 'overflowChunks' | 'reasons' | 'totalReadBytes' | 'releaseBudget' | 'onEndFlag'>) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      const prefixBuf = prefixChunks.length === 1 ? prefixChunks[0] : Buffer.concat(prefixChunks)
-      prefixChunks.length = 0
-      resolve({
-        prefixBuf,
-        overflowChunks,
-        reasons,
-        totalReadBytes,
-        releaseBudget,
-        onEndFlag: () => reqEnded || req.readableEnded,
-        ...resObj,
-      })
-    }
-
-    const markEnded = () => { reqEnded = true }
-    req.once('end', markEnded)
-
-    const onAbort = () => {
-      req.pause()
-      done({ bodyComplete: false, transport: 'truncated', aborted: true, budgetExceeded: false })
-    }
-    const onError = () => {
-      done({ bodyComplete: false, transport: 'truncated', aborted: true, budgetExceeded: false })
-    }
-    const onEnd = () => {
-      reqEnded = true
-      done({ bodyComplete: true, transport: 'complete', aborted: false, budgetExceeded: false })
-    }
-    const onData = (chunk: Buffer) => {
-      if (settled) return
-      totalReadBytes += chunk.length
-      if (!tracker.tryAcquire(clientId, sessionId, chunk.length)) {
-        req.pause()
-        done({ bodyComplete: false, transport: 'truncated', aborted: false, budgetExceeded: true })
-        return
-      }
-      acquiredBytes += chunk.length
-      if (prefixLen + chunk.length < MAX_PREFIX_BYTES) {
-        prefixChunks.push(Buffer.from(chunk))
-        prefixLen += chunk.length
-        return
-      }
-      if (prefixLen + chunk.length === MAX_PREFIX_BYTES) {
-        prefixChunks.push(Buffer.from(chunk))
-        prefixLen = MAX_PREFIX_BYTES
-        if (req.readableEnded) {
-          reqEnded = true
-          done({ bodyComplete: true, transport: 'complete', aborted: false, budgetExceeded: false })
-        } else {
-          req.pause()
-          reasons.push('>=64KiB')
-          done({ bodyComplete: false, transport: 'truncated', aborted: false, budgetExceeded: false })
-        }
-        return
-      }
-      // Straddles 64 KiB boundary: copy slices so no giant slab is retained
-      const need = MAX_PREFIX_BYTES - prefixLen
-      if (need > 0) {
-        prefixChunks.push(Buffer.from(chunk.subarray(0, need)))
-        prefixLen = MAX_PREFIX_BYTES
-      }
-      overflowChunks.push(Buffer.from(chunk.subarray(need)))
-      req.pause()
-      reasons.push('>64KiB')
-      done({ bodyComplete: false, transport: 'truncated', aborted: false, budgetExceeded: false })
-    }
-
-    const timer = setTimeout(() => {
-      req.pause()
-      reasons.push('prefix-timeout')
-      done({ bodyComplete: false, transport: 'truncated', aborted: false, budgetExceeded: false })
-    }, prefixTimeoutMs)
-    timer.unref?.()
-
-    if (abortSignal.aborted) {
-      onAbort()
-      return
-    }
-    if (req.readableEnded) {
-      reqEnded = true
-      done({ bodyComplete: true, transport: 'complete', aborted: false, budgetExceeded: false })
-      return
-    }
-    req.on('data', onData)
-    req.on('end', onEnd)
-    req.on('error', onError)
-    abortSignal.addEventListener('abort', onAbort, { once: true })
-  })
-}
-
-async function replayChunksAndPipe(
-  req: http.IncomingMessage,
-  up: http.ClientRequest,
-  chunks: Buffer[],
-  isEnded: () => boolean,
-  onTailBytes: (n: number) => void,
-  onUploadEnd: () => void,
-  onChunksDrained: () => void,
-) {
-  for (let i = 0; i < chunks.length; i++) {
-    const c = chunks[i]
-    chunks[i] = Buffer.alloc(0) // drop reference promptly
-    if (up.destroyed) {
-      onChunksDrained()
-      return
-    }
-    if (!c.length) continue
-    if (!up.write(c)) {
-      await new Promise<void>(r => {
-        const done = () => { up.off('drain', done); up.off('close', done); up.off('error', done); r() }
-        up.once('drain', done)
-        up.once('close', done)
-        up.once('error', done)
-      })
-    }
-  }
-  onChunksDrained()
-  if (up.destroyed) return
-  if (isEnded() || req.readableEnded) {
-    up.end()
-    onUploadEnd()
-  } else {
-    req.on('data', (c: Buffer) => onTailBytes(c.length))
-    req.once('end', onUploadEnd)
-    req.pipe(up)
-    req.resume()
-  }
-}
-
 export function startProxy(
   path: string,
   site: Site,
@@ -747,10 +511,9 @@ export function startProxy(
   liveGen?: () => number,
   opts?: ProxyV2Options,
 ): ProxyServer {
-  const v2Enabled = Boolean(opts?.auditV2 || opts?.policyHook)
+  const v2Enabled = Boolean(opts?.auditV2)
   const projection: ProjectionMode = opts?.auditV2?.projection ?? 'semantic'
   const vault = opts?.vault
-  const policyHook = opts?.policyHook
   const siteName = opts?.siteName ?? (site.start_url ? URL.parse(site.start_url)?.hostname : undefined) ?? site.hosts[0] ?? 'site'
   const sessionId = opts?.sessionId ?? 'session'
   const clientId = opts?.clientId ?? 'default'
@@ -762,7 +525,6 @@ export function startProxy(
   const maxSampleBytes = opts?.maxSampleBytes ?? 2 * 1024 * 1024
   const collapseGetsAfterBytes = opts?.collapseGetsAfterBytes ?? 1 * 1024 * 1024
   const collapseGetsAfterEntries = opts?.collapseGetsAfterEntries ?? 2_000
-  const maxConcurrentAsyncHooks = opts?.maxConcurrentAsyncHooks ?? 8
   const isLiveNow = opts?.isLiveOrCooldown ?? isLive
 
   let seqCounter = 0
@@ -775,7 +537,6 @@ export function startProxy(
   let refusedFullCount = 0
   let incompleteAtSeal = 0
   let droppedLateOutcomes = 0
-  let activeAsyncHooks = 0
   let admissionStopped = false
   let sealed = false
   const collapsedGets: Record<string, { count: number; bytes: number }> = {}
@@ -1048,7 +809,6 @@ export function startProxy(
     liveAtStart: boolean
     httpCursorAtArrival: number
     cdpCursorAtArrival: number
-    siteConfigRev?: number
     reason: string
   }): SafeRequestProjection => {
     const sanUrl = params.url ? sanitizeUrl(params.url, { projection, vault }) : sanitizeUrl(params.req.url ?? '/', { projection, vault })
@@ -1082,7 +842,6 @@ export function startProxy(
       actions: params.kind === 'upgrade' ? [{ family: 'upgrade', op: 'upgrade:websocket', resource: sanUrl.path, coverage: 'complete' }] : [],
       cdpCursor: params.cdpCursorAtArrival,
       httpCursor: params.httpCursorAtArrival,
-      ...(params.siteConfigRev !== undefined && { siteConfigRev: params.siteConfigRev }),
       ...(params.liveAtStart && { live: true as const }),
     }
   }
@@ -1104,8 +863,7 @@ export function startProxy(
     hasBody: boolean
     httpCursorAtArrival: number
     cdpCursorAtArrival: number
-    siteConfigRev?: number
-  }): Promise<{ safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void; decodeBudgetExceeded?: boolean }> => {
+  }): Promise<{ safe: SafeRequestProjection; releaseDecoded: () => void }> => {
     const { req, url, seq, t, kind, prefixBuf, bodyComplete, transport, transportReasons, liveAtStart, genAtStart, arrival, hasBody } = params
     const hdrs = params.effectiveHeaders ?? req.headers
     const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
@@ -1126,7 +884,6 @@ export function startProxy(
 
     let decodeRes = undefined
     let decodedCharge = 0
-    let decodeBudgetExceeded = false
     if (kind === 'http' && prefixBuf.length > 0 && !liveOrChanged) {
       const charger = {
         tryAcquire: (b: number) => inFlightTracker.tryAcquire(clientId, sessionId, b),
@@ -1142,7 +899,6 @@ export function startProxy(
           charger,
         )
         decodedCharge = decodeRes.chargedBytes ?? 0
-        if (decodeRes.budgetExceeded) decodeBudgetExceeded = true
       } catch {
         decodeRes = { ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error' as const, truncated: false, reason: 'decompress-err' }
       }
@@ -1214,169 +970,13 @@ export function startProxy(
       ...(vaultRedactions > 0 && { vaultRedactions }),
       cdpCursor: params.cdpCursorAtArrival,
       httpCursor: params.httpCursorAtArrival,
-      ...(params.siteConfigRev !== undefined && { siteConfigRev: params.siteConfigRev }),
       ...(liveAtStart && { live: true as const }),
       ...(extracted.reqBody !== undefined && { reqBody: extracted.reqBody }),
       ...(extracted.reqTrunc && { reqTrunc: true as const }),
       ...(extracted.reqOmitted && { reqOmitted: extracted.reqOmitted }),
     }
 
-    const raw: RequestDescriptor['raw'] | undefined = url && !liveAfterDecode
-      ? {
-          url: url.href,
-          ...(extracted.parsedBody !== undefined && { parsedBody: extracted.parsedBody }),
-          ...(extracted.rawBodyText !== undefined && { rawBodyText: extracted.rawBodyText }),
-          ...(arrival.declaredBytes !== undefined && { declaredBytes: arrival.declaredBytes }),
-        }
-      : undefined
-
-    return { safe, raw, releaseDecoded, ...(decodeBudgetExceeded && { decodeBudgetExceeded: true }) }
-  }
-
-  const runPolicyHook = async (
-    hook: PolicyHookConfig,
-    descriptor: RequestDescriptor,
-    parentSignal: AbortSignal,
-    cdpCursorAtArrival: number,
-    httpCursorAtArrival: number,
-  ): Promise<{ decision: PolicyDecision; busy?: boolean }> => {
-    const decisionId = crypto.randomUUID()
-    const deadlineDuration = hook.deadlineMs ?? 20_000
-    const deadlineMs = Date.now() + deadlineDuration
-    const start = performance.now()
-    const makeErrorDecision = (): PolicyDecision => ({
-      decisionId,
-      mode: hook.mode,
-      stage: 1,
-      action: 'deny',
-      ruleId: 'policy_error',
-      policyVersion: 'host-fallback',
-      ms: Math.round(performance.now() - start),
-    })
-
-    const isValidDecision = (dec: unknown): dec is PolicyDecision =>
-      Boolean(dec && typeof (dec as any).action === 'string' && ['allow', 'deny', 'escalate', 'requireApproval'].includes((dec as any).action))
-
-    // Per-call child AbortController aborted on parent disconnect OR deadline timeout
-    const hookAbort = new AbortController()
-    const onParentAbort = () => hookAbort.abort()
-    if (parentSignal.aborted) hookAbort.abort()
-    else parentSignal.addEventListener('abort', onParentAbort, { once: true })
-
-    const ctx: PolicyContext = {
-      decisionId,
-      signal: hookAbort.signal,
-      deadlineMs,
-      intent: opts?.auditV2?.intent,
-      recentCdpCursor: cdpCursorAtArrival,
-      recentHttpCursor: httpCursorAtArrival,
-    }
-
-    // 1. Optional explicit synchronous Stage-1 pre-check (never consumes async hook slot!)
-    if (hook.checkSync) {
-      let syncRes: PolicyDecision | undefined
-      let isThenable = false
-      try {
-        syncRes = hook.checkSync(descriptor, ctx)
-        if (syncRes !== undefined) {
-          isThenable = typeof (syncRes as any)?.then === 'function'
-        }
-      } catch {
-        parentSignal.removeEventListener('abort', onParentAbort)
-        return { decision: makeErrorDecision() }
-      }
-      if (syncRes !== undefined) {
-        if (isThenable) {
-          Promise.resolve(syncRes).catch(() => {})
-          hookAbort.abort()
-          parentSignal.removeEventListener('abort', onParentAbort)
-          return { decision: makeErrorDecision() }
-        }
-        parentSignal.removeEventListener('abort', onParentAbort)
-        if (!isValidDecision(syncRes)) return { decision: makeErrorDecision() }
-        return { decision: { ...syncRes, decisionId } }
-      }
-    }
-
-    // 2. Explicit sync-only evaluate() contract (fails closed if a Promise is returned)
-    if (hook.sync === true) {
-      let result: PolicyDecision | Promise<PolicyDecision>
-      let isThenable = false
-      try {
-        result = hook.evaluate(descriptor, ctx)
-        isThenable = Boolean(result && typeof (result as any).then === 'function')
-      } catch {
-        parentSignal.removeEventListener('abort', onParentAbort)
-        return { decision: makeErrorDecision() }
-      }
-      if (isThenable) {
-        Promise.resolve(result).catch(() => {})
-        hookAbort.abort()
-        parentSignal.removeEventListener('abort', onParentAbort)
-        return { decision: makeErrorDecision() }
-      }
-      parentSignal.removeEventListener('abort', onParentAbort)
-      if (!isValidDecision(result)) return { decision: makeErrorDecision() }
-      return { decision: { ...result, decisionId } }
-    }
-
-    // 3. Default async-capable evaluate(): reserve concurrency capacity BEFORE invoking evaluate()!
-    if (hook.mode === 'enforce' && activeAsyncHooks >= maxConcurrentAsyncHooks) {
-      parentSignal.removeEventListener('abort', onParentAbort)
-      return { decision: makeErrorDecision(), busy: true }
-    }
-
-    activeAsyncHooks++
-    let result: PolicyDecision | Promise<PolicyDecision>
-    let isThenable = false
-    try {
-      result = hook.evaluate(descriptor, ctx)
-      isThenable = Boolean(result && typeof (result as any).then === 'function')
-    } catch {
-      activeAsyncHooks = Math.max(0, activeAsyncHooks - 1)
-      parentSignal.removeEventListener('abort', onParentAbort)
-      return { decision: makeErrorDecision() }
-    }
-
-    // Synchronous return from an async-capable hook releases the reserved slot immediately
-    if (!isThenable) {
-      activeAsyncHooks = Math.max(0, activeAsyncHooks - 1)
-      parentSignal.removeEventListener('abort', onParentAbort)
-      if (!isValidDecision(result)) return { decision: makeErrorDecision() }
-      return { decision: { ...result, decisionId } }
-    }
-
-    const promise = Promise.resolve(result)
-    // Observe every promise so rejections never become unhandledProcessRejections
-    promise.catch(() => {})
-
-    // Slot stays occupied until underlying promise ACTUALLY settles (not released prematurely on timeout!)
-    void promise.finally(() => {
-      activeAsyncHooks = Math.max(0, activeAsyncHooks - 1)
-      parentSignal.removeEventListener('abort', onParentAbort)
-    }).catch(() => {})
-
-    let timer: NodeJS.Timeout | undefined
-    try {
-      const settled = await Promise.race([
-        promise,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            hookAbort.abort()
-            reject(new Error('policy timeout'))
-          }, deadlineDuration)
-          timer.unref?.()
-        }),
-      ])
-      if (!settled || typeof settled.action !== 'string' || !['allow', 'deny', 'escalate', 'requireApproval'].includes(settled.action)) {
-        return { decision: makeErrorDecision() }
-      }
-      return { decision: { ...settled, decisionId } }
-    } catch {
-      return { decision: makeErrorDecision() }
-    } finally {
-      clearTimeout(timer)
-    }
+    return { safe, releaseDecoded }
   }
 
   const forward = (req: http.IncomingMessage, res: http.ServerResponse) => {
@@ -1439,17 +1039,14 @@ export function startProxy(
   ) => {
     const httpCursorAtArrival = cursorCounter
     const cdpCursorAtArrival = opts?.getCdpCursor?.() ?? 0
-    const revAtStart = opts?.getSiteConfigRev?.()
     const liveAtStart = isLiveNow()
     const genAtStart = liveGen?.()
 
     try { vault?.ingestRequestHeaders(req.headers) } catch {}
 
-    // Build effective outbound snapshot BEFORE deriving RequestDescriptor so site.headers are accounted for!
     const outboundSnap = url ? buildOutboundSnapshot(req, url) : undefined
     const arrival = classifyArrival(req, url, outboundSnap?.headers)
 
-    // Single persistent cancellation owner installed at arrival and kept through dispatch
     const abortController = new AbortController()
     activeAbortControllers.add(abortController)
     const onReqErr = () => abortController.abort()
@@ -1462,7 +1059,6 @@ export function startProxy(
       res.off('close', onResClose)
     }
 
-    // Register in activeInFlight IMMEDIATELY at arrival so seal() can NEVER lose an accepted request!
     let reserved = 0
     let terminalCommitted = false
     let cleanupExtra: (() => void) | undefined
@@ -1482,7 +1078,7 @@ export function startProxy(
       cleanupExtra?.()
       const fb = buildFallbackProjection({
         req, url, seq, t, kind: 'http', arrival, liveAtStart,
-        httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart, reason,
+        httpCursorAtArrival, cdpCursorAtArrival, reason,
       })
       const lateLive = !liveAtStart && (isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart))
       appendV2Entry({
@@ -1512,7 +1108,7 @@ export function startProxy(
       const built = await buildSafeProjection({
         req, url, seq, t, kind: 'http', prefixBuf: Buffer.alloc(0), bodyComplete: false,
         transport: 'not-read', transportReasons: [], liveAtStart, genAtStart, arrival,
-        hasBody: false, httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
+        hasBody: false, httpCursorAtArrival, cdpCursorAtArrival,
       })
       built.releaseDecoded()
       if (!terminalCommitted) {
@@ -1540,204 +1136,7 @@ export function startProxy(
       }
     }
 
-    const activeHook = selectActiveHook(policyHook, liveAtStart)
-
-    // ---- ENFORCE MODE ----
-    if (activeHook && activeHook.mode === 'enforce') {
-      let prefixBuf = Buffer.alloc(0)
-      let overflowChunks: Buffer[] = []
-      let bodyComplete = false
-      let transport: 'complete' | 'truncated' | 'not-read' = 'not-read'
-      let transportReasons: string[] = []
-      let totalReqBytes = 0
-      let releasePrefixBudget = () => {}
-      let onEndFlag = () => req.readableEnded
-
-      if (arrival.hasPotentialBody) {
-        const pr = await readBoundedPrefix(req, inFlightTracker, clientId, sessionId, prefixTimeoutMs, abortController.signal)
-        prefixBuf = pr.prefixBuf
-        overflowChunks = pr.overflowChunks
-        bodyComplete = pr.bodyComplete
-        transport = pr.transport
-        transportReasons = pr.reasons
-        totalReqBytes = pr.totalReadBytes
-        stateRef.reqBytes = totalReqBytes
-        releasePrefixBudget = pr.releaseBudget
-        onEndFlag = pr.onEndFlag
-        cleanupExtra = () => releasePrefixBudget()
-
-        if (pr.aborted || sealed) {
-          releasePrefixBudget()
-          if (!terminalCommitted) {
-            const built = await buildSafeProjection({
-              req, url, seq, t, kind: 'http', prefixBuf, bodyComplete: false,
-              transport: 'truncated', transportReasons: [...transportReasons, 'client-abort'],
-              liveAtStart, genAtStart, arrival, hasBody: totalReqBytes > 0,
-              httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
-            })
-            built.releaseDecoded()
-            if (!terminalCommitted) {
-              terminalCommitted = true
-              activeInFlight.delete(seq)
-              cleanupCancellation()
-              appendV2Entry({ ...built.safe, status: 0, reqBytes: totalReqBytes, dispatch: 'not_dispatched', incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
-              reserved = 0
-            }
-          }
-          return
-        }
-
-        if (pr.budgetExceeded) {
-          releasePrefixBudget()
-          const built = await buildSafeProjection({
-            req, url, seq, t, kind: 'http', prefixBuf, bodyComplete: false,
-            transport: 'truncated', transportReasons: [...transportReasons, 'inflight-budget'],
-            liveAtStart, genAtStart, arrival, hasBody: totalReqBytes > 0,
-            httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
-          })
-          built.releaseDecoded()
-          if (!terminalCommitted) {
-            terminalCommitted = true
-            activeInFlight.delete(seq)
-            cleanupCancellation()
-            appendV2Entry({ ...built.safe, status: 503, blocked: 'capture budget exceeded', dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
-            reserved = 0
-          }
-          res.writeHead(503, { 'content-type': 'application/json', connection: 'close' }).end(JSON.stringify({ error: 'capture budget exceeded' }))
-          return
-        }
-      }
-
-      const built = await buildSafeProjection({
-        req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'http', prefixBuf, bodyComplete, transport, transportReasons,
-        liveAtStart, genAtStart, arrival, hasBody: totalReqBytes > 0,
-        httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
-      })
-      cleanupExtra = () => { releasePrefixBudget(); built.releaseDecoded() }
-
-      if (built.decodeBudgetExceeded) {
-        releasePrefixBudget()
-        built.releaseDecoded()
-        if (!terminalCommitted) {
-          terminalCommitted = true
-          activeInFlight.delete(seq)
-          cleanupCancellation()
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 503, blocked: 'capture budget exceeded', dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        }
-        res.writeHead(503, { 'content-type': 'application/json', connection: 'close' }).end(JSON.stringify({ error: 'capture budget exceeded' }))
-        return
-      }
-
-      const hookRes = await runPolicyHook(activeHook, { safe: built.safe, raw: built.raw }, abortController.signal, cdpCursorAtArrival, httpCursorAtArrival)
-      built.releaseDecoded()
-
-      if (hookRes.busy) {
-        releasePrefixBudget()
-        if (!terminalCommitted) {
-          terminalCommitted = true
-          activeInFlight.delete(seq)
-          cleanupCancellation()
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 503, blocked: 'policy busy', dispatch: 'not_dispatched', policy: hookRes.decision, ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        }
-        res.writeHead(503, { 'content-type': 'application/json', connection: 'close' }).end(JSON.stringify({ error: 'policy evaluator busy' }))
-        return
-      }
-
-      if (abortController.signal.aborted || res.destroyed || (!req.readableEnded && req.destroyed) || req.socket?.destroyed || sealed || admissionStopped) {
-        releasePrefixBudget()
-        if (!terminalCommitted) {
-          terminalCommitted = true
-          activeInFlight.delete(seq)
-          cleanupCancellation()
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, reqBytes: totalReqBytes, dispatch: 'not_dispatched', policy: hookRes.decision, incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        }
-        return
-      }
-
-      if (hookRes.decision.action !== 'allow') {
-        releasePrefixBudget()
-        if (!terminalCommitted) {
-          terminalCommitted = true
-          activeInFlight.delete(seq)
-          cleanupCancellation()
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({
-            ...ll.safe,
-            ...(ll.liveAtEnd && { liveAtEnd: true as const }),
-            status: 403,
-            blocked: 'blocked by policy',
-            dispatch: 'not_dispatched',
-            policy: hookRes.decision,
-            ms: Math.round(performance.now() - startMs),
-          }, reserved)
-          reserved = 0
-        }
-        const respHeaders: Record<string, string> = { 'content-type': 'application/json' }
-        if (!bodyComplete) respHeaders.connection = 'close'
-        res.writeHead(403, respHeaders).end(JSON.stringify({
-          error: 'blocked by policy',
-          ruleId: hookRes.decision.ruleId,
-          decisionId: hookRes.decision.decisionId,
-        }))
-        return
-      }
-
-      // Recheck BOTH host authorization AND siteConfigRev after async wait!
-      const revChanged = revAtStart !== undefined && opts?.getSiteConfigRev?.() !== revAtStart
-      const recheckBlocked = check(url) ?? (revChanged ? 'site config changed' : undefined)
-      if (recheckBlocked) {
-        releasePrefixBudget()
-        if (!terminalCommitted) {
-          terminalCommitted = true
-          activeInFlight.delete(seq)
-          cleanupCancellation()
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({
-            ...ll.safe,
-            ...(ll.liveAtEnd && { liveAtEnd: true as const }),
-            status: 403,
-            blocked: recheckBlocked,
-            dispatch: 'not_dispatched',
-            policy: hookRes.decision,
-            ms: Math.round(performance.now() - startMs),
-          }, reserved)
-          reserved = 0
-        }
-        const respHeaders: Record<string, string> = { 'content-type': 'text/plain' }
-        if (!bodyComplete) respHeaders.connection = 'close'
-        res.writeHead(403, respHeaders).end(`rollforward-browser: ${recheckBlocked}: ${req.method} ${url?.href ?? req.url}\n`)
-        return
-      }
-
-      dispatchUpstream({
-        req, res, url: url!, outboundSnap: outboundSnap!, seq, t, startMs,
-        liveAtStart, genAtStart, arrival, revAtStart,
-        httpCursorAtArrival, cdpCursorAtArrival,
-        getReserved: () => { const r = reserved; reserved = 0; return r },
-        abortController, cleanupCancellation,
-        isCommitted: () => terminalCommitted,
-        markCommitted: () => { terminalCommitted = true; activeInFlight.delete(seq) },
-        stateRef,
-        preBuiltSafe: built.safe,
-        policyDecision: hookRes.decision,
-        replay: {
-          chunks: [...(prefixBuf.length ? [prefixBuf] : []), ...overflowChunks],
-          initialBytes: totalReqBytes,
-          isEnded: onEndFlag,
-          releaseBudget: releasePrefixBudget,
-        },
-      })
-      return
-    }
-
-    // ---- OBSERVE OR SHADOW MODE ----
-    // Uses the EXACT SAME 65,536-byte / 10 s cutoff state machine as PrefixReader!
+    // Observe-mode bounded 64 KiB prefix tee
     const teeChunks: Buffer[] = []
     let teeLen = 0
     let teeAcquired = 0
@@ -1797,13 +1196,11 @@ export function startProxy(
           return
         }
         teeAcquired += take
-        // Copy small slice so we never pin a giant backing buffer
         teeChunks.push(Buffer.from(chunk.subarray(0, take)))
         teeLen += take
         if (chunk.length > take) {
           freezeTee(false, '>64KiB')
         } else if (teeLen === MAX_PREFIX_BYTES) {
-          // Exact 65,536-byte parity with PrefixReader!
           if (req.readableEnded) freezeTee(true)
           else freezeTee(false, '>=64KiB')
         }
@@ -1813,38 +1210,34 @@ export function startProxy(
       if (!teeFrozen) freezeTee(true)
     })
 
-    let shadowDecision: PolicyDecision | undefined
-    let emittedEntryN: number | null = null
-    let pendingShadowLate: PolicyDecision | undefined
-    let consumersLeft = activeHook && activeHook.mode === 'shadow' ? 2 : 1
-    let builtPromise: Promise<{ safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void }> | undefined
-    let resolvedBuilt: { safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void } | undefined
+    let builtPromise: Promise<{ safe: SafeRequestProjection; releaseDecoded: () => void }> | undefined
+    let resolvedBuilt: { safe: SafeRequestProjection; releaseDecoded: () => void } | undefined
+    let released = false
 
-    const releaseObserveConsumer = (built?: { safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void }) => {
+    const releaseObserve = (built?: { safe: SafeRequestProjection; releaseDecoded: () => void }) => {
       if (built) resolvedBuilt = built
-      consumersLeft--
-      if (consumersLeft <= 0) {
-        resolvedBuilt?.releaseDecoded()
-        releaseTeeBudget()
-      }
+      if (released) return
+      released = true
+      resolvedBuilt?.releaseDecoded()
+      releaseTeeBudget()
     }
 
     const buildObserveDescriptor = async () => {
       const prefixBuf = teeChunks.length === 1 ? teeChunks[0] : Buffer.concat(teeChunks)
-      teeChunks.length = 0 // drop chunk array immediately; charge stays held until all consumers finish!
+      teeChunks.length = 0
       const built = await buildSafeProjection({
         req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'http', prefixBuf,
         bodyComplete: teeComplete,
         transport: teeTransport,
         transportReasons: teeReasons,
         liveAtStart, genAtStart, arrival, hasBody: totalReqBytes > 0,
-        httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
+        httpCursorAtArrival, cdpCursorAtArrival,
       })
       resolvedBuilt = built
       if (budgetHit && built.safe.isWrite && (!built.safe.reqOmitted || built.safe.reqOmitted === 'policy-profile')) {
         built.safe.reqOmitted = 'budget'
       }
-      if (sealed || consumersLeft <= 0) {
+      if (sealed || released) {
         built.releaseDecoded()
         releaseTeeBudget()
       }
@@ -1858,51 +1251,17 @@ export function startProxy(
 
     cleanupExtra = () => {
       clearTimeout(prefixTimer)
-      consumersLeft = 0
       if (builtPromise) void builtPromise.then(b => b.releaseDecoded(), () => {})
-      resolvedBuilt?.releaseDecoded()
-      releaseTeeBudget()
+      releaseObserve()
     }
 
-    if (activeHook && activeHook.mode === 'shadow') {
-      void prefixFrozenPromise.then(async () => {
-        if (sealed) {
-          if (builtPromise) void builtPromise.then(b => b.releaseDecoded(), () => {})
-          releaseObserveConsumer()
-          return
-        }
-        let desc: { safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void } | undefined
-        try {
-          desc = await getBuilt()
-          const hr = await runPolicyHook(activeHook, { safe: desc.safe, raw: desc.raw }, abortController.signal, cdpCursorAtArrival, httpCursorAtArrival)
-          shadowDecision = hr.decision
-          if (emittedEntryN !== null && !sealed) {
-            appendLateOutcome({
-              rec: 'http_end',
-              ref: emittedEntryN,
-              t: new Date().toISOString(),
-              ms: Math.round(performance.now() - startMs),
-              policy: shadowDecision,
-            })
-          } else {
-            pendingShadowLate = shadowDecision
-          }
-        } catch {
-          // shadow failure never disrupts observe path
-        } finally {
-          releaseObserveConsumer(desc)
-        }
-      })
-    } else {
-      // Eagerly compute projection as soon as prefix is frozen so finalizeAtSeal() preserves bodyShape/actions!
-      void prefixFrozenPromise.then(() => {
-        if (!sealed) void getBuilt().catch(() => {})
-      })
-    }
+    void prefixFrozenPromise.then(() => {
+      if (!sealed) void getBuilt().catch(() => {})
+    })
 
     dispatchUpstream({
       req, res, url: url!, outboundSnap: outboundSnap!, seq, t, startMs,
-      liveAtStart, genAtStart, arrival, revAtStart,
+      liveAtStart, genAtStart, arrival,
       httpCursorAtArrival, cdpCursorAtArrival,
       getReserved: () => { const r = reserved; reserved = 0; return r },
       abortController, cleanupCancellation,
@@ -1910,23 +1269,16 @@ export function startProxy(
       markCommitted: () => { terminalCommitted = true; activeInFlight.delete(seq) },
       stateRef,
       getLazySafe: async () => {
-        let desc: { safe: SafeRequestProjection; raw?: RequestDescriptor['raw']; releaseDecoded: () => void } | undefined
+        let desc: { safe: SafeRequestProjection; releaseDecoded: () => void } | undefined
         try {
           desc = await getBuilt()
           return desc.safe
         } finally {
-          releaseObserveConsumer(desc)
+          releaseObserve(desc)
         }
       },
       getResolvedSafe: () => resolvedBuilt?.safe,
       onSealFinalize: () => cleanupExtra(),
-      getShadowDecision: () => shadowDecision ?? pendingShadowLate,
-      onEmittedN: n => {
-        emittedEntryN = n
-        if (n !== null && pendingShadowLate && !sealed) {
-          pendingShadowLate = undefined
-        }
-      },
       getReqBytes: () => totalReqBytes,
       onCleanupTee: () => { clearTimeout(prefixTimer) },
     })
@@ -1943,7 +1295,6 @@ export function startProxy(
     liveAtStart: boolean
     genAtStart: number | undefined
     arrival: ReturnType<typeof classifyArrival>
-    revAtStart: number | undefined
     httpCursorAtArrival: number
     cdpCursorAtArrival: number
     getReserved: () => number
@@ -1952,25 +1303,14 @@ export function startProxy(
     isCommitted: () => boolean
     markCommitted: () => void
     stateRef: { status: number; dispatch: 'not_dispatched' | 'dispatched' | 'unknown'; reqBytes: number; resBytes: number; error?: string }
-    preBuiltSafe?: SafeRequestProjection
-    policyDecision?: PolicyDecision
-    getLazySafe?: () => Promise<SafeRequestProjection>
-    getResolvedSafe?: () => SafeRequestProjection | undefined
-    onSealFinalize?: () => void
-    getShadowDecision?: () => PolicyDecision | undefined
-    onEmittedN?: (n: number | null) => void
-    getReqBytes?: () => number
-    onCleanupTee?: () => void
-    replay?: {
-      chunks: Buffer[]
-      initialBytes: number
-      isEnded: () => boolean
-      releaseBudget: () => void
-    }
+    getLazySafe: () => Promise<SafeRequestProjection>
+    getResolvedSafe: () => SafeRequestProjection | undefined
+    onSealFinalize: () => void
+    getReqBytes: () => number
+    onCleanupTee: () => void
   }) => {
     const { req, res, url, outboundSnap, seq, t, startMs, liveAtStart, genAtStart, arrival, abortController, cleanupCancellation, stateRef } = ctx
     let resBytes = 0
-    let replayTailBytes = 0
     let status = 0
     let resType: string | undefined
     let headerMs: number | undefined
@@ -1978,12 +1318,12 @@ export function startProxy(
     let emitStarted = false
     let emittedN: number | null = null
     let timedOutStream = false
-    let reqDone = req.readableEnded || (!arrival.hasPotentialBody && !ctx.replay)
+    let reqDone = req.readableEnded || !arrival.hasPotentialBody
     let resDone = false
     let lateEmitted = false
     const pendingLateOutcomes: Array<Omit<LateOutcomeEntry, 'n' | 'ref'>> = []
 
-    const totalReqBytes = () => ctx.replay ? ctx.replay.initialBytes + replayTailBytes : (ctx.getReqBytes?.() ?? 0)
+    const totalReqBytes = () => ctx.getReqBytes()
 
     const flushPendingLate = () => {
       if (emittedN === null || sealed) return
@@ -2004,7 +1344,6 @@ export function startProxy(
         finalSafe.reqOmitted = 'live'
       }
       const scrubbedErr = errorMsg ? scrubText(errorMsg, vault).text : undefined
-      const decision = ctx.policyDecision ?? ctx.getShadowDecision?.()
 
       const n = appendV2Entry({
         ...finalSafe,
@@ -2016,13 +1355,11 @@ export function startProxy(
         ...(headerMs !== undefined && { headerMs }),
         ms,
         dispatch: optsEmit.forceDispatch ?? 'dispatched',
-        ...(decision && { policy: decision }),
         ...(lateLive && { liveAtEnd: true as const }),
         ...(optsEmit.incomplete && { incomplete: true as const }),
       }, ctx.getReserved())
 
       emittedN = n
-      ctx.onEmittedN?.(n)
       flushPendingLate()
     }
 
@@ -2030,24 +1367,19 @@ export function startProxy(
       if (emitStarted || ctx.isCommitted()) return
       emitStarted = true
       clearTimeout(streamTimer)
-      ctx.onCleanupTee?.()
+      ctx.onCleanupTee()
 
-      if (ctx.preBuiltSafe) {
-        commitProjection(ctx.preBuiltSafe, optsEmit)
-      } else if (ctx.getLazySafe) {
-        void ctx.getLazySafe().then(
-          safe => commitProjection(safe, optsEmit),
-          () => {
-            // Never silently drop an observed request on projection error!
-            const fb = buildFallbackProjection({
-              req, url, seq, t, kind: 'http', arrival, liveAtStart,
-              httpCursorAtArrival: ctx.httpCursorAtArrival, cdpCursorAtArrival: ctx.cdpCursorAtArrival,
-              siteConfigRev: ctx.revAtStart, reason: 'extractor-error',
-            })
-            commitProjection(fb, optsEmit)
-          },
-        )
-      }
+      void ctx.getLazySafe().then(
+        safe => commitProjection(safe, optsEmit),
+        () => {
+          const fb = buildFallbackProjection({
+            req, url, seq, t, kind: 'http', arrival, liveAtStart,
+            httpCursorAtArrival: ctx.httpCursorAtArrival, cdpCursorAtArrival: ctx.cdpCursorAtArrival,
+            reason: 'extractor-error',
+          })
+          commitProjection(fb, optsEmit)
+        },
+      )
     }
 
     const queueOrEmitLate = (incomplete?: true) => {
@@ -2083,20 +1415,18 @@ export function startProxy(
     }, streamTimeoutMs)
     streamTimer.unref?.()
 
-    // Update seal finalizer so even during async projection, seal() commits synchronously and releases all budgets!
     activeInFlight.set(seq, {
       finalize: () => {
         if (ctx.isCommitted()) return
         incompleteAtSeal++
         clearTimeout(streamTimer)
-        ctx.onCleanupTee?.()
-        const safe = ctx.preBuiltSafe ?? ctx.getResolvedSafe?.() ?? buildFallbackProjection({
+        ctx.onCleanupTee()
+        const safe = ctx.getResolvedSafe() ?? buildFallbackProjection({
           req, url, seq, t, kind: 'http', arrival, liveAtStart,
           httpCursorAtArrival: ctx.httpCursorAtArrival, cdpCursorAtArrival: ctx.cdpCursorAtArrival,
-          siteConfigRev: ctx.revAtStart, reason: 'sealed-in-flight',
+          reason: 'sealed-in-flight',
         })
-        ctx.onSealFinalize?.()
-        ctx.replay?.releaseBudget()
+        ctx.onSealFinalize()
         cleanupCancellation()
         commitProjection(safe, { incomplete: true, forceDispatch: 'unknown' })
       },
@@ -2106,7 +1436,6 @@ export function startProxy(
       headerMs = Math.round(performance.now() - startMs)
       status = r.statusCode ?? 0
       stateRef.status = status
-      // Ingest Set-Cookie BEFORE projecting response Content-Type so newly issued tokens are scrubbed!
       try { vault?.ingestSetCookie(r.headers['set-cookie']) } catch {}
       resType = normalizeContentType(r.headers['content-type'], vault)
 
@@ -2154,7 +1483,6 @@ export function startProxy(
     activeUpstreams.add(up)
     up.on('close', () => activeUpstreams.delete(up))
 
-    // Link arrival cancellation to upstream destruction
     const onAbort = () => {
       reqDone = true
       resDone = true
@@ -2188,25 +1516,10 @@ export function startProxy(
       }
     })
 
-    if (ctx.replay) {
-      void replayChunksAndPipe(
-        req,
-        up,
-        ctx.replay.chunks,
-        ctx.replay.isEnded,
-        n => { replayTailBytes += n; stateRef.reqBytes = totalReqBytes() },
-        () => { reqDone = true; tryCompleteBoth() },
-        () => ctx.replay!.releaseBudget(),
-      ).catch(() => {
-        ctx.replay!.releaseBudget()
-        up.destroy()
-      })
-    } else {
-      if (!reqDone) {
-        req.once('end', () => { reqDone = true; tryCompleteBoth() })
-      }
-      req.pipe(up)
+    if (!reqDone) {
+      req.once('end', () => { reqDone = true; tryCompleteBoth() })
     }
+    req.pipe(up)
   }
 
   const forwardUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
@@ -2260,12 +1573,11 @@ export function startProxy(
       return
     }
 
-    // ---- auditV2 / policyHook upgrade path ----
+    // ---- auditV2 upgrade path ----
     const seq = ++seqCounter
     void (async () => {
       const httpCursorAtArrival = cursorCounter
       const cdpCursorAtArrival = opts?.getCdpCursor?.() ?? 0
-      const revAtStart = opts?.getSiteConfigRev?.()
       const liveAtStart = isLiveNow()
       const genAtStart = liveGen?.()
       try { vault?.ingestRequestHeaders(req.headers) } catch {}
@@ -2273,19 +1585,7 @@ export function startProxy(
       const outboundSnap = url ? buildOutboundSnapshot(req, url) : undefined
       const arrival = classifyArrival(req, url, outboundSnap?.headers)
 
-      const abortController = new AbortController()
-      activeAbortControllers.add(abortController)
-      const onSockAbort = () => abortController.abort()
-      socket.once('close', onSockAbort)
-      socket.once('end', onSockAbort)
-      const cleanupAbort = () => {
-        activeAbortControllers.delete(abortController)
-        socket.off('close', onSockAbort)
-        socket.off('end', onSockAbort)
-      }
-
       let committed = false
-      let emittedUpgradeN: number | null = null
       let reserved = 0
       let dispatchState: 'not_dispatched' | 'dispatched' | 'unknown' = 'not_dispatched'
       activeInFlight.set(seq, {
@@ -2294,12 +1594,11 @@ export function startProxy(
           committed = true
           incompleteAtSeal++
           activeInFlight.delete(seq)
-          cleanupAbort()
           const fb = buildFallbackProjection({
             req, url, seq, t, kind: 'upgrade', arrival, liveAtStart,
-            httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart, reason: 'sealed-in-flight',
+            httpCursorAtArrival, cdpCursorAtArrival, reason: 'sealed-in-flight',
           })
-          emittedUpgradeN = appendV2Entry({ ...fb, status: 0, dispatch: dispatchState === 'dispatched' ? 'unknown' : 'not_dispatched', incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
+          appendV2Entry({ ...fb, status: 0, dispatch: dispatchState === 'dispatched' ? 'unknown' : 'not_dispatched', incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         },
       })
@@ -2307,7 +1606,7 @@ export function startProxy(
       const built = await buildSafeProjection({
         req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'upgrade', prefixBuf: Buffer.alloc(0), bodyComplete: false,
         transport: 'not-read', transportReasons: [], liveAtStart, genAtStart, arrival,
-        hasBody: false, httpCursorAtArrival, cdpCursorAtArrival, siteConfigRev: revAtStart,
+        hasBody: false, httpCursorAtArrival, cdpCursorAtArrival,
       })
       built.releaseDecoded()
 
@@ -2316,8 +1615,7 @@ export function startProxy(
         if (!committed) {
           committed = true
           activeInFlight.delete(seq)
-          cleanupAbort()
-          emittedUpgradeN = appendV2Entry({ ...built.safe, status: 403, blocked, dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
+          appendV2Entry({ ...built.safe, status: 403, blocked, dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         }
         socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n')
@@ -2330,7 +1628,6 @@ export function startProxy(
           reserved = 0
           committed = true
           activeInFlight.delete(seq)
-          cleanupAbort()
           refusedFullCount++
           const fullJson = JSON.stringify({ error: 'audit log full' })
           socket.end(`HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(fullJson)}\r\nconnection: close\r\n\r\n${fullJson}`)
@@ -2338,86 +1635,12 @@ export function startProxy(
         }
       }
 
-      const activeHook = selectActiveHook(policyHook, liveAtStart)
-      let policyDecision: PolicyDecision | undefined
-      if (activeHook) {
-        if (activeHook.mode === 'enforce') {
-          const hr = await runPolicyHook(activeHook, { safe: built.safe, raw: built.raw }, abortController.signal, cdpCursorAtArrival, httpCursorAtArrival)
-          policyDecision = hr.decision
-          if (hr.busy) {
-            if (!committed) {
-              committed = true
-              activeInFlight.delete(seq)
-              cleanupAbort()
-              const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-              emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 503, blocked: 'policy busy', dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) }, reserved)
-              reserved = 0
-            }
-            socket.end('HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\n\r\n')
-            return
-          }
-          if (abortController.signal.aborted || socket.destroyed || sealed || admissionStopped) {
-            if (!committed) {
-              committed = true
-              activeInFlight.delete(seq)
-              cleanupAbort()
-              const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-              emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, dispatch: 'not_dispatched', policy: policyDecision, incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
-              reserved = 0
-            }
-            socket.destroy()
-            return
-          }
-          if (policyDecision.action !== 'allow') {
-            if (!committed) {
-              committed = true
-              activeInFlight.delete(seq)
-              cleanupAbort()
-              const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-              emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 403, blocked: 'blocked by policy', dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) }, reserved)
-              reserved = 0
-            }
-            const bodyJson = JSON.stringify({ error: 'blocked by policy', ruleId: policyDecision.ruleId, decisionId: policyDecision.decisionId })
-            socket.end(`HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(bodyJson)}\r\nconnection: close\r\n\r\n${bodyJson}`)
-            return
-          }
-          const revChanged = revAtStart !== undefined && opts?.getSiteConfigRev?.() !== revAtStart
-          const recheck = check(url) ?? (revChanged ? 'site config changed' : undefined)
-          if (recheck) {
-            if (!committed) {
-              committed = true
-              activeInFlight.delete(seq)
-              cleanupAbort()
-              const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-              emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 403, blocked: recheck, dispatch: 'not_dispatched', policy: policyDecision, ms: Math.round(performance.now() - startMs) }, reserved)
-              reserved = 0
-            }
-            socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n')
-            return
-          }
-        } else {
-          void runPolicyHook(activeHook, { safe: built.safe, raw: built.raw }, abortController.signal, cdpCursorAtArrival, httpCursorAtArrival).then(hr => {
-            policyDecision = hr.decision
-            if (emittedUpgradeN !== null && !sealed) {
-              appendLateOutcome({
-                rec: 'http_end',
-                ref: emittedUpgradeN,
-                t: new Date().toISOString(),
-                ms: Math.round(performance.now() - startMs),
-                policy: policyDecision,
-              })
-            }
-          }).catch(() => {})
-        }
-      }
-
-      if (abortController.signal.aborted || socket.destroyed || sealed || admissionStopped) {
+      if (socket.destroyed || sealed || admissionStopped) {
         if (!committed) {
           committed = true
           activeInFlight.delete(seq)
-          cleanupAbort()
           const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, dispatch: 'not_dispatched', ...(policyDecision && { policy: policyDecision }), incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
+          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, dispatch: 'not_dispatched', incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         }
         socket.destroy()
@@ -2445,9 +1668,8 @@ export function startProxy(
         if (!committed) {
           committed = true
           activeInFlight.delete(seq)
-          cleanupAbort()
           const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 101, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) }, reserved)
+          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 101, dispatch: 'dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         }
         socket.write(`HTTP/1.1 101 Switching Protocols\r\n${Object.entries(r.headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`)
@@ -2460,9 +1682,8 @@ export function startProxy(
         if (!committed) {
           committed = true
           activeInFlight.delete(seq)
-          cleanupAbort()
           const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: r.statusCode ?? 0, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) }, reserved)
+          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: r.statusCode ?? 0, dispatch: 'dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         }
         socket.end(`HTTP/1.1 ${r.statusCode} ${r.statusMessage}\r\nconnection: close\r\n\r\n`)
@@ -2472,9 +1693,8 @@ export function startProxy(
         if (!committed) {
           committed = true
           activeInFlight.delete(seq)
-          cleanupAbort()
           const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          emittedUpgradeN = appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 502, error: err, dispatch: 'dispatched', ...(policyDecision && { policy: policyDecision }), ms: Math.round(performance.now() - startMs) }, reserved)
+          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 502, error: err, dispatch: 'dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
           reserved = 0
         }
         socket.end('HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n')

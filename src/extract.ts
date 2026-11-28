@@ -817,8 +817,6 @@ export type ExtractOutput = {
   reqTrunc?: true
   reqOmitted?: BodyOmittedReason
   vaultRedactions: number
-  parsedBody?: unknown
-  rawBodyText?: string
 }
 
 const E1_ENDPOINTS = new Set(['formservice', 'appstack', 'dataservice', 'orchestrator', 'file', 'tokenrequest', 'discover', 'defaultconfig'])
@@ -1287,8 +1285,6 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       ...(reqTrunc && { reqTrunc }),
       ...(reqOmitted && { reqOmitted }),
       vaultRedactions,
-      ...(isJson && !input.isLive && { parsedBody: parsedJson }),
-      ...(decodedText !== undefined && !input.isLive && { rawBodyText: decodedText }),
     }
   } catch {
     return {
