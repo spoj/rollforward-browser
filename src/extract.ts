@@ -1,17 +1,48 @@
 import zlib from 'node:zlib'
 import {
-  buildBodyShape,
-  buildFormBodyShape,
   isDataLikeKey,
   isSensitiveValue,
   parseJsonSafe,
   scrubStructuralKey,
   scrubText,
   truncateUtf8HeadTail,
-} from './redact.ts'
+} from './shared/redact.ts'
+import {
+  E1_MUTATING_FORM_COMMANDS,
+  MAX_PREFIX_BYTES,
+  computeTargetDigest,
+  decodeUtf8Prefix,
+  extractSemantic as sharedExtractSemantic,
+  type Completeness,
+  type SemanticAction,
+} from './shared/classify.ts'
 
-export const EXTRACTOR_V = 1
-export const MAX_PREFIX_BYTES = 65_536
+export {
+  DESC_V,
+  E1_MUTATING_FORM_COMMANDS,
+  EXTRACTOR_V,
+  MAX_PREFIX_BYTES,
+  SAFE_METHODS,
+  canonicalSqlPayload,
+  canonicalTargetPayload,
+  classifySqlStatement,
+  computeSqlContextDigest,
+  computeTargetDigest,
+  decodePathSegmentsStrict,
+  decodeUtf8Prefix,
+  extractSharePointRestSubpath,
+  hasBinaryMagic,
+  hasIfNoneMatchStar,
+  hasStrongIfMatch,
+  isBinaryContentType,
+  parseSemanticMethods,
+  validateSharePointDeleteIds,
+  type Completeness,
+  type SafeRequestProjection as SharedSafeRequestProjection,
+  type SemanticAction,
+  type SemanticMethodInfo,
+  type SqlClassification,
+} from './shared/classify.ts'
 
 export type BodyOmittedReason =
   | 'live'
@@ -21,21 +52,6 @@ export type BodyOmittedReason =
   | 'encoded'
   | 'timeout'
   | 'policy-profile'
-
-export type SemanticAction = {
-  family: 'e1-ais' | 'sharepoint' | 'graphql' | 'soap' | 'rest' | 'api' | 'upgrade'
-  op: string
-  resource?: string
-  details?: Record<string, unknown>
-  coverage: 'complete' | 'partial' | 'opaque-batch' | 'persisted-query-unknown' | 'unknown'
-}
-
-export type Completeness = {
-  transport: 'complete' | 'truncated' | 'not-read'
-  decode: 'complete' | 'truncated' | 'error' | 'none'
-  extract: 'complete' | 'partial' | 'opaque' | 'none'
-  reasons?: string[]
-}
 
 export type GraphqlOp = 'query' | 'mutation' | 'subscription' | 'mixed' | 'persisted'
 
@@ -104,44 +120,6 @@ export function normalizeContentType(header: string | undefined): string | undef
   if (!header) return undefined
   const e = header.split(';')[0].trim().toLowerCase()
   return e ? (SAFE_MIME_RE.test(e) ? e : 'other') : undefined
-}
-
-export function isBinaryContentType(reqType: string | undefined): boolean {
-  if (!reqType) return false
-  if (reqType === 'multipart/form-data') return true
-  if (reqType.startsWith('image/') || reqType.startsWith('video/') || reqType.startsWith('audio/') || reqType.startsWith('font/')) return true
-  return (
-    reqType === 'application/octet-stream' ||
-    reqType === 'application/pdf' ||
-    reqType === 'application/zip' ||
-    reqType === 'application/gzip' ||
-    reqType === 'application/wasm'
-  )
-}
-
-export function hasBinaryMagic(buf: Buffer): boolean {
-  if (!buf.length) return false
-  if (buf.length >= 4) {
-    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true
-    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true
-    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return true
-    if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return true
-    if (buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return true
-    if (buf[0] === 0x77 && buf[1] === 0x4f && buf[2] === 0x46 && (buf[3] === 0x46 || buf[3] === 0x32)) return true
-  }
-  return buf.includes(0x00)
-}
-
-export function decodeUtf8Prefix(buf: Buffer, truncated: boolean): string | null {
-  if (!buf.length) return ''
-  const dec = new TextDecoder('utf-8', { fatal: true })
-  const maxTrim = truncated ? Math.min(3, buf.length) : 0
-  for (let trim = 0; trim <= maxTrim; trim++) {
-    try {
-      return dec.decode(trim ? buf.subarray(0, buf.length - trim) : buf)
-    } catch {}
-  }
-  return null
 }
 
 const GQL_STRIP_RE = /"""(?:\\"""|[\s\S])*?"""|"(?:\\.|[^"\\])*"|#[^\r\n]*/g
@@ -233,7 +211,6 @@ export type ExtractOutput = {
   reqOmitted?: BodyOmittedReason
 }
 
-const E1_ENDPOINTS = new Set(['formservice', 'appstack', 'dataservice', 'orchestrator', 'file', 'tokenrequest', 'discover', 'defaultconfig'])
 const STRUCT_IDENT_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,47}$/
 const E1_CONTROL_ID_RE = /^[A-Za-z0-9_.-]{1,32}$/
 const GQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,47}$/
@@ -243,6 +220,79 @@ function validateStructuralIdent(val: unknown, pattern: RegExp, allowNumeric = f
   if (!pattern.test(val) || isSensitiveValue(val)) return undefined
   if (!allowNumeric && isDataLikeKey(val)) return undefined
   return val
+}
+
+function classifyBrowserE1BodyShape(
+  obj: Record<string, unknown>,
+  input: ExtractInput,
+  defaultCov: SemanticAction['coverage'],
+): SemanticAction {
+  const details: Record<string, unknown> = {}
+  const rawFormName = typeof obj.formName === 'string'
+    ? obj.formName
+    : typeof (obj.formRequest as any)?.formName === 'string'
+      ? (obj.formRequest as any).formName
+      : typeof obj.targetName === 'string'
+        ? obj.targetName
+        : undefined
+  const formIdent = validateStructuralIdent(rawFormName, STRUCT_IDENT_RE)
+  if (formIdent) details.formName = formIdent
+  const verIdent = validateStructuralIdent(obj.version, STRUCT_IDENT_RE)
+  if (verIdent) details.version = verIdent
+  const rawAction = typeof obj.action === 'string' ? obj.action : typeof obj.formServiceAction === 'string' ? obj.formServiceAction : undefined
+  const actIdent = validateStructuralIdent(rawAction, /^[A-Za-z][A-Za-z0-9_-]{0,23}$/)
+  if (actIdent) details.action = actIdent
+  const targetTypeIdent = validateStructuralIdent(obj.targetType, STRUCT_IDENT_RE)
+  if (targetTypeIdent) details.targetType = targetTypeIdent
+  const dsTypeIdent = validateStructuralIdent(obj.dataServiceType, STRUCT_IDENT_RE)
+  if (dsTypeIdent) details.dataServiceType = dsTypeIdent
+
+  const rawActions = Array.isArray(obj.formActions)
+    ? obj.formActions
+    : Array.isArray((obj.actionRequest as any)?.formActions)
+      ? (obj.actionRequest as any).formActions
+      : Array.isArray((obj.formRequest as any)?.formActions)
+        ? (obj.formRequest as any).formActions
+        : undefined
+  let hasMutatingFormAction = false
+  if (rawActions) {
+    details.formActions = rawActions.slice(0, 32).map(a => {
+      if (!a || typeof a !== 'object') return { command: 'unknown' }
+      const rec = a as Record<string, unknown>
+      const item: Record<string, string> = {}
+      const cmd = validateStructuralIdent(rec.command, STRUCT_IDENT_RE)
+      if (cmd) {
+        item.command = cmd
+        if (E1_MUTATING_FORM_COMMANDS.has(cmd.toLowerCase())) hasMutatingFormAction = true
+      }
+      const cid = validateStructuralIdent(rec.controlID, E1_CONTROL_ID_RE, true)
+      if (cid) item.controlID = cid
+      return item
+    })
+    if (hasMutatingFormAction) details.hasMutatingFormAction = true
+    if (rawActions.length > 32) details.formActionsTruncated = true
+  }
+  const mutates = hasMutatingFormAction || Boolean(actIdent && ['W', 'C', 'U', 'D'].includes(actIdent.toUpperCase()))
+  if (mutates && formIdent) details.mutatingForms = [formIdent]
+  if (input.isWrite) {
+    details.targetDigest = computeTargetDigest({
+      surface: 'browser',
+      host: input.url.hostname,
+      port: input.url.port,
+      scheme: input.url.protocol.replace(/:$/, ''),
+      rawPathname: input.url.pathname,
+      rawSearch: input.url.search,
+      resourceId: formIdent,
+    })
+  }
+
+  return {
+    family: 'e1-ais',
+    op: actIdent ? `ais:${actIdent}` : `ais:${input.effectiveMethod}`,
+    resource: formIdent ?? input.sanitizedPath,
+    ...(Object.keys(details).length && { details }),
+    coverage: defaultCov,
+  }
 }
 
 export function extractSemantic(input: ExtractInput): ExtractOutput {
@@ -279,287 +329,181 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
     }
 
     const hasBody = rawBuf.length > 0
-    let isBinary = false
-    let decodedText: string | undefined
-    if (hasBody) {
-      if (isBinaryContentType(input.reqType) || hasBinaryMagic(rawBuf)) {
-        isBinary = true
-        reasons.push(input.reqType === 'multipart/form-data' ? 'multipart' : 'binary')
-      } else {
-        const text = decodeUtf8Prefix(rawBuf, !decodeComplete || !input.bodyComplete)
-        if (text === null) {
-          isBinary = true
-          reasons.push('invalid-utf8')
-        } else {
-          decodedText = text
-        }
-      }
-    }
+    const effectiveBodyComplete = input.bodyComplete && decodeComplete
 
-    let parsedJson: unknown
-    let isJson = false
-    let dupKeys = false
-    let structuredJsonParseFailed = false
-    if (decodedText !== undefined) {
-      const trimmed = decodedText.trimStart()
-      const looksJson = input.reqType === 'application/json' || Boolean(input.reqType?.endsWith('+json')) || trimmed.startsWith('{') || trimmed.startsWith('[')
-      const parsed = parseJsonSafe(decodedText)
-      if (parsed.ok) {
-        isJson = true
-        parsedJson = parsed.value
-        dupKeys = parsed.dupKeys
-        if (dupKeys) reasons.push('dupKeys')
-      } else if (looksJson) {
-        structuredJsonParseFailed = true
-        reasons.push('json-parse-failed')
-      }
-    }
+    // Delegate shared core classification (ambiguous path encoding, SharePoint, /jderest/ E1 AIS,
+    // binary/UTF-8/JSON parsing, bodyShape, dupKeys, REST fallback).
+    const shared = sharedExtractSemantic({
+      url: input.url,
+      sanitizedPath: input.sanitizedPath,
+      method: input.method,
+      effectiveMethod: input.effectiveMethod,
+      kind: input.kind,
+      surface: 'browser',
+      hdr: input.hdr,
+      rawHeaders: input.rawHeaders,
+      reqType: input.reqType,
+      decodedBuf: rawBuf,
+      bodyComplete: effectiveBodyComplete,
+      transport: input.transport,
+      transportReasons: reasons,
+      isWrite: input.isWrite,
+      isLive: input.isLive,
+    })
 
-    let bodyShape: Record<string, string> | undefined
-    if (!input.isLive && hasBody && !isBinary) {
-      if (isJson && parsedJson !== null && typeof parsedJson === 'object') {
-        bodyShape = buildBodyShape(parsedJson).shape
-      } else if (decodedText !== undefined && input.reqType === 'application/x-www-form-urlencoded') {
-        bodyShape = buildFormBodyShape(decodedText).shape
-      }
-    }
-
-    const fullyIntact = input.bodyComplete && decodeComplete && !dupKeys
+    const sharedReasons = shared.completeness.reasons ?? []
+    const isBinary = sharedReasons.includes('binary') || sharedReasons.includes('multipart') || sharedReasons.includes('invalid-utf8')
+    const dupKeys = shared.dupKeys === true
+    const fullyIntact = effectiveBodyComplete && !dupKeys
     const defaultCov: SemanticAction['coverage'] = fullyIntact ? 'complete' : 'partial'
-    const lowerPath = input.url.pathname.toLowerCase()
-    const actions: SemanticAction[] = []
+
+    let actions = shared.actions
+    let extractStatus = shared.completeness.extract
     let graphqlOp: GraphqlOp | undefined
-    let extractStatus: Completeness['extract'] = 'none'
+    const outReasons = [...sharedReasons]
 
-    // 1. JD Edwards E1 AIS
-    const obj = isJson && parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)
-      ? (parsedJson as Record<string, unknown>)
-      : undefined
-    const isE1Path = lowerPath.includes('/jderest/')
-    const isE1Shape = !!obj && (
-      typeof obj.formName === 'string' &&
-      (Array.isArray(obj.formActions) || typeof obj.formServiceAction === 'string' || 'actionRequest' in obj || 'formRequest' in obj)
-    )
+    // Browser-only classifiers run only when shared fell through to generic REST or empty actions.
+    const isGenericFallback =
+      actions.length === 0 ||
+      (actions.length === 1 && actions[0].family === 'rest' && actions[0].op !== 'ambiguous_path_encoding')
 
-    if (isE1Path || isE1Shape) {
-      const m = /\/jderest\/(?:v\d+\/)?([^/;?]+)/i.exec(input.url.pathname)
-      const rawEndpoint = m ? m[1].toLowerCase() : 'ais'
-      const endpoint = E1_ENDPOINTS.has(rawEndpoint) ? rawEndpoint : 'ais'
+    if (isGenericFallback) {
+      const decodedText = hasBody && !isBinary ? decodeUtf8Prefix(rawBuf, !effectiveBodyComplete) ?? undefined : undefined
+      const parsed = decodedText !== undefined ? parseJsonSafe(decodedText) : undefined
+      const parsedJson = parsed?.ok ? parsed.value : undefined
+      const obj = parsed?.ok && parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)
+        ? (parsedJson as Record<string, unknown>)
+        : undefined
+      const lowerPath = input.url.pathname.toLowerCase()
 
-      const details: Record<string, unknown> = {}
-      const rawFormName = typeof obj?.formName === 'string'
-        ? obj.formName
-        : typeof (obj?.formRequest as any)?.formName === 'string'
-          ? (obj!.formRequest as any).formName
-          : typeof obj?.targetName === 'string'
-            ? obj.targetName
-            : undefined
+      // 1. Body-shape E1 AIS detection (non-/jderest/ paths)
+      const isE1Shape = Boolean(
+        obj &&
+        typeof obj.formName === 'string' &&
+        (Array.isArray(obj.formActions) || typeof obj.formServiceAction === 'string' || 'actionRequest' in obj || 'formRequest' in obj),
+      )
 
-      const formIdent = validateStructuralIdent(rawFormName, STRUCT_IDENT_RE)
-      if (formIdent) details.formName = formIdent
-      const verIdent = validateStructuralIdent(obj?.version, STRUCT_IDENT_RE)
-      if (verIdent) details.version = verIdent
-      const rawAction = typeof obj?.action === 'string' ? obj.action : typeof obj?.formServiceAction === 'string' ? obj.formServiceAction : undefined
-      const actIdent = validateStructuralIdent(rawAction, /^[A-Za-z][A-Za-z0-9_-]{0,23}$/)
-      if (actIdent) details.action = actIdent
-      const targetTypeIdent = validateStructuralIdent(obj?.targetType, STRUCT_IDENT_RE)
-      if (targetTypeIdent) details.targetType = targetTypeIdent
-      const dsTypeIdent = validateStructuralIdent(obj?.dataServiceType, STRUCT_IDENT_RE)
-      if (dsTypeIdent) details.dataServiceType = dsTypeIdent
-
-      const rawActions = Array.isArray(obj?.formActions)
-        ? obj.formActions
-        : Array.isArray((obj?.actionRequest as any)?.formActions)
-          ? (obj!.actionRequest as any).formActions
-          : Array.isArray((obj?.formRequest as any)?.formActions)
-            ? (obj!.formRequest as any).formActions
-            : undefined
-      if (rawActions) {
-        details.formActions = rawActions.slice(0, 32).map(a => {
-          if (!a || typeof a !== 'object') return { command: 'unknown' }
-          const rec = a as Record<string, unknown>
-          const item: Record<string, string> = {}
-          const cmd = validateStructuralIdent(rec.command, STRUCT_IDENT_RE)
-          if (cmd) item.command = cmd
-          const cid = validateStructuralIdent(rec.controlID, E1_CONTROL_ID_RE, true)
-          if (cid) item.controlID = cid
-          return item
-        })
-        if (rawActions.length > 32) details.formActionsTruncated = true
-      }
-
-      actions.push({
-        family: 'e1-ais',
-        op: actIdent ? `${endpoint}:${actIdent}` : `${endpoint}:${input.effectiveMethod}`,
-        resource: formIdent ?? input.sanitizedPath,
-        ...(Object.keys(details).length && { details }),
-        coverage: defaultCov,
-      })
-      extractStatus = fullyIntact ? 'complete' : 'partial'
-    }
-
-    // 2. SharePoint REST API
-    else if (lowerPath.includes('/_api/') || lowerPath.includes('/_vti_bin/')) {
-      const sanLower = input.sanitizedPath.toLowerCase()
-      const apiIdx = sanLower.indexOf('/_api/') >= 0 ? sanLower.indexOf('/_api/') : sanLower.indexOf('/_vti_bin/')
-      const spResource = apiIdx >= 0 ? input.sanitizedPath.slice(apiIdx) : input.sanitizedPath
-      if (lowerPath.includes('/$batch')) {
-        actions.push({
-          family: 'sharepoint',
-          op: 'sharepoint:batch',
-          resource: spResource,
-          details: {
-            hasRequestDigest: Boolean(input.rawHeaders['x-requestdigest']),
-            hasIfMatch: Boolean(input.rawHeaders['if-match']),
-          },
-          coverage: 'opaque-batch',
-        })
-        extractStatus = 'opaque'
-      } else {
-        const details: Record<string, unknown> = {
-          hasIfMatch: Boolean(input.rawHeaders['if-match']),
-          hasRequestDigest: Boolean(input.rawHeaders['x-requestdigest']),
-        }
-        if (input.hdr?.['x-http-method']) details.override = input.hdr['x-http-method']
-        const rawMetaType = (obj?.__metadata as any)?.type ?? obj?.['@odata.type']
-        const metaIdent = validateStructuralIdent(rawMetaType, /^[#A-Za-z][A-Za-z0-9_.-]{0,63}$/)
-        if (metaIdent) details.metadataType = metaIdent
-
-        actions.push({
-          family: 'sharepoint',
-          op: `sharepoint:${input.effectiveMethod}`,
-          resource: spResource,
-          details,
-          coverage: defaultCov,
-        })
+      if (isE1Shape && obj) {
+        actions = [classifyBrowserE1BodyShape(obj, input, defaultCov)]
         extractStatus = fullyIntact ? 'complete' : 'partial'
       }
-    }
 
-    // 3. GraphQL
-    else if (
-      lowerPath.includes('/graphql') ||
-      (obj && (typeof obj.query === 'string' || (obj.extensions && typeof obj.extensions === 'object' && 'persistedQuery' in (obj.extensions as Record<string, unknown>)))) ||
-      (Array.isArray(parsedJson) && parsedJson.length > 0 && parsedJson.every(item => item && typeof item === 'object' && ('query' in (item as any) || 'extensions' in (item as any))))
-    ) {
-      const allItems = Array.isArray(parsedJson) ? parsedJson : obj ? [obj] : []
-      const batchTruncated = allItems.length > 16
-      if (batchTruncated) reasons.push('batch-truncated')
-      const opsSeen: GraphqlOp[] = []
+      // 2. GraphQL
+      else if (
+        lowerPath.includes('/graphql') ||
+        (obj && (typeof obj.query === 'string' || (obj.extensions && typeof obj.extensions === 'object' && 'persistedQuery' in (obj.extensions as Record<string, unknown>)))) ||
+        (Array.isArray(parsedJson) && parsedJson.length > 0 && parsedJson.every(item => item && typeof item === 'object' && ('query' in (item as any) || 'extensions' in (item as any))))
+      ) {
+        const allItems = Array.isArray(parsedJson) ? parsedJson : obj ? [obj] : []
+        const batchTruncated = allItems.length > 16
+        if (batchTruncated) outReasons.push('batch-truncated')
+        const gqlActions: SemanticAction[] = []
+        const opsSeen: GraphqlOp[] = []
 
-      for (let idx = 0; idx < allItems.length; idx++) {
-        const rec = allItems[idx] as Record<string, unknown>
-        const qStr = typeof rec.query === 'string' ? rec.query : undefined
-        const opNameRaw = typeof rec.operationName === 'string' ? rec.operationName : undefined
-        const hasPersisted = Boolean(rec.extensions && typeof rec.extensions === 'object' && 'persistedQuery' in (rec.extensions as Record<string, unknown>))
-        const safeOpName = validateStructuralIdent(opNameRaw, GQL_IDENT_RE)
+        for (let idx = 0; idx < allItems.length; idx++) {
+          const rec = allItems[idx] as Record<string, unknown>
+          const qStr = typeof rec.query === 'string' ? rec.query : undefined
+          const opNameRaw = typeof rec.operationName === 'string' ? rec.operationName : undefined
+          const hasPersisted = Boolean(rec.extensions && typeof rec.extensions === 'object' && 'persistedQuery' in (rec.extensions as Record<string, unknown>))
+          const safeOpName = validateStructuralIdent(opNameRaw, GQL_IDENT_RE)
 
-        let varKeys: string[] | undefined
-        if (idx < 16 && rec.variables && typeof rec.variables === 'object' && !Array.isArray(rec.variables)) {
-          varKeys = Object.keys(rec.variables as Record<string, unknown>).slice(0, 32).map(k => scrubStructuralKey(k).key)
+          let varKeys: string[] | undefined
+          if (idx < 16 && rec.variables && typeof rec.variables === 'object' && !Array.isArray(rec.variables)) {
+            varKeys = Object.keys(rec.variables as Record<string, unknown>).slice(0, 32).map(scrubStructuralKey)
+          }
+
+          if (!qStr && hasPersisted) {
+            opsSeen.push('persisted')
+            if (idx < 16) {
+              gqlActions.push({
+                family: 'graphql',
+                op: 'graphql:persisted',
+                resource: safeOpName ?? input.sanitizedPath,
+                details: { ...(varKeys && { variableKeys: varKeys }) },
+                coverage: 'persisted-query-unknown',
+              })
+            }
+            continue
+          }
+          if (qStr) {
+            const res = classifyGraphqlQuery(qStr, opNameRaw)
+            const itemOp: GraphqlOp = dupKeys ? 'mixed' : res.op
+            opsSeen.push(itemOp)
+            if (idx < 16) {
+              const safeNames = res.opNames.slice(0, 16).map(n => n === '<anonymous>' ? n : (validateStructuralIdent(n, GQL_IDENT_RE) ?? '<redacted>'))
+              const resource = safeOpName ?? (safeNames.length === 1 && safeNames[0] !== '<anonymous>' && safeNames[0] !== '<redacted>' ? safeNames[0] : input.sanitizedPath)
+              gqlActions.push({
+                family: 'graphql',
+                op: `graphql:${itemOp}`,
+                resource,
+                details: {
+                  opNames: safeNames,
+                  opKinds: res.opKinds.slice(0, 16),
+                  ...(varKeys && { variableKeys: varKeys }),
+                },
+                coverage: !fullyIntact || itemOp === 'mixed' || batchTruncated ? 'partial' : 'complete',
+              })
+            }
+          } else {
+            opsSeen.push('mixed')
+            if (idx < 16) {
+              gqlActions.push({ family: 'graphql', op: 'graphql:mixed', resource: input.sanitizedPath, coverage: 'unknown' })
+            }
+          }
         }
 
-        if (!qStr && hasPersisted) {
-          opsSeen.push('persisted')
-          if (idx < 16) {
-            actions.push({
-              family: 'graphql',
-              op: 'graphql:persisted',
-              resource: safeOpName ?? input.sanitizedPath,
-              details: { ...(varKeys && { variableKeys: varKeys }) },
-              coverage: 'persisted-query-unknown',
-            })
-          }
-          continue
-        }
-        if (qStr) {
-          const res = classifyGraphqlQuery(qStr, opNameRaw)
-          const itemOp: GraphqlOp = dupKeys ? 'mixed' : res.op
-          opsSeen.push(itemOp)
-          if (idx < 16) {
-            const safeNames = res.opNames.slice(0, 16).map(n => n === '<anonymous>' ? n : (validateStructuralIdent(n, GQL_IDENT_RE) ?? '<redacted>'))
-            const resource = safeOpName ?? (safeNames.length === 1 && safeNames[0] !== '<anonymous>' && safeNames[0] !== '<redacted>' ? safeNames[0] : input.sanitizedPath)
-            actions.push({
-              family: 'graphql',
-              op: `graphql:${itemOp}`,
-              resource,
-              details: {
-                opNames: safeNames,
-                opKinds: res.opKinds.slice(0, 16),
-                ...(varKeys && { variableKeys: varKeys }),
-              },
-              coverage: !fullyIntact || itemOp === 'mixed' || batchTruncated ? 'partial' : 'complete',
-            })
-          }
+        actions = gqlActions
+        if (opsSeen.length === 0) {
+          graphqlOp = 'mixed'
+          extractStatus = 'opaque'
+        } else if (opsSeen.includes('persisted')) {
+          graphqlOp = opsSeen.every(o => o === 'persisted') ? 'persisted' : 'mixed'
+          extractStatus = 'opaque'
+        } else if (opsSeen.every(o => o === 'query') && fullyIntact && !batchTruncated) {
+          graphqlOp = 'query'
+          extractStatus = 'complete'
+        } else if (opsSeen.every(o => o === 'mutation')) {
+          graphqlOp = 'mutation'
+          extractStatus = fullyIntact && !batchTruncated ? 'complete' : 'partial'
+        } else if (opsSeen.every(o => o === 'subscription')) {
+          graphqlOp = 'subscription'
+          extractStatus = fullyIntact && !batchTruncated ? 'complete' : 'partial'
         } else {
-          opsSeen.push('mixed')
-          if (idx < 16) {
-            actions.push({ family: 'graphql', op: 'graphql:mixed', resource: input.sanitizedPath, coverage: 'unknown' })
-          }
+          graphqlOp = 'mixed'
+          extractStatus = 'partial'
         }
       }
 
-      if (opsSeen.length === 0) {
-        graphqlOp = 'mixed'
-        extractStatus = 'opaque'
-      } else if (opsSeen.includes('persisted')) {
-        graphqlOp = opsSeen.every(o => o === 'persisted') ? 'persisted' : 'mixed'
-        extractStatus = 'opaque'
-      } else if (opsSeen.every(o => o === 'query') && fullyIntact && !batchTruncated) {
-        graphqlOp = 'query'
-        extractStatus = 'complete'
-      } else if (opsSeen.every(o => o === 'mutation')) {
-        graphqlOp = 'mutation'
-        extractStatus = fullyIntact && !batchTruncated ? 'complete' : 'partial'
-      } else if (opsSeen.every(o => o === 'subscription')) {
-        graphqlOp = 'subscription'
-        extractStatus = fullyIntact && !batchTruncated ? 'complete' : 'partial'
-      } else {
-        graphqlOp = 'mixed'
-        extractStatus = 'partial'
+      // 3. SOAP
+      else if (
+        input.hdr?.soapaction ||
+        ((input.reqType === 'text/xml' || input.reqType === 'application/soap+xml' || input.reqType === 'application/xml') &&
+          decodedText !== undefined &&
+          /<(?:[A-Za-z_][\w.-]*:)?Envelope[\s>]/i.test(decodedText))
+      ) {
+        const claimedRaw = input.hdr?.soapaction?.replace(/^"(.*)"$/, '$1')
+        const bodyRootRaw = decodedText ? extractSoapBodyRoot(decodedText) : undefined
+        let soapAction: string | undefined
+        if (claimedRaw) {
+          const s = scrubText(truncateUtf8HeadTail(claimedRaw, 128)).text
+          if (!isSensitiveValue(s)) soapAction = s
+        }
+        const bodyRoot = validateStructuralIdent(bodyRootRaw, /^[A-Za-z_][\w.-]{0,47}(?::[A-Za-z_][\w.-]{0,47})?$/)
+        const rootLocal = bodyRoot?.includes(':') ? bodyRoot.split(':')[1] : bodyRoot
+        const actionMismatch = Boolean(soapAction && rootLocal && !soapAction.toLowerCase().includes(rootLocal.toLowerCase()))
+        actions = [{
+          family: 'soap',
+          op: `soap:${bodyRoot || soapAction || 'unknown'}`,
+          resource: input.sanitizedPath,
+          details: {
+            ...(soapAction && { soapAction }),
+            ...(bodyRoot && { bodyRootQName: bodyRoot }),
+            ...(actionMismatch && { actionMismatch: true }),
+          },
+          coverage: defaultCov,
+        }]
+        extractStatus = bodyRoot || soapAction ? (fullyIntact ? 'complete' : 'partial') : 'opaque'
       }
-    }
-
-    // 4. SOAP
-    else if (
-      input.hdr?.soapaction ||
-      ((input.reqType === 'text/xml' || input.reqType === 'application/soap+xml' || input.reqType === 'application/xml') &&
-        decodedText !== undefined &&
-        /<(?:[A-Za-z_][\w.-]*:)?Envelope[\s>]/i.test(decodedText))
-    ) {
-      const claimedRaw = input.hdr?.soapaction?.replace(/^"(.*)"$/, '$1')
-      const bodyRootRaw = decodedText ? extractSoapBodyRoot(decodedText) : undefined
-      let soapAction: string | undefined
-      if (claimedRaw) {
-        const s = scrubText(truncateUtf8HeadTail(claimedRaw, 128)).text
-        if (!isSensitiveValue(s)) soapAction = s
-      }
-      const bodyRoot = validateStructuralIdent(bodyRootRaw, /^[A-Za-z_][\w.-]{0,47}(?::[A-Za-z_][\w.-]{0,47})?$/)
-      const rootLocal = bodyRoot?.includes(':') ? bodyRoot.split(':')[1] : bodyRoot
-      const actionMismatch = Boolean(soapAction && rootLocal && !soapAction.toLowerCase().includes(rootLocal.toLowerCase()))
-      actions.push({
-        family: 'soap',
-        op: `soap:${bodyRoot || soapAction || 'unknown'}`,
-        resource: input.sanitizedPath,
-        details: {
-          ...(soapAction && { soapAction }),
-          ...(bodyRoot && { bodyRootQName: bodyRoot }),
-          ...(actionMismatch && { actionMismatch: true }),
-        },
-        coverage: defaultCov,
-      })
-      extractStatus = bodyRoot || soapAction ? (fullyIntact ? 'complete' : 'partial') : 'opaque'
-    }
-
-    // 5. Generic REST fallback (for writes)
-    else if (input.isWrite) {
-      actions.push({
-        family: 'rest',
-        op: `rest:${input.effectiveMethod}`,
-        resource: input.sanitizedPath,
-        coverage: isBinary || structuredJsonParseFailed ? 'partial' : defaultCov,
-      })
-      extractStatus = isBinary || structuredJsonParseFailed ? 'opaque' : fullyIntact ? 'complete' : 'partial'
     }
 
     let reqTrunc: true | undefined
@@ -576,14 +520,14 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
 
     return {
       actions,
-      ...(bodyShape && Object.keys(bodyShape).length > 0 && { bodyShape }),
+      ...(shared.bodyShape && Object.keys(shared.bodyShape).length > 0 && { bodyShape: shared.bodyShape }),
       ...(graphqlOp && { graphqlOp }),
       ...(dupKeys && { dupKeys: true as const }),
       completeness: {
         transport: input.transport,
         decode: decodeStatus,
         extract: extractStatus,
-        ...(reasons.length > 0 && { reasons }),
+        ...(outReasons.length > 0 && { reasons: outReasons }),
       },
       decodeComplete,
       ...(reqTrunc && { reqTrunc }),

@@ -224,7 +224,7 @@ export class BrowserSession {
       if (typeof e.summary?.url === 'string') {
         const parsed = URL.parse(e.summary.url)
         if (parsed) {
-          const san = sanitizeUrl(parsed, { projection: 'semantic' })
+          const san = sanitizeUrl(parsed)
           hostPath = ` ${san.authority}${san.path}`
         }
       }
@@ -361,7 +361,7 @@ export class BrowserSession {
       this.lastShotAt = Date.now()
       if (this.lastJpeg?.equals(jpeg)) return
       this.lastJpeg = jpeg
-      const sanUrl = scrubDeep(sanitizeUrl(urlBefore, { projection: 'semantic' }).url, this.vault)
+      const sanUrl = scrubDeep(sanitizeUrl(urlBefore).url, this.vault)
       this.shots.push({
         seq: ++this.shotSeq,
         at: new Date().toISOString(),

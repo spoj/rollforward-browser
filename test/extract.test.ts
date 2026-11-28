@@ -44,9 +44,29 @@ test('E1 AIS extractor captures formName, action, and formActions controlIDs wit
   assert.equal(res.reqOmitted, 'policy-profile')
   assert.ok(!JSON.stringify(res.actions).includes('ACME Corp'))
   assert.equal(res.bodyShape?.['formActions[].value'], 'string')
+
+  // Browser-only body-shape E1 detection still works on non-/jderest/ paths
+  const byShape = extractSemantic({
+    url: new URL('https://e1.example/custom/endpoint'),
+    sanitizedPath: '/custom/endpoint',
+    method: 'POST',
+    effectiveMethod: 'POST',
+    kind: 'http',
+    rawHeaders: {},
+    reqType: 'application/json',
+    decodedBuf: Buffer.from(payload),
+    bodyComplete: true,
+    transport: 'complete',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+  })
+  assert.equal(byShape.actions[0].family, 'e1-ais')
+  assert.equal(byShape.actions[0].op, 'ais:U')
+  assert.equal(byShape.actions[0].resource, 'P0411_W0411A')
 })
 
-test('SharePoint extractor handles overrides, sanitizedPath offsets, and marks $batch opaque', () => {
+test('SharePoint extractor handles overrides, sanitizedPath offsets, strong If-Match, and marks $batch opaque', () => {
   const item = extractSemantic({
     url: new URL("https://tenant.sharepoint.com/sites/aB3dE9fG2hJ5kL8mN1pQ4rS7tU0vW/_api/web/lists/getbytitle('Invoices')/items(42)"),
     sanitizedPath: "/sites/[REDACTED:seg]/_api/web/lists/getbytitle('Invoices')/items(42)",
@@ -54,7 +74,7 @@ test('SharePoint extractor handles overrides, sanitizedPath offsets, and marks $
     effectiveMethod: 'DELETE',
     kind: 'http',
     hdr: { 'x-http-method': 'DELETE' },
-    rawHeaders: { 'if-match': '*', 'x-requestdigest': 'tok' },
+    rawHeaders: { 'if-match': '"etag-1"', 'x-requestdigest': 'tok' },
     reqType: 'application/json',
     decodedBuf: Buffer.from(JSON.stringify({ __metadata: { type: 'SP.Data.InvoicesListItem' } })),
     bodyComplete: true,
@@ -69,6 +89,24 @@ test('SharePoint extractor handles overrides, sanitizedPath offsets, and marks $
   assert.equal(item.actions[0].details?.override, 'DELETE')
   assert.equal(item.actions[0].details?.hasIfMatch, true)
   assert.equal(item.actions[0].details?.metadataType, 'SP.Data.InvoicesListItem')
+
+  const wildcard = extractSemantic({
+    url: new URL("https://tenant.sharepoint.com/_api/web/lists/getbytitle('Invoices')/items(42)"),
+    sanitizedPath: "/_api/web/lists/getbytitle('Invoices')/items(42)",
+    method: 'POST',
+    effectiveMethod: 'DELETE',
+    kind: 'http',
+    hdr: { 'x-http-method': 'DELETE' },
+    rawHeaders: { 'if-match': '*', 'x-requestdigest': 'tok' },
+    reqType: 'application/json',
+    decodedBuf: Buffer.from('{}'),
+    bodyComplete: true,
+    transport: 'complete',
+    isWrite: true,
+    isAuth: false,
+    isLive: false,
+  })
+  assert.equal(wildcard.actions[0].details?.hasIfMatch, false)
 
   const batch = extractSemantic({
     url: new URL('https://tenant.sharepoint.com/_api/$batch'),

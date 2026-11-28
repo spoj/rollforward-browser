@@ -7,15 +7,16 @@ import { Duplex } from 'node:stream'
 import { isBlocked } from './blocklists.ts'
 import { page } from './page.ts'
 import {
+  DESC_V,
   EXTRACTOR_V,
   MAX_PREFIX_BYTES,
+  SAFE_METHODS,
   decompressPrefix,
   extractSemantic,
   normalizeContentType,
+  parseSemanticMethods,
   type BodyOmittedReason,
-  type Completeness,
-  type GraphqlOp,
-  type SemanticAction,
+  type SharedSafeRequestProjection,
 } from './extract.ts'
 import {
   REDACT_V,
@@ -27,7 +28,7 @@ import {
   truncateUtf8HeadTail,
 } from './redact.ts'
 
-export const DESC_V = 1
+export { DESC_V }
 
 export type AuditV2Config = {
   v: 2
@@ -37,39 +38,9 @@ export type AuditV2Config = {
   intent?: { run: number; series?: string; taskSummary?: string }
 }
 
-export type SafeRequestProjection = {
-  descV: 1
-  redactV: 1
-  extractorV: 1
-  surface: 'browser' | 'api'
-  target: { site: string } | { connection: string }
-  seq: number
-  t: string
-  kind: 'http' | 'upgrade'
-  scheme: 'http' | 'https'
-  authority: string
-  path: string
-  url: string
-  method: string
-  effectiveMethod: string
-  methodSource: 'wire' | 'x-http-method' | 'x-http-method-override' | 'x-method-override'
-  isWrite: boolean
-  hdr?: Record<string, string>
-  dest?: string
-  from?: string
-  reqType?: string
-  declaredBytes?: number
-  prefixBytes: number
-  bodyComplete: boolean
-  decodeComplete: boolean
-  completeness: Completeness
-  actions: SemanticAction[]
-  bodyShape?: Record<string, string>
-  graphqlOp?: GraphqlOp
-  dupKeys?: true
+export type SafeRequestProjection = SharedSafeRequestProjection & {
   cdpCursor?: number
   httpCursor?: number
-  live?: true
   reqTrunc?: true
   reqOmitted?: BodyOmittedReason
 }
@@ -170,9 +141,6 @@ export type ProxyServer = http.Server & { controller: ProxyController }
 export type Site = { hosts: string[], internalHosts?: string[], start_url?: string, headers?: Record<string, string>, public?: boolean, open?: boolean, except?: string[], via?: { url: string, token: string, hosts: string[] } }
 type Target = { scheme: string, authority: string }
 
-const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
-const OVERRIDE_HEADERS = ['x-http-method', 'x-http-method-override', 'x-method-override'] as const
-const VALID_VERB_RE = /^[A-Z]{3,16}$/
 const ALLOWED_FETCH_DESTS = new Set([
   'audio', 'audioworklet', 'document', 'embed', 'empty', 'fencedframe', 'font', 'frame',
   'iframe', 'image', 'manifest', 'object', 'paintworklet', 'report', 'script',
@@ -209,29 +177,13 @@ const plain = (socket: net.Socket) => {
 }
 
 function classifyMethod(method: string | undefined, headers: Record<string, string | string[] | undefined>) {
-  const wireMethod = (method ?? 'GET').toUpperCase()
-  const hdr: Record<string, string> = {}
-  let ovHdr: typeof OVERRIDE_HEADERS[number] | undefined
-  let ovVal: string | undefined
-  for (const name of OVERRIDE_HEADERS) {
-    const raw = headers[name]
-    if (raw === undefined) continue
-    const joined = Array.isArray(raw) ? raw.join(',') : raw
-    hdr[name] = truncateUtf8HeadTail(joined, 256)
-    if (ovVal === undefined && typeof raw === 'string') {
-      ovHdr = name
-      ovVal = raw.trim().toUpperCase()
-    }
-  }
+  const sem = parseSemanticMethods(method, headers)
+  let hdr = sem.hdr
   if (headers['soapaction'] !== undefined) {
     const raw = headers['soapaction']
-    hdr.soapaction = truncateUtf8HeadTail(Array.isArray(raw) ? raw.join(',') : raw, 256)
+    hdr = { ...hdr, soapaction: scrubText(truncateUtf8HeadTail(Array.isArray(raw) ? raw.join(',') : raw, 256)).text }
   }
-  const hasOverride = OVERRIDE_HEADERS.some(h => headers[h] !== undefined)
-  const validOv = Boolean(ovVal && VALID_VERB_RE.test(ovVal))
-  const effectiveMethod = validOv && (SAFE_METHODS.has(wireMethod) || !SAFE_METHODS.has(ovVal!)) ? ovVal! : wireMethod
-  const methodSource: SafeRequestProjection['methodSource'] = validOv && effectiveMethod === ovVal && ovHdr ? ovHdr : 'wire'
-  return { wireMethod, effectiveMethod, methodSource, hasOverride, hdr: Object.keys(hdr).length ? hdr : undefined }
+  return { ...sem, hdr, hasOverride: sem.hdr !== undefined }
 }
 
 function sanitizeDest(headers: Record<string, string | string[] | undefined>): string | undefined {
@@ -446,9 +398,9 @@ export function startProxy(
   }): SafeRequestProjection => {
     const { req, url, seq, t, kind, arrival, liveAtStart, genAtStart } = params
     const hdrs = params.effectiveHeaders ?? req.headers
-    const sanUrl = url ? sanitizeUrl(url, { projection: 'semantic' }) : sanitizeUrl(req.url ?? '/', { projection: 'semantic' })
+    const sanUrl = url ? sanitizeUrl(url) : sanitizeUrl(req.url ?? '/')
     const dest = sanitizeDest(hdrs)
-    const from = typeof hdrs.referer === 'string' && hdrs.referer ? sanitizeUrl(hdrs.referer, { projection: 'semantic' }).url : undefined
+    const from = typeof hdrs.referer === 'string' && hdrs.referer ? sanitizeUrl(hdrs.referer).url : undefined
     const prefixBuf = params.prefixBuf ?? Buffer.alloc(0)
     const transport = params.transport ?? 'not-read'
     const bodyComplete = params.bodyComplete ?? false
@@ -473,6 +425,9 @@ export function startProxy(
         methodSource: arrival.sem.methodSource,
         isWrite,
         ...(arrival.sem.hdr && { hdr: arrival.sem.hdr }),
+        ...(arrival.sem.hdrConflict && { hdrConflict: true as const }),
+        ...(arrival.sem.invalidOrConflictingOverride && { overrideInvalid: true as const }),
+        ...(arrival.sem.attemptedDowngrade && { overrideDowngrade: true as const }),
         ...(dest && { dest }),
         ...(from && { from }),
         ...(arrival.declaredBytes !== undefined && { declaredBytes: arrival.declaredBytes }),
@@ -535,6 +490,9 @@ export function startProxy(
       methodSource: arrival.sem.methodSource,
       isWrite,
       ...(arrival.sem.hdr && { hdr: arrival.sem.hdr }),
+      ...(arrival.sem.hdrConflict && { hdrConflict: true as const }),
+      ...(arrival.sem.invalidOrConflictingOverride && { overrideInvalid: true as const }),
+      ...(arrival.sem.attemptedDowngrade && { overrideDowngrade: true as const }),
       ...(dest && { dest }),
       ...(from && { from }),
       ...(reqType && { reqType }),

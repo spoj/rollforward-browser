@@ -65,9 +65,9 @@ const leftovers = () =>
   execFileSync('podman', ['ps', '-a', '-q', '--filter', `label=rollforward-browser=${port}`]).toString().trim() +
   fs.readdirSync(`${os.tmpdir()}/rollforward-browser-${port}`).join(' ')
 
-test('GET /capabilities advertises v0.3.1, POST /sessions validates auditV2, and rejects dropped semantic+samples projection', async () => {
+test('GET /capabilities advertises v0.3.2, POST /sessions validates auditV2, and rejects dropped semantic+samples projection', async () => {
   const cap = await api('GET', '/capabilities')
-  assert.deepEqual(cap.body, { version: '0.3.1', auditV2: 2, seal: true, activity: true })
+  assert.deepEqual(cap.body, { version: '0.3.2', auditV2: 2, seal: true, activity: true })
   assert.equal(cap.status, 200)
 
   assert.equal((await api('POST', '/sessions', { site, auditV2: { v: 99 } })).status, 400)

@@ -9,7 +9,7 @@ import { blocklist, isBlocked, loadBlocklists } from './blocklists.ts'
 import { createDriveVaultTap } from './cdp-tap.ts'
 import { ByteBudget, type AuditV2Config, type V2Entry } from './proxy.ts'
 
-const VERSION = '0.3.1'
+const VERSION = '0.3.2'
 const port = Number(process.env.BROWSER_PORT ?? 8797)
 const host = process.env.BROWSER_HOST ?? '127.0.0.1'
 const postTtlGcMs = Number(process.env.BROWSER_POST_TTL_GC_MS ?? 25 * 60_000)

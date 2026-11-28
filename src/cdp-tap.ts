@@ -486,7 +486,7 @@ export class CdpSessionTap {
         if (!parsed || (rawHit && vault!.scrub(parsed.host).count > 0)) {
           navUrl = `${scheme}//[REDACTED]`
         } else {
-          navUrl = sanitizeUrl(parsed, { projection: 'semantic' }).url
+          navUrl = sanitizeUrl(parsed).url
         }
       } else if (/^data:/i.test(stripped)) {
         severity = 'high'
@@ -543,7 +543,7 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Network.setExtraHTTPHeaders') {
       capture = true
       const hdrs = params.headers && typeof params.headers === 'object'
-        ? Object.keys(params.headers as Record<string, unknown>).slice(0, 64).map(k => truncateUtf8HeadTail(scrubStructuralKey(k).key, 64))
+        ? Object.keys(params.headers as Record<string, unknown>).slice(0, 64).map(k => truncateUtf8HeadTail(scrubStructuralKey(k), 64))
         : []
       summary = { headerNames: hdrs }
     } else if (rawMethod === 'Network.setCookie') {
@@ -560,11 +560,11 @@ export class CdpSessionTap {
       summary = { cookies }
     } else if (rawMethod === 'DOMStorage.setDOMStorageItem') {
       capture = true
-      summary = { key: truncateUtf8HeadTail(typeof params.key === 'string' ? scrubStructuralKey(params.key).key : '', 64) }
+      summary = { key: truncateUtf8HeadTail(typeof params.key === 'string' ? scrubStructuralKey(params.key) : '', 64) }
     } else if (rawMethod === 'Storage.setStorageItems') {
       capture = true
       const items = Array.isArray(params.items)
-        ? params.items.slice(0, 32).map(it => truncateUtf8HeadTail(scrubStructuralKey(typeof (it as any)?.key === 'string' ? (it as any).key : '').key, 64))
+        ? params.items.slice(0, 32).map(it => truncateUtf8HeadTail(scrubStructuralKey(typeof (it as any)?.key === 'string' ? (it as any).key : ''), 64))
         : []
       summary = { keys: items }
     } else if (NET_SIMPLE_METHODS.has(rawMethod)) {

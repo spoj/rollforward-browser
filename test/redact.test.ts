@@ -43,7 +43,7 @@ test('bodyShape collapses arrays, strips scalar values, and masks data-like map 
     byNum: { '123456': 'row' },
     byLong: { ['a'.repeat(33)]: 'val' },
   }
-  const { shape } = buildBodyShape(doc)
+  const shape = buildBodyShape(doc)
   assert.equal(shape['formName'], 'string')
   assert.equal(shape['items[].amount'], 'number')
   assert.equal(shape['items[].active'], 'boolean')
@@ -117,27 +117,27 @@ test('table-driven no-secret-in-output: secrets never survive URL sanitization o
     {
       name: 'userinfo + sensitive query + high-entropy path segment',
       secret: 'user:pass',
-      output: sanitizeUrl('https://user:pass@app.example/items/aB3dE9fG2hJ5kL8mN1pQ4rS7tU0vW/view?verification_code=999111', { projection: 'semantic' }),
+      output: sanitizeUrl('https://user:pass@app.example/items/aB3dE9fG2hJ5kL8mN1pQ4rS7tU0vW/view?verification_code=999111'),
     },
     {
       name: 'valueless JWT query param',
       secret: jwt,
-      output: sanitizeUrl(`https://h.example/p?${jwt}&a=b`, { projection: 'semantic' }),
+      output: sanitizeUrl(`https://h.example/p?${jwt}&a=b`),
     },
     {
       name: 'GitHub PAT in query key',
       secret: ghp,
-      output: sanitizeUrl(`https://h.example/p?${ghp}=1`, { projection: 'semantic' }),
+      output: sanitizeUrl(`https://h.example/p?${ghp}=1`),
     },
     {
       name: 'email in query key',
       secret: 'jane.doe',
-      output: sanitizeUrl('https://h.example/p?jane.doe%40example.com=1', { projection: 'semantic' }),
+      output: sanitizeUrl('https://h.example/p?jane.doe%40example.com=1'),
     },
     {
       name: 'vaulted mixed-case hostname lowercased by URL.parse',
       secret: 'mixedtenant99',
-      output: scrubDeep(sanitizeUrl('https://MixedTenant99.example/api', { projection: 'semantic' }), vault),
+      output: scrubDeep(sanitizeUrl('https://MixedTenant99.example/api'), vault),
     },
     {
       name: 'vaulted OTP and URL-encoded header secret inside nested record keys & values',
@@ -157,7 +157,7 @@ test('table-driven no-secret-in-output: secrets never survive URL sanitization o
   }
 
   // UUID path segment preserved and UTF-8 truncation never splits %XX or surrogate pairs
-  const sem = sanitizeUrl('https://app.example/items/550e8400-e29b-41d4-a716-446655440000?id=42&flag=true', { projection: 'semantic' })
+  const sem = sanitizeUrl('https://app.example/items/550e8400-e29b-41d4-a716-446655440000?id=42&flag=true')
   assert.ok(sem.url.includes('/550e8400-e29b-41d4-a716-446655440000'))
   assert.ok(sem.url.endsWith('?id=<num>&flag=<bool>'))
 
