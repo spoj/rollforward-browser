@@ -15,7 +15,7 @@ import {
   type Site,
   type V2Entry,
 } from './proxy.ts'
-import { SecretVault, sanitizeUrl, scrubText } from './redact.ts'
+import { SecretVault, isAuthUrl, sanitizeUrl, scrubText } from './redact.ts'
 
 export type ShotTrigger = 'nav' | 'load' | 'write' | 'download' | 'tab' | 'file-upload'
 
@@ -140,7 +140,6 @@ export class BrowserSession {
   private shotGen = 0
   private frameGen = 0
   private taintedPages = new WeakSet<Page>()
-  private pwCheck?: Promise<{ blocked: boolean; sig: string }>
   private capturing = false
   private pendingShot = false
   private pendingShotTrigger: ShotTrigger = 'nav'
@@ -408,60 +407,15 @@ export class BrowserSession {
     this.shotTimer.unref?.()
   }
 
-  private async hasVisiblePassword(p: Page, arm = false): Promise<{ blocked: boolean; sig: string }> {
-    if (this.pwCheck) return { blocked: true, sig: '' }
-    const run = Promise.all(p.frames().map(f => f.evaluate((doArm: boolean) => {
-      const w = globalThis as Record<string, any>
-      const hasPw = (n: any): boolean => {
-        if (!n) return false
-        if (n.nodeType === 1 && n.tagName === 'INPUT' && n.type === 'password') return true
-        if (n.querySelector?.('input[type="password"]')) return true
-        if (n.shadowRoot && hasPw(n.shadowRoot)) return true
-        for (const el of n.querySelectorAll?.('*') ?? []) if (el.shadowRoot && hasPw(el.shadowRoot)) return true
-        return false
-      }
-      if (typeof w.__rfPwEpoch !== 'number') {
-        if (!doArm) return { blocked: true, epoch: -1 }
-        w.__rfPwEpoch = 0
-        w.__rfPwRoots = new WeakSet()
-        w.__rfPwMo = new MutationObserver(ms => {
-          for (const m of ms) {
-            if (m.type === 'attributes') {
-              const el = m.target as any
-              if (el?.nodeType === 1 && ((el.tagName === 'INPUT' && (m.attributeName === 'type' || el.type === 'password')) || hasPw(el))) { w.__rfPwEpoch++; return }
-            } else if ([...m.addedNodes, ...m.removedNodes].some(hasPw)) { w.__rfPwEpoch++; return }
-          }
-        })
-      }
-      const observeRoot = (root: Node) => {
-        if (w.__rfPwRoots.has(root)) return
-        w.__rfPwRoots.add(root)
-        w.__rfPwMo.observe(root, { subtree: true, childList: true, attributes: true })
-      }
-      const scan = (root: ParentNode): boolean => {
-        observeRoot(root)
-        for (const el of root.querySelectorAll('*')) {
-          if (el.tagName === 'INPUT' && (el as HTMLInputElement).type === 'password') {
-            const r = el.getBoundingClientRect(), st = getComputedStyle(el)
-            if (r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none') return true
-          }
-          if (el.shadowRoot && scan(el.shadowRoot)) return true
-        }
-        return false
-      }
-      const vis = scan(document.documentElement || document)
-      return { blocked: vis, epoch: w.__rfPwEpoch as number }
-    }, arm).catch(() => ({ blocked: true, epoch: -1 })))).then(res => ({
-      blocked: res.some(r => r.blocked),
-      sig: res.map(r => r.epoch).join(','),
-    }))
-    this.pwCheck = run
-    run.finally(() => { if (this.pwCheck === run) this.pwCheck = undefined })
-    let t: NodeJS.Timeout | undefined
-    return Promise.race([
-      run,
-      new Promise<{ blocked: boolean; sig: string }>(r => { t = setTimeout(() => r({ blocked: true, sig: '' }), 1000); t.unref?.() }),
-    ]).finally(() => clearTimeout(t))
+  private async isSafeForShot(p: Page): Promise<boolean> {
+    if (isAuthUrl(p.url())) return false
+    const check = Promise.all(
+      p.frames().map(async f => {
+        if (isAuthUrl(f.url())) return true
+        return (await f.locator('input[type=password]:visible').count()) > 0
+      }),
+    ).then(hits => !hits.some(Boolean))
+    return withTimeout(check, 1_000, false)
   }
 
   private async captureAudit() {
@@ -476,14 +430,10 @@ export class BrowserSession {
       this.shotPage = undefined
       if (!p || p.isClosed() || this.taintedPages.has(p)) return
       const urlBefore = p.url(), fg = this.frameGen
-      const pw1 = await this.hasVisiblePassword(p, true)
-      if (pw1.blocked) return
+      if (!(await this.isSafeForShot(p))) return
       if (this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg || p.isClosed()) return
       const jpeg = await p.screenshot({ type: 'jpeg', quality: 65, timeout: 3000 }).catch(() => null)
       if (!jpeg || jpeg.length > MAX_SINGLE_SHOT_JPEG_BYTES || this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg || p.isClosed() || p.url() !== urlBefore) return
-      const pw2 = await this.hasVisiblePassword(p, false)
-      if (pw2.blocked || pw2.sig !== pw1.sig) return
-      if (this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg) return
       this.lastShotAt = Date.now()
       if (this.lastJpeg?.equals(jpeg)) return
       this.lastJpeg = jpeg
