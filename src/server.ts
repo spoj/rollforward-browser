@@ -72,20 +72,19 @@ const sealSession = (s: Session, scheduleGc = false): Promise<SealSnapshot> => {
 
 function validateAuditV2(raw: unknown): AuditV2Config {
   if (raw === undefined || raw === null) {
-    return { v: 2, projection: 'semantic', cdp: true, hud: true }
+    return { v: 2, cdp: true, hud: true }
   }
   if (typeof raw !== 'object' || Array.isArray(raw)) throw fail(400, 'auditV2 must be an object')
   const cfg = raw as Record<string, unknown>
   if (cfg.v !== 2) throw fail(400, 'auditV2.v must be 2')
-  if (cfg.projection !== undefined && cfg.projection !== 'semantic' && cfg.projection !== 'semantic+samples') {
-    throw fail(400, 'auditV2.projection must be "semantic" or "semantic+samples"')
+  if (cfg.projection !== undefined && cfg.projection !== 'semantic') {
+    throw fail(400, 'auditV2.projection must be "semantic"')
   }
   if (cfg.cdp !== undefined && typeof cfg.cdp !== 'boolean') throw fail(400, 'auditV2.cdp must be boolean')
   if (cfg.hud !== undefined && typeof cfg.hud !== 'boolean') throw fail(400, 'auditV2.hud must be boolean')
   if (cfg.shots !== undefined && typeof cfg.shots !== 'boolean') throw fail(400, 'auditV2.shots must be boolean')
   return {
     v: 2,
-    projection: (cfg.projection as AuditV2Config['projection']) ?? 'semantic',
     cdp: (cfg.cdp as boolean | undefined) ?? true,
     hud: (cfg.hud as boolean | undefined) ?? true,
     ...(cfg.shots !== undefined && { shots: cfg.shots as boolean }),

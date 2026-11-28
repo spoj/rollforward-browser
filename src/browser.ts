@@ -150,7 +150,7 @@ export class BrowserSession {
     this.dir = dir
     this.label = label
     this.site = site
-    this.auditV2 = opts.auditV2 ?? { v: 2, projection: 'semantic', cdp: true, hud: true }
+    this.auditV2 = opts.auditV2 ?? { v: 2, cdp: true, hud: true }
     this.audit = audit || this.auditV2.shots === true
     this.opts = opts
     this.cdpSocket = `${dir}/cdp.sock`
@@ -166,7 +166,6 @@ export class BrowserSession {
 
     if (this.auditV2.cdp !== false) {
       this.cdpTap = new CdpSessionTap({
-        projection: this.auditV2.projection ?? 'semantic',
         vault: this.vault,
         isLive: () => this.isLiveOrCooldown(),
         onFileUpload: () => this.scheduleShot(undefined, 'file-upload', false),

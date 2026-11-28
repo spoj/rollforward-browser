@@ -3,29 +3,22 @@ import {
   buildBodyShape,
   buildFormBodyShape,
   isDataLikeKey,
-  isSensitiveContainerKey,
-  isSensitiveKey,
   isSensitiveValue,
   parseJsonSafe,
-  redactFormBody,
-  redactJsonValue,
   scrubStructuralKey,
   scrubText,
   truncateUtf8HeadTail,
-  type ProjectionMode,
-  type SecretVault,
 } from './redact.ts'
 
 export const EXTRACTOR_V = 1
 export const MAX_PREFIX_BYTES = 65_536
-export const MAX_SAMPLE_BODY_BYTES = 4_096
 
 export type BodyOmittedReason =
   | 'live'
   | 'auth-url'
   | 'binary'
   | 'budget'
-  | 'decompress-err'
+  | 'encoded'
   | 'timeout'
   | 'policy-profile'
 
@@ -53,292 +46,77 @@ export type DecompressResult = {
   decode: 'complete' | 'truncated' | 'error' | 'none'
   truncated: boolean
   reason?: string
-  budgetExceeded?: boolean
-  chargedBytes?: number
 }
 
-export type DecodeBudgetCharger = {
-  tryAcquire: (bytes: number) => boolean
-  release: (bytes: number) => void
+const SYNC_CODECS: Record<string, (buf: Buffer, opts: zlib.ZlibOptions | zlib.BrotliOptions) => Buffer> = {
+  gzip: zlib.gunzipSync,
+  'x-gzip': zlib.gunzipSync,
+  deflate: zlib.inflateSync,
+  br: zlib.brotliDecompressSync,
 }
 
-const SUPPORTED_ENCODINGS = new Set(['gzip', 'x-gzip', 'deflate', 'br', 'zstd'])
-
-function decompressSingleLayer(
-  input: Buffer,
-  encoding: string,
-  inputComplete: boolean,
-  maxBytes: number,
-  maxMs: number,
-  charger?: DecodeBudgetCharger,
-  rawDeflateFallback = false,
-): Promise<DecompressResult> {
-  return new Promise(resolve => {
-    let stream: zlib.Gunzip | zlib.Inflate | zlib.InflateRaw | zlib.BrotliDecompress | zlib.ZstdDecompress
-    try {
-      // Strict codec EOF when transport is complete (catches truncated trailers!); partial flush ONLY when prefix is already known truncated.
-      if (encoding === 'gzip' || encoding === 'x-gzip') {
-        stream = inputComplete ? zlib.createGunzip() : zlib.createGunzip({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
-      } else if (encoding === 'deflate') {
-        if (rawDeflateFallback) {
-          stream = inputComplete ? zlib.createInflateRaw() : zlib.createInflateRaw({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
-        } else {
-          stream = inputComplete ? zlib.createInflate() : zlib.createInflate({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
-        }
-      } else if (encoding === 'br') {
-        stream = inputComplete ? zlib.createBrotliDecompress() : zlib.createBrotliDecompress({ finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH })
-      } else if (encoding === 'zstd') {
-        stream = zlib.createZstdDecompress()
-      } else {
-        resolve({ ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error', truncated: false, reason: 'unsupported-encoding' })
-        return
-      }
-    } catch {
-      resolve({ ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error', truncated: false, reason: 'codec-init-error' })
-      return
-    }
-
-    let outBuf = Buffer.alloc(0)
-    let outBytes = 0
-    let charged = 0
-    let done = false
-    const start = performance.now()
-
-    const releaseAll = () => {
-      if (charged > 0 && charger) {
-        charger.release(charged)
-        charged = 0
-      }
-      outBuf = Buffer.alloc(0)
-      outBytes = 0
-    }
-
-    const timer = setTimeout(() => {
-      if (done) return
-      done = true
-      stream.destroy()
-      resolve({
-        ok: true,
-        buf: outBuf.subarray(0, outBytes),
-        decodeComplete: false,
-        decode: 'truncated',
-        truncated: true,
-        reason: 'decompress-cpu-limit',
-        chargedBytes: charged,
-      })
-    }, maxMs)
-    timer.unref?.()
-
-    const finish = (res: DecompressResult) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      resolve(res)
-    }
-
-    stream.on('data', (c: Buffer) => {
-      if (done) return
-      if (performance.now() - start > maxMs) {
-        stream.destroy()
-        finish({
-          ok: true,
-          buf: outBuf.subarray(0, outBytes),
-          decodeComplete: false,
-          decode: 'truncated',
-          truncated: true,
-          reason: 'decompress-cpu-limit',
-          chargedBytes: charged,
-        })
-        return
-      }
-      const need = Math.min(c.length, maxBytes - outBytes)
-      if (need > 0) {
-        if (outBytes + need > outBuf.length) {
-          const oldLen = outBuf.length
-          const nextCap = Math.min(maxBytes, Math.max(4096, oldLen * 2, outBytes + need))
-          // Charge full replacement allocation before allocating so peak concurrent memory stays within budget!
-          if (charger && !charger.tryAcquire(nextCap)) {
-            stream.destroy()
-            releaseAll()
-            finish({
-              ok: false,
-              buf: Buffer.alloc(0),
-              decodeComplete: false,
-              decode: 'error',
-              truncated: true,
-              reason: 'inflight-budget',
-              budgetExceeded: true,
-              chargedBytes: 0,
-            })
-            return
-          }
-          const next = Buffer.allocUnsafe(nextCap)
-          if (outBytes > 0) outBuf.copy(next, 0, 0, outBytes)
-          outBuf = next
-          if (charger) {
-            if (oldLen > 0) charger.release(oldLen)
-            charged = nextCap
-          }
-        }
-        c.copy(outBuf, outBytes, 0, need)
-        outBytes += need
-      }
-      if (outBytes >= maxBytes) {
-        stream.destroy()
-        finish({
-          ok: true,
-          buf: outBuf.subarray(0, outBytes),
-          decodeComplete: false,
-          decode: 'truncated',
-          truncated: true,
-          reason: '>64KiB-decoded',
-          chargedBytes: charged,
-        })
-      }
-    })
-
-    stream.on('end', () => {
-      const buf = outBuf.subarray(0, outBytes)
-      if (!inputComplete) {
-        finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB', chargedBytes: charged })
-      } else {
-        finish({ ok: true, buf, decodeComplete: true, decode: 'complete', truncated: false, chargedBytes: charged })
-      }
-    })
-
-    stream.on('error', () => {
-      const buf = outBuf.subarray(0, outBytes)
-      if (!inputComplete) {
-        finish({ ok: true, buf, decodeComplete: false, decode: 'truncated', truncated: true, reason: '>64KiB', chargedBytes: charged })
-        return
-      }
-      releaseAll()
-      if (encoding === 'deflate' && !rawDeflateFallback) {
-        clearTimeout(timer)
-        done = true
-        void decompressSingleLayer(input, encoding, inputComplete, maxBytes, maxMs, charger, true).then(resolve)
-        return
-      }
-      finish({ ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error', truncated: false, reason: 'decompress-err', chargedBytes: 0 })
-    })
-
-    const SLICE = 4096
-    let offset = 0
-    const pump = () => {
-      while (!done && offset < input.length) {
-        const end = Math.min(offset + SLICE, input.length)
-        const slice = input.subarray(offset, end)
-        offset = end
-        if (!stream.write(slice)) {
-          stream.once('drain', pump)
-          return
-        }
-      }
-      if (!done) stream.end()
-    }
-    pump()
-  })
-}
-
-export async function decompressPrefix(
+export function decompressPrefix(
   rawBuf: Buffer,
   contentEncoding: string | undefined,
   bodyComplete: boolean,
   maxBytes = MAX_PREFIX_BYTES,
-  maxMs = 50,
-  charger?: DecodeBudgetCharger,
-): Promise<DecompressResult> {
+): DecompressResult {
   if (rawBuf.length === 0) {
-    return { ok: true, buf: rawBuf, decodeComplete: bodyComplete, decode: 'none', truncated: !bodyComplete, chargedBytes: 0 }
+    return { ok: true, buf: rawBuf, decodeComplete: bodyComplete, decode: 'none', truncated: !bodyComplete }
   }
   const encodings = (contentEncoding ?? '')
     .split(',')
     .map(s => s.trim().toLowerCase())
     .filter(s => s && s !== 'identity')
   if (encodings.length === 0) {
+    const within = rawBuf.length <= maxBytes
     return {
       ok: true,
       buf: rawBuf.subarray(0, maxBytes),
-      decodeComplete: bodyComplete && rawBuf.length <= maxBytes,
-      decode: bodyComplete && rawBuf.length <= maxBytes ? 'complete' : 'truncated',
-      truncated: !bodyComplete || rawBuf.length > maxBytes,
-      chargedBytes: 0,
+      decodeComplete: bodyComplete && within,
+      decode: bodyComplete && within ? 'complete' : 'truncated',
+      truncated: !bodyComplete || !within,
     }
   }
-  if (encodings.length > 2 || encodings.some(e => !SUPPORTED_ENCODINGS.has(e))) {
+  if (encodings.length !== 1 || !(encodings[0] in SYNC_CODECS)) {
+    return { ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error', truncated: false, reason: 'encoded' }
+  }
+  const enc = encodings[0]
+  const fn = SYNC_CODECS[enc]
+  const flush = enc === 'br' ? zlib.constants.BROTLI_OPERATION_FLUSH : zlib.constants.Z_SYNC_FLUSH
+  try {
+    const buf = fn(rawBuf, bodyComplete ? { maxOutputLength: maxBytes } : { maxOutputLength: maxBytes, finishFlush: flush })
     return {
-      ok: false,
-      buf: Buffer.alloc(0),
-      decodeComplete: false,
-      decode: 'error',
-      truncated: false,
-      reason: 'unsupported-encoding',
-      chargedBytes: 0,
+      ok: true,
+      buf,
+      decodeComplete: bodyComplete,
+      decode: bodyComplete ? 'complete' : 'truncated',
+      truncated: !bodyComplete,
     }
-  }
-  let curBuf = rawBuf
-  let curComplete = bodyComplete
-  let curCharged = 0
-  let anyTruncated = !bodyComplete
-  for (let i = encodings.length - 1; i >= 0; i--) {
-    const res = await decompressSingleLayer(curBuf, encodings[i], curComplete, maxBytes, maxMs, charger)
-    if (curCharged > 0 && charger) {
-      charger.release(curCharged)
-      curCharged = 0
-    }
-    if (!res.ok) return res
-    curBuf = res.buf
-    curComplete = res.decodeComplete
-    curCharged = res.chargedBytes ?? 0
-    if (res.truncated) anyTruncated = true
-  }
-  return {
-    ok: true,
-    buf: curBuf,
-    decodeComplete: curComplete && !anyTruncated,
-    decode: curComplete && !anyTruncated ? 'complete' : 'truncated',
-    truncated: anyTruncated,
-    chargedBytes: curCharged,
+  } catch {
+    return { ok: false, buf: Buffer.alloc(0), decodeComplete: false, decode: 'error', truncated: false, reason: 'encoded' }
   }
 }
 
-const SAFE_MIME_RE = /^[a-z0-9!#$&^_.+-]{1,40}\/[a-z0-9!#$&^_.+-]{1,64}$/
-const STANDARD_MIME_TYPES = new Set(['application', 'audio', 'font', 'image', 'message', 'model', 'multipart', 'text', 'video'])
+const SAFE_MIME_RE = /^(?:application|audio|font|image|message|model|multipart|text|video)\/[a-z0-9!#$&^_.+-]{1,64}$/
 
-export function normalizeContentType(header: string | undefined, vault?: SecretVault): string | undefined {
+export function normalizeContentType(header: string | undefined): string | undefined {
   if (!header) return undefined
-  const rawEssence = header.split(';')[0].trim()
-  if (!rawEssence) return undefined
-  const essence = rawEssence.toLowerCase()
-  // Scrub original-case essence BEFORE lowercasing so mixed-case vault secrets never leak in lowercase!
-  if (vault && (vault.scrub(rawEssence).count > 0 || vault.scrub(essence).count > 0)) {
-    return 'application/octet-stream'
-  }
-  if (!SAFE_MIME_RE.test(essence)) return 'application/octet-stream'
-  const slashIdx = rawEssence.indexOf('/')
-  const rawSub = slashIdx >= 0 ? rawEssence.slice(slashIdx + 1) : ''
-  const [type, subtype] = essence.split('/')
-  if (!STANDARD_MIME_TYPES.has(type)) return 'application/octet-stream'
-  if (isSensitiveValue(rawSub) || isSensitiveValue(subtype) || isDataLikeKey(rawSub) || isDataLikeKey(subtype)) {
-    return `${type}/<redacted>`
-  }
-  return essence
+  const e = header.split(';')[0].trim().toLowerCase()
+  return e ? (SAFE_MIME_RE.test(e) ? e : 'other') : undefined
 }
 
 export function isBinaryContentType(reqType: string | undefined): boolean {
   if (!reqType) return false
   if (reqType === 'multipart/form-data') return true
   if (reqType.startsWith('image/') || reqType.startsWith('video/') || reqType.startsWith('audio/') || reqType.startsWith('font/')) return true
-  if (
+  return (
     reqType === 'application/octet-stream' ||
     reqType === 'application/pdf' ||
     reqType === 'application/zip' ||
     reqType === 'application/gzip' ||
     reqType === 'application/wasm'
-  ) {
-    return true
-  }
-  return false
+  )
 }
 
 export function hasBinaryMagic(buf: Buffer): boolean {
@@ -351,8 +129,7 @@ export function hasBinaryMagic(buf: Buffer): boolean {
     if (buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return true
     if (buf[0] === 0x77 && buf[1] === 0x4f && buf[2] === 0x46 && (buf[3] === 0x46 || buf[3] === 0x32)) return true
   }
-  if (buf.includes(0x00)) return true
-  return false
+  return buf.includes(0x00)
 }
 
 export function decodeUtf8Prefix(buf: Buffer, truncated: boolean): string | null {
@@ -362,427 +139,69 @@ export function decodeUtf8Prefix(buf: Buffer, truncated: boolean): string | null
   for (let trim = 0; trim <= maxTrim; trim++) {
     try {
       return dec.decode(trim ? buf.subarray(0, buf.length - trim) : buf)
-    } catch {
-      // retry with one fewer trailing byte if truncated mid-codepoint
-    }
+    } catch {}
   }
   return null
 }
 
-// Strict token-level GraphQL document classifier.
+const GQL_STRIP_RE = /"""(?:\\"""|[\s\S])*?"""|"(?:\\.|[^"\\])*"|#[^\r\n]*/g
+const GQL_TOP_HEADER_RE = /\b(?:(fragment)\b|(query|mutation|subscription)(?:\s+([A-Za-z_]\w*))?)/g
+
 export function classifyGraphqlQuery(
   query: string,
   operationName?: string,
 ): { op: GraphqlOp; opNames: string[]; opKinds: string[] } {
-  type OpDef = { kind: 'query' | 'mutation' | 'subscription'; name?: string }
-  const ops: OpDef[] = []
-  const len = query.length
-  let i = 0
+  const stripped = query.replace(GQL_STRIP_RE, ' ')
+  const ops: Array<{ kind: 'query' | 'mutation' | 'subscription'; name?: string }> = []
   let depth = 0
-  let pendingOp: 'query' | 'mutation' | 'subscription' | null = null
-  let pendingName: string | undefined
-  let skippingFragmentHeader = false
+  let pDepth = 0
+  let headerStart = 0
 
-  const isNameStart = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95
-  const isNameCont = (c: number) => isNameStart(c) || (c >= 48 && c <= 57)
-
-  while (i < len) {
-    const ch = query[i]
-    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n' || ch === ',' || ch === '\ufeff') {
-      i++
-      continue
-    }
-    if (ch === '#') {
-      while (i < len && query[i] !== '\n' && query[i] !== '\r') i++
-      continue
-    }
-    if (ch === '"') {
-      if (query.startsWith('"""', i)) {
-        i += 3
-        while (i < len) {
-          if (query[i] === '\\' && query.startsWith('"""', i + 1)) {
-            i += 4
-            continue
-          }
-          if (query.startsWith('"""', i)) {
-            i += 3
-            break
-          }
-          i++
-        }
-      } else {
-        i++
-        while (i < len) {
-          if (query[i] === '\\') {
-            i += 2
-            continue
-          }
-          if (query[i] === '"') {
-            i++
-            break
-          }
-          i++
-        }
-      }
-      continue
-    }
+  for (let i = 0; i < stripped.length; i++) {
+    const ch = stripped[i]
+    if (ch === '(') { pDepth++; continue }
+    if (ch === ')') { if (pDepth > 0) pDepth--; continue }
+    if (pDepth > 0) continue
     if (ch === '{') {
       if (depth === 0) {
-        if (skippingFragmentHeader) {
-          skippingFragmentHeader = false
-        } else if (pendingOp) {
-          ops.push({ kind: pendingOp, name: pendingName })
-          pendingOp = null
-          pendingName = undefined
-        } else {
-          ops.push({ kind: 'query', name: undefined })
+        const hdr = stripped.slice(headerStart, i)
+        let match: RegExpExecArray | null
+        let isFrag = false
+        let kind: 'query' | 'mutation' | 'subscription' = 'query'
+        let name: string | undefined
+        GQL_TOP_HEADER_RE.lastIndex = 0
+        while ((match = GQL_TOP_HEADER_RE.exec(hdr))) {
+          if (match[1]) { isFrag = true; break }
+          if (match[2]) {
+            kind = match[2] as 'query' | 'mutation' | 'subscription'
+            name = match[3]
+            break
+          }
         }
+        if (!isFrag) ops.push({ kind, name })
       }
       depth++
-      i++
-      continue
-    }
-    if (ch === '}') {
+    } else if (ch === '}') {
       if (depth > 0) depth--
-      i++
-      continue
+      if (depth === 0) headerStart = i + 1
     }
-    if (ch === '(') {
-      let pDepth = 1
-      i++
-      while (i < len && pDepth > 0) {
-        const pc = query[i]
-        if (pc === '"') {
-          if (query.startsWith('"""', i)) {
-            i += 3
-            while (i < len && !query.startsWith('"""', i)) i += query[i] === '\\' ? 2 : 1
-            i += 3
-          } else {
-            i++
-            while (i < len && query[i] !== '"') i += query[i] === '\\' ? 2 : 1
-            i++
-          }
-          continue
-        }
-        if (pc === '#') {
-          while (i < len && query[i] !== '\n') i++
-          continue
-        }
-        if (pc === '(') pDepth++
-        else if (pc === ')') pDepth--
-        i++
-      }
-      continue
-    }
-    if (ch === '@') {
-      i++
-      while (i < len && isNameCont(query.charCodeAt(i))) i++
-      continue
-    }
-    const code = query.charCodeAt(i)
-    if (isNameStart(code)) {
-      const start = i
-      i++
-      while (i < len && isNameCont(query.charCodeAt(i))) i++
-      if (depth === 0) {
-        const word = query.slice(start, i)
-        if (word === 'fragment') {
-          skippingFragmentHeader = true
-          pendingOp = null
-          pendingName = undefined
-        } else if (word === 'query' || word === 'mutation' || word === 'subscription') {
-          if (!skippingFragmentHeader) {
-            pendingOp = word
-            pendingName = undefined
-          }
-        } else if (pendingOp && pendingName === undefined && !skippingFragmentHeader) {
-          pendingName = word
-        }
-      }
-      continue
-    }
-    i++
   }
 
   const opNames = ops.map(o => o.name ?? '<anonymous>')
   const opKinds = ops.map(o => o.kind)
-
-  if (ops.length === 0) {
-    return { op: 'mixed', opNames, opKinds }
-  }
+  if (ops.length === 0) return { op: 'mixed', opNames, opKinds }
   if (operationName) {
     const matches = ops.filter(o => o.name === operationName)
-    if (matches.length !== 1) return { op: 'mixed', opNames, opKinds }
-    return { op: matches[0].kind, opNames, opKinds }
+    return { op: matches.length === 1 ? matches[0].kind : 'mixed', opNames, opKinds }
   }
-  if (ops.length === 1) {
-    return { op: ops[0].kind, opNames, opKinds }
-  }
-  return { op: 'mixed', opNames, opKinds }
+  return { op: ops.length === 1 ? ops[0].kind : 'mixed', opNames, opKinds }
 }
 
-// Linear O(N) SOAP Body root element scanner (zero regex backtracking / ReDoS-safe).
+const SOAP_BODY_ROOT_RE = /<(?:[\w.-]+:)?Body(?:\s[^<>]*)?>\s*(?:<!--[\s\S]*?-->\s*)*<([\w.:-]+)/i
+
 export function extractSoapBodyRoot(xml: string): string | undefined {
-  const len = xml.length
-  let i = 0
-  let inBody = false
-  const isNameChar = (c: number) =>
-    (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 45 || c === 46 || c === 58
-
-  while (i < len) {
-    const pos = xml.indexOf('<', i)
-    if (pos < 0 || pos + 1 >= len) return undefined
-    if (xml.startsWith('<!--', pos)) {
-      const end = xml.indexOf('-->', pos + 4)
-      if (end < 0) return undefined
-      i = end + 3
-      continue
-    }
-    if (xml.startsWith('<?', pos)) {
-      const end = xml.indexOf('?>', pos + 2)
-      if (end < 0) return undefined
-      i = end + 2
-      continue
-    }
-    if (xml.startsWith('<![CDATA[', pos)) {
-      const end = xml.indexOf(']]>', pos + 9)
-      if (end < 0) return undefined
-      i = end + 3
-      continue
-    }
-    if (xml.startsWith('<!', pos)) {
-      const end = xml.indexOf('>', pos + 2)
-      if (end < 0) return undefined
-      i = end + 1
-      continue
-    }
-    const nextCh = xml.charCodeAt(pos + 1)
-    if (nextCh === 47) { // '</'
-      const end = xml.indexOf('>', pos + 2)
-      if (end < 0) return undefined
-      if (inBody) {
-        const closeName = xml.slice(pos + 2, end).trim()
-        const colon = closeName.indexOf(':')
-        const local = (colon >= 0 ? closeName.slice(colon + 1) : closeName).toLowerCase()
-        if (local === 'body') return undefined
-      }
-      i = end + 1
-      continue
-    }
-    let nameEnd = pos + 1
-    while (nameEnd < len && isNameChar(xml.charCodeAt(nameEnd))) nameEnd++
-    if (nameEnd === pos + 1) {
-      i = pos + 1
-      continue
-    }
-    const qname = xml.slice(pos + 1, nameEnd)
-    const gt = xml.indexOf('>', nameEnd)
-    if (gt < 0) return undefined
-    const selfClosing = xml.charCodeAt(gt - 1) === 47
-    if (inBody) {
-      return qname
-    }
-    const colon = qname.indexOf(':')
-    const local = (colon >= 0 ? qname.slice(colon + 1) : qname).toLowerCase()
-    if (local === 'body' && !selfClosing) {
-      inBody = true
-    }
-    i = gt + 1
-  }
-  return undefined
+  return SOAP_BODY_ROOT_RE.exec(xml)?.[1]
 }
-
-// Linear O(N) XML/SOAP redactor: redacts text inside elements whose local name is a sensitive key or container,
-// plus sensitive attribute values and vault/secret patterns.
-export const MAX_XML_DEPTH = 256
-
-function isXmlWs(c: number): boolean {
-  return c === 32 || c === 9 || c === 10 || c === 13
-}
-
-function isXmlNameStart(c: number): boolean {
-  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 58
-}
-
-function isXmlNameChar(c: number): boolean {
-  return isXmlNameStart(c) || (c >= 48 && c <= 57) || c === 45 || c === 46
-}
-
-// Single-pass, quote-aware, forward-only O(N) XML tokenizer & redactor (fail-closed on malformed/incomplete XML).
-function redactXmlBody(xml: string, vault?: SecretVault): { ok: boolean; text: string; vaultRedactions: number } {
-  const len = xml.length
-  let i = len > 0 && xml.charCodeAt(0) === 0xfeff ? 1 : 0
-  const outParts: string[] = []
-  let vaultRedactions = 0
-  const stack: Array<{ qname: string; sensitive: boolean }> = []
-  let rootOpened = false
-  let rootClosed = false
-
-  const scrubSegment = (s: string, sensitive: boolean): string => {
-    if (!s) return s
-    if (sensitive) return s.trim() ? '[REDACTED]' : s
-    if (isSensitiveValue(s.trim())) return '[REDACTED]'
-    const sc = scrubText(s, vault)
-    vaultRedactions += sc.vaultRedactions
-    return sc.text
-  }
-
-  while (i < len) {
-    const pos = xml.indexOf('<', i)
-    const curSensitive = stack.length > 0 && stack[stack.length - 1].sensitive
-    if (pos < 0) {
-      const tail = xml.slice(i)
-      if (tail.trim()) return { ok: false, text: '', vaultRedactions: 0 }
-      outParts.push(tail)
-      break
-    }
-    if (pos > i) {
-      const text = xml.slice(i, pos)
-      if (stack.length === 0) {
-        if (text.trim()) return { ok: false, text: '', vaultRedactions: 0 }
-        outParts.push(text)
-      } else {
-        outParts.push(scrubSegment(text, curSensitive))
-      }
-    }
-
-    if (xml.startsWith('<!--', pos)) {
-      const end = xml.indexOf('-->', pos + 4)
-      if (end < 0) return { ok: false, text: '', vaultRedactions: 0 }
-      outParts.push(`<!--${scrubSegment(xml.slice(pos + 4, end), curSensitive)}-->`)
-      i = end + 3
-      continue
-    }
-    if (xml.startsWith('<?', pos)) {
-      const end = xml.indexOf('?>', pos + 2)
-      if (end < 0) return { ok: false, text: '', vaultRedactions: 0 }
-      outParts.push(`<?${scrubSegment(xml.slice(pos + 2, end), curSensitive)}?>`)
-      i = end + 2
-      continue
-    }
-    if (xml.startsWith('<![CDATA[', pos)) {
-      if (stack.length === 0) return { ok: false, text: '', vaultRedactions: 0 }
-      const end = xml.indexOf(']]>', pos + 9)
-      if (end < 0) return { ok: false, text: '', vaultRedactions: 0 }
-      outParts.push(`<![CDATA[${scrubSegment(xml.slice(pos + 9, end), curSensitive)}]]>`)
-      i = end + 3
-      continue
-    }
-    if (xml.startsWith('<!', pos)) {
-      return { ok: false, text: '', vaultRedactions: 0 }
-    }
-
-    if (pos + 1 < len && xml.charCodeAt(pos + 1) === 47) { // '</'
-      let j = pos + 2
-      if (j >= len || !isXmlNameStart(xml.charCodeAt(j))) return { ok: false, text: '', vaultRedactions: 0 }
-      const nameStart = j
-      while (j < len && isXmlNameChar(xml.charCodeAt(j))) j++
-      const closeQname = xml.slice(nameStart, j)
-      while (j < len && isXmlWs(xml.charCodeAt(j))) j++
-      if (j >= len || xml.charCodeAt(j) !== 62) return { ok: false, text: '', vaultRedactions: 0 }
-      if (stack.length === 0 || stack[stack.length - 1].qname !== closeQname) {
-        return { ok: false, text: '', vaultRedactions: 0 }
-      }
-      stack.pop()
-      if (stack.length === 0) rootClosed = true
-      outParts.push(`</${closeQname}>`)
-      i = j + 1
-      continue
-    }
-
-    if (rootClosed) return { ok: false, text: '', vaultRedactions: 0 }
-    let j = pos + 1
-    if (j >= len || !isXmlNameStart(xml.charCodeAt(j))) return { ok: false, text: '', vaultRedactions: 0 }
-    const nameStart = j
-    while (j < len && isXmlNameChar(xml.charCodeAt(j))) j++
-    const qname = xml.slice(nameStart, j)
-    const colon = qname.indexOf(':')
-    const local = colon >= 0 ? qname.slice(colon + 1) : qname
-    const elemSensitive = curSensitive || isSensitiveKey(local) || isSensitiveContainerKey(local)
-
-    const tagParts: string[] = ['<', qname]
-    let selfClosing = false
-    let closedTag = false
-    while (j < len) {
-      const wsStart = j
-      while (j < len && isXmlWs(xml.charCodeAt(j))) j++
-      if (j >= len) return { ok: false, text: '', vaultRedactions: 0 }
-      const ch = xml.charCodeAt(j)
-      if (ch === 62) { // '>'
-        j++
-        closedTag = true
-        break
-      }
-      if (ch === 47) { // '/>'
-        if (j + 1 >= len || xml.charCodeAt(j + 1) !== 62) return { ok: false, text: '', vaultRedactions: 0 }
-        selfClosing = true
-        closedTag = true
-        j += 2
-        break
-      }
-      if (j === wsStart || !isXmlNameStart(ch)) return { ok: false, text: '', vaultRedactions: 0 }
-      const aStart = j
-      while (j < len && isXmlNameChar(xml.charCodeAt(j))) j++
-      const attrName = xml.slice(aStart, j)
-      while (j < len && isXmlWs(xml.charCodeAt(j))) j++
-      if (j >= len || xml.charCodeAt(j) !== 61) return { ok: false, text: '', vaultRedactions: 0 }
-      j++
-      while (j < len && isXmlWs(xml.charCodeAt(j))) j++
-      if (j >= len) return { ok: false, text: '', vaultRedactions: 0 }
-      const q = xml.charCodeAt(j)
-      if (q !== 34 && q !== 39) return { ok: false, text: '', vaultRedactions: 0 }
-      const quote = q === 34 ? '"' : "'"
-      j++
-      const vStart = j
-      const qEnd = xml.indexOf(quote, j)
-      if (qEnd < 0) return { ok: false, text: '', vaultRedactions: 0 }
-      const rawVal = xml.slice(vStart, qEnd)
-      if (rawVal.includes('<')) return { ok: false, text: '', vaultRedactions: 0 }
-      j = qEnd + 1
-
-      const aColon = attrName.indexOf(':')
-      const aLocal = aColon >= 0 ? attrName.slice(aColon + 1) : attrName
-      const isXmlns = attrName === 'xmlns' || attrName.startsWith('xmlns:')
-      let outVal: string
-      if (!isXmlns && (elemSensitive || isSensitiveKey(aLocal) || isSensitiveContainerKey(aLocal) || isSensitiveValue(rawVal))) {
-        outVal = '[REDACTED]'
-      } else {
-        const sc = scrubText(rawVal, vault)
-        vaultRedactions += sc.vaultRedactions
-        outVal = sc.text
-      }
-      tagParts.push(' ', attrName, '=', quote, outVal, quote)
-    }
-    if (!closedTag) return { ok: false, text: '', vaultRedactions: 0 }
-
-    tagParts.push(selfClosing ? '/>' : '>')
-    outParts.push(tagParts.join(''))
-    if (!rootOpened) rootOpened = true
-    if (selfClosing) {
-      if (stack.length === 0) rootClosed = true
-    } else {
-      if (stack.length >= MAX_XML_DEPTH) return { ok: false, text: '', vaultRedactions: 0 }
-      stack.push({ qname, sensitive: elemSensitive })
-    }
-    i = j
-  }
-
-  if (!rootOpened || stack.length !== 0) {
-    return { ok: false, text: '', vaultRedactions: 0 }
-  }
-
-  let finalOut = outParts.join('')
-  if (vault) {
-    const finalScrub = vault.scrub(finalOut)
-    if (finalScrub.count > 0) {
-      vaultRedactions += finalScrub.count
-      finalOut = finalScrub.text
-    }
-  }
-  return { ok: true, text: finalOut, vaultRedactions }
-}
-
-const FORM_LIKE_RE = /^[A-Za-z0-9_.%+-]+=[^&\r\n]*(?:&[A-Za-z0-9_.%+-]+=[^&\r\n]*)*$/
 
 export type ExtractInput = {
   url: URL
@@ -801,9 +220,6 @@ export type ExtractInput = {
   isWrite: boolean
   isAuth: boolean
   isLive: boolean
-  projection: ProjectionMode
-  vault?: SecretVault
-  sampleBudgetOk?: boolean
 }
 
 export type ExtractOutput = {
@@ -813,7 +229,6 @@ export type ExtractOutput = {
   dupKeys?: true
   completeness: Completeness
   decodeComplete: boolean
-  reqBody?: string
   reqTrunc?: true
   reqOmitted?: BodyOmittedReason
 }
@@ -857,9 +272,9 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         : []
       return {
         actions,
-        completeness: { transport: input.transport, decode: decodeRes.budgetExceeded ? 'truncated' : 'error', extract: 'none', ...(reasons.length && { reasons }) },
+        completeness: { transport: input.transport, decode: 'error', extract: 'none', ...(reasons.length && { reasons }) },
         decodeComplete: false,
-        reqOmitted: input.isLive ? 'live' : input.isAuth ? 'auth-url' : decodeRes.budgetExceeded ? 'budget' : 'decompress-err',
+        reqOmitted: input.isLive ? 'live' : input.isAuth ? 'auth-url' : 'encoded',
       }
     }
 
@@ -869,8 +284,7 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
     if (hasBody) {
       if (isBinaryContentType(input.reqType) || hasBinaryMagic(rawBuf)) {
         isBinary = true
-        if (input.reqType === 'multipart/form-data') reasons.push('multipart')
-        else reasons.push('binary')
+        reasons.push(input.reqType === 'multipart/form-data' ? 'multipart' : 'binary')
       } else {
         const text = decodeUtf8Prefix(rawBuf, !decodeComplete || !input.bodyComplete)
         if (text === null) {
@@ -943,17 +357,13 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
 
       const formIdent = validateStructuralIdent(rawFormName, STRUCT_IDENT_RE)
       if (formIdent) details.formName = formIdent
-
       const verIdent = validateStructuralIdent(obj?.version, STRUCT_IDENT_RE)
       if (verIdent) details.version = verIdent
-
       const rawAction = typeof obj?.action === 'string' ? obj.action : typeof obj?.formServiceAction === 'string' ? obj.formServiceAction : undefined
       const actIdent = validateStructuralIdent(rawAction, /^[A-Za-z][A-Za-z0-9_-]{0,23}$/)
       if (actIdent) details.action = actIdent
-
       const targetTypeIdent = validateStructuralIdent(obj?.targetType, STRUCT_IDENT_RE)
       if (targetTypeIdent) details.targetType = targetTypeIdent
-
       const dsTypeIdent = validateStructuralIdent(obj?.dataServiceType, STRUCT_IDENT_RE)
       if (dsTypeIdent) details.dataServiceType = dsTypeIdent
 
@@ -965,7 +375,7 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
             ? (obj!.formRequest as any).formActions
             : undefined
       if (rawActions) {
-        const summarized = rawActions.slice(0, 32).map(a => {
+        details.formActions = rawActions.slice(0, 32).map(a => {
           if (!a || typeof a !== 'object') return { command: 'unknown' }
           const rec = a as Record<string, unknown>
           const item: Record<string, string> = {}
@@ -975,16 +385,13 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
           if (cid) item.controlID = cid
           return item
         })
-        details.formActions = summarized
         if (rawActions.length > 32) details.formActionsTruncated = true
       }
 
-      const op = actIdent ? `${endpoint}:${actIdent}` : `${endpoint}:${input.effectiveMethod}`
-      const resource = formIdent ?? input.sanitizedPath
       actions.push({
         family: 'e1-ais',
-        op,
-        resource,
+        op: actIdent ? `${endpoint}:${actIdent}` : `${endpoint}:${input.effectiveMethod}`,
+        resource: formIdent ?? input.sanitizedPath,
         ...(Object.keys(details).length && { details }),
         coverage: defaultCov,
       })
@@ -1045,7 +452,6 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         const qStr = typeof rec.query === 'string' ? rec.query : undefined
         const opNameRaw = typeof rec.operationName === 'string' ? rec.operationName : undefined
         const hasPersisted = Boolean(rec.extensions && typeof rec.extensions === 'object' && 'persistedQuery' in (rec.extensions as Record<string, unknown>))
-
         const safeOpName = validateStructuralIdent(opNameRaw, GQL_IDENT_RE)
 
         let varKeys: string[] | undefined
@@ -1088,12 +494,7 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         } else {
           opsSeen.push('mixed')
           if (idx < 16) {
-            actions.push({
-              family: 'graphql',
-              op: 'graphql:mixed',
-              resource: input.sanitizedPath,
-              coverage: 'unknown',
-            })
+            actions.push({ family: 'graphql', op: 'graphql:mixed', resource: input.sanitizedPath, coverage: 'unknown' })
           }
         }
       }
@@ -1161,64 +562,14 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       extractStatus = isBinary || structuredJsonParseFailed ? 'opaque' : fullyIntact ? 'complete' : 'partial'
     }
 
-    // Compute reqBody / reqOmitted / reqTrunc
-    let reqBody: string | undefined
     let reqTrunc: true | undefined
     let reqOmitted: BodyOmittedReason | undefined
-
     if (input.isWrite && (hasBody || input.isLive)) {
-      if (input.isLive) {
-        reqOmitted = 'live'
-      } else if (input.isAuth) {
-        reqOmitted = 'auth-url'
-      } else if (isBinary) {
-        reqOmitted = 'binary'
-      } else if (input.projection === 'semantic') {
-        reqOmitted = 'policy-profile'
-      } else if (structuredJsonParseFailed) {
-        reqOmitted = 'policy-profile'
-        reqTrunc = true
-      } else if (input.sampleBudgetOk === false) {
-        reqOmitted = 'budget'
-      } else if (decodedText !== undefined) {
-        const trimmedSample = decodedText.trim()
-        const isXml =
-          input.reqType === 'text/xml' ||
-          input.reqType === 'application/xml' ||
-          input.reqType === 'application/soap+xml' ||
-          trimmedSample.startsWith('<')
-        const isForm =
-          input.reqType === 'application/x-www-form-urlencoded' ||
-          (!isJson && !isXml && FORM_LIKE_RE.test(trimmedSample))
-
-        let redactedText: string | undefined
-        if (isJson) {
-          redactedText = JSON.stringify(redactJsonValue(parsedJson, input.vault, false).value)
-        } else if (isForm) {
-          redactedText = redactFormBody(decodedText, input.vault).text
-        } else if (isXml) {
-          const rx = redactXmlBody(decodedText, input.vault)
-          if (rx.ok) {
-            redactedText = rx.text
-          } else {
-            reqOmitted = 'policy-profile'
-            reasons.push('malformed-xml')
-          }
-        } else {
-          reqOmitted = 'policy-profile'
-          reasons.push('unstructured-text')
-        }
-        if (redactedText !== undefined) {
-          if (Buffer.byteLength(redactedText, 'utf8') > MAX_SAMPLE_BODY_BYTES) {
-            reqBody = truncateUtf8HeadTail(redactedText, MAX_SAMPLE_BODY_BYTES, 3072, 1020)
-            reqTrunc = true
-          } else {
-            reqBody = redactedText
-          }
-        }
-      }
+      if (input.isLive) reqOmitted = 'live'
+      else if (input.isAuth) reqOmitted = 'auth-url'
+      else if (isBinary) reqOmitted = 'binary'
+      else reqOmitted = 'policy-profile'
     }
-
     if ((!input.bodyComplete || !decodeComplete) && (hasBody || input.transport === 'truncated')) {
       reqTrunc = true
     }
@@ -1235,7 +586,6 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         ...(reasons.length > 0 && { reasons }),
       },
       decodeComplete,
-      ...(reqBody !== undefined && { reqBody }),
       ...(reqTrunc && { reqTrunc }),
       ...(reqOmitted && { reqOmitted }),
     }

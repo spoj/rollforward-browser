@@ -549,7 +549,6 @@ const DEFAULT_CDP_PARSER_BUDGET = 1024 * 1024 // 1 MiB dedicated per-session CDP
 const RESERVED_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
 export type CdpTapOptions = {
-  projection: ProjectionMode
   vault?: SecretVault
   isLive: () => boolean
   coalesceMs?: number
@@ -754,7 +753,6 @@ export class CdpSessionTap {
     const params: Record<string, unknown> = parsed.params && typeof parsed.params === 'object' ? parsed.params : {}
     onParsed?.(rawMethod, params)
     const ambiguous = hasDuplicateTopLevelKeys(rawText)
-    const samples = this.opts.projection === 'semantic+samples'
 
     this.countMethod(rawMethod)
     const safeMethod = scrubCdpIdent(rawMethod, MAX_METHOD_NAME_BYTES) ?? '_unknown'
@@ -774,9 +772,6 @@ export class CdpSessionTap {
     let summary: Record<string, unknown> | undefined
     let capture = false
 
-    const scrubSampleExpr = (expr: string): string =>
-      truncateUtf8HeadTail(scrubText(expr).text, MAX_SAMPLE_EXPR_BYTES, 768, 252)
-
     if (rawMethod === 'Runtime.callFunctionOn') {
       capture = true
       const fn = typeof params.functionDeclaration === 'string' ? params.functionDeclaration : ''
@@ -788,7 +783,6 @@ export class CdpSessionTap {
         fnLen,
         fnHash64,
         argCount: args.length,
-        ...(samples && fn && { fn: scrubSampleExpr(fn) }),
       }
       if ((fnLen > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
         severity = 'high'
@@ -800,7 +794,6 @@ export class CdpSessionTap {
       summary = {
         exprLen: Buffer.byteLength(expr, 'utf8'),
         exprHash64: hash64(expr),
-        ...(samples && expr && { expr: scrubSampleExpr(expr) }),
       }
       if ((Buffer.byteLength(expr, 'utf8') > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
         severity = 'high'
@@ -831,7 +824,7 @@ export class CdpSessionTap {
 
       if (/^https?:/i.test(strippedUrl)) {
         const parsed = URL.parse(strippedUrl)
-        navUrl = parsed ? sanitizeUrl(parsed, { projection: this.opts.projection }).url : `${/^https:/i.test(strippedUrl) ? 'https:' : 'http:'}//[REDACTED]`
+        navUrl = parsed ? sanitizeUrl(parsed, { projection: 'semantic' }).url : `${/^https:/i.test(strippedUrl) ? 'https:' : 'http:'}//[REDACTED]`
       } else if (/^data:/i.test(strippedUrl)) {
         severity = 'high'
         const comma = strippedUrl.indexOf(',')
