@@ -372,19 +372,25 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
           release: (b: number) => driveParserTracker.release(client.name, s.id, b),
         }
       : undefined
+    const onTapError = () => {
+      socket.destroy()
+      up.destroy()
+    }
     const tap = tapExternalCdp
-      ? s.cdpTap!.attachConnection()
+      ? s.cdpTap!.attachConnection(onTapError)
       : tapDriveVault
-        ? createDriveVaultTap(s.vault, driveCharger)
+        ? createDriveVaultTap(s.vault, driveCharger, onTapError)
         : undefined
-    // Passive zero-mutation attachment: feed head before up.write(head), then pipe, then observe socket data (§3.1.3)
-    if (tap && head.length) tap.feed(head)
+    if (tap && head.length) {
+      tap.feed(head)
+      if (socket.destroyed) return
+    }
     up.write(head)
-    socket.pipe(up)
     if (tap) {
       socket.on('data', (c: Buffer) => tap.feed(c))
       socket.on('close', () => tap.close())
     }
+    socket.pipe(up)
   }
 
   up.pipe(socket)

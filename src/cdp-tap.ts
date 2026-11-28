@@ -51,7 +51,6 @@ export type CdpTapSummary = {
   depthLimited: number
   droppedCdp: number
   droppedHighSeverity: number
-  tapDisabledCount: number
 }
 
 export type CdpLogRecord = CdpEntry | CdpTapSummary
@@ -582,7 +581,6 @@ export class CdpSessionTap {
   private droppedCdp = 0
   private droppedHighSeverity = 0
   private overflowHighSevUsed = 0
-  private tapDisabledCount = 0
   private slots = new Map<string, CoalesceSlot>()
   private lastKeyByConnSession = new Map<string, string>()
   private sealed = false
@@ -1121,27 +1119,18 @@ export class CdpSessionTap {
     }
   }
 
-  attachConnection(): { feed: (chunk: Buffer) => void; close: () => void } {
+  attachConnection(onError?: (reason: string) => void): { feed: (chunk: Buffer) => void; close: () => void } {
     const conn = ++this.connSeq
-    let connDisabled = false
-    const emitDisabled = (reason: string) => {
-      if (connDisabled || this.sealed) return
-      connDisabled = true
-      this.tapDisabledCount++
-      const s = scrubText(reason, this.opts.vault)
-      this.appendRecord({
-        t: new Date().toISOString(),
-        conn,
-        method: '_tap.disabled',
-        severity: 'high',
-        summary: { reason: truncateUtf8HeadTail(s.text, 200) },
-        ...(s.vaultRedactions > 0 && { vaultRedactions: s.vaultRedactions }),
-      })
+    let connFailed = false
+    const failConn = (reason: string) => {
+      if (connFailed) return
+      connFailed = true
+      onError?.(reason)
     }
 
     const parser = new WsFrameParser(
       msg => {
-        if (this.sealed || connDisabled) return
+        if (this.sealed || connFailed) return
         if (msg.truncated || msg.budgetDropped) {
           if (!msg.budgetDropped && this.opts.injectedScriptSha256Allowlist?.has(msg.sha256)) {
             this.countMethod('_playwright.injectedScript')
@@ -1180,17 +1169,17 @@ export class CdpSessionTap {
         const text = msg.head.toString('utf8')
         this.handleCommand(conn, text, undefined, 0, msg.sha256, msg.totalBytes)
       },
-      reason => emitDisabled(reason),
+      reason => failConn(reason),
       this.getParserCharger(),
     )
 
     return {
       feed: (chunk: Buffer) => {
-        if (connDisabled || this.sealed) return
+        if (connFailed || this.sealed) return
         try {
           parser.feed(chunk)
         } catch (e: any) {
-          emitDisabled(e?.message ?? 'tap exception')
+          failConn(e?.message ?? 'tap exception')
         }
       },
       close: () => {
@@ -1215,7 +1204,6 @@ export class CdpSessionTap {
       depthLimited: this.depthLimited,
       droppedCdp: this.droppedCdp,
       droppedHighSeverity: this.droppedHighSeverity,
-      tapDisabledCount: this.tapDisabledCount,
     }
     let size = Buffer.byteLength(JSON.stringify(summary), 'utf8')
     if (this.bytes + size > this.maxBytes) {
@@ -1279,12 +1267,18 @@ export class CdpSessionTap {
 }
 
 // Passive uncompressed /view/drive observer for SecretVault ONLY (per-connection edit buffer, never logged).
-export function createDriveVaultTap(vault: SecretVault, charger?: BudgetCharger): { feed: (chunk: Buffer) => void; close: () => void } {
-  let disabled = false
+export function createDriveVaultTap(vault: SecretVault, charger?: BudgetCharger, onError?: (reason: string) => void): { feed: (chunk: Buffer) => void; close: () => void } {
+  let failed = false
   const driveBuf = vault.createDriveBuffer()
+  const failTap = (reason: string) => {
+    if (failed) return
+    failed = true
+    driveBuf.clear()
+    onError?.(reason)
+  }
   const parser = new WsFrameParser(
     msg => {
-      if (disabled || msg.truncated || msg.budgetDropped) return
+      if (failed || msg.truncated || msg.budgetDropped) return
       let parsed: any
       try {
         parsed = JSON.parse(msg.head.toString('utf8'))
@@ -1294,20 +1288,16 @@ export function createDriveVaultTap(vault: SecretVault, charger?: BudgetCharger)
       if (!parsed || typeof parsed !== 'object' || typeof parsed.method !== 'string') return
       driveBuf.onEvent(parsed.method, parsed.params)
     },
-    () => {
-      disabled = true
-      driveBuf.clear()
-    },
+    reason => failTap(reason),
     charger,
   )
   return {
     feed: (chunk: Buffer) => {
-      if (disabled) return
+      if (failed) return
       try {
         parser.feed(chunk)
-      } catch {
-        disabled = true
-        driveBuf.clear()
+      } catch (e: any) {
+        failTap(e?.message ?? 'tap exception')
       }
     },
     close: () => {
