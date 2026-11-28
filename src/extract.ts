@@ -409,7 +409,7 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
 
           let varKeys: string[] | undefined
           if (idx < 16 && rec.variables && typeof rec.variables === 'object' && !Array.isArray(rec.variables)) {
-            varKeys = Object.keys(rec.variables as Record<string, unknown>).slice(0, 32).map(scrubStructuralKey)
+            varKeys = Object.keys(rec.variables as Record<string, unknown>).slice(0, 32).map(k => scrubStructuralKey(k))
           }
 
           if (!qStr && hasPersisted) {
