@@ -348,9 +348,11 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
       up.destroy()
     }
     const tap = tapExternalCdp
-      ? s.cdpTap!.attachConnection(onTapError)
+      ? s.cdpTap!.attachConnection({ onError: onTapError })
       : tapDriveVault
-        ? createDriveVaultTap(s.vault, driveCharger, onTapError)
+        ? (s.cdpTap
+            ? s.cdpTap.attachConnection({ live: true, driveVault: true, onError: onTapError })
+            : createDriveVaultTap(s.vault, driveCharger, onTapError))
         : undefined
     if (tap && head.length) {
       tap.feed(head)

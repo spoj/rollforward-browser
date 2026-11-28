@@ -699,10 +699,11 @@ export class CdpSessionTap {
     ambiguous: boolean,
     summary: Record<string, unknown> | undefined,
     vaultRedactions: number,
+    forceLive = false,
   ) {
     if (this.sealed) return
     const now = new Date().toISOString()
-    const live = this.opts.isLive()
+    const live = forceLive || this.opts.isLive()
     const sig = hash64(JSON.stringify({ method, severity, ambiguous, live, summary }))
     const key = `${conn}:${cdpSession ?? ''}:${method}:${sig}`
     const csKey = `${conn}:${cdpSession ?? ''}`
@@ -745,14 +746,14 @@ export class CdpSessionTap {
     this.lastKeyByConnSession.set(csKey, key)
   }
 
-  private handleCommand(conn: number, rawText: string, cdpSessionFallback: string | undefined, depth: number, rawSha256?: string, rawTotalBytes?: number) {
+  private handleCommand(conn: number, rawText: string, cdpSessionFallback: string | undefined, depth: number, rawSha256?: string, rawTotalBytes?: number, forceLive = false, onParsed?: (method: string, params: Record<string, unknown>) => void) {
     if (this.sealed) return
     let parsed: any
     try {
       parsed = JSON.parse(rawText)
     } catch {
       this.countMethod('_unparsed')
-      this.enqueue(conn, cdpSessionFallback, '_tap.unparsed', 'high', false, { bytes: Buffer.byteLength(rawText, 'utf8') }, 0)
+      this.enqueue(conn, cdpSessionFallback, '_tap.unparsed', 'high', false, { bytes: Buffer.byteLength(rawText, 'utf8') }, 0, forceLive)
       return
     }
     if (!parsed || typeof parsed !== 'object' || typeof parsed.method !== 'string') {
@@ -767,6 +768,7 @@ export class CdpSessionTap {
     let vaultRedactions = sidScrub.vaultRedactions
 
     const params: Record<string, unknown> = parsed.params && typeof parsed.params === 'object' ? parsed.params : {}
+    onParsed?.(rawMethod, params)
     const ambiguous = hasDuplicateTopLevelKeys(rawText)
     const samples = this.opts.projection === 'semantic+samples'
 
@@ -779,11 +781,11 @@ export class CdpSessionTap {
     if (rawMethod === 'Target.sendMessageToTarget' && typeof params.message === 'string') {
       if (depth >= 2) {
         this.depthLimited++
-        this.enqueue(conn, cdpSession, safeMethod, 'high', ambiguous, { depthLimited: true }, vaultRedactions)
+        this.enqueue(conn, cdpSession, safeMethod, 'high', ambiguous, { depthLimited: true }, vaultRedactions, forceLive)
         return
       }
       const innerSession = typeof params.sessionId === 'string' ? params.sessionId : cdpSession
-      this.handleCommand(conn, params.message, innerSession, depth + 1)
+      this.handleCommand(conn, params.message, innerSession, depth + 1, undefined, undefined, forceLive, onParsed)
       return
     }
 
@@ -1061,17 +1063,20 @@ export class CdpSessionTap {
     }
 
     if (capture || ambiguous) {
-      this.enqueue(conn, cdpSession, safeMethod, severity, ambiguous, summary, vaultRedactions)
+      this.enqueue(conn, cdpSession, safeMethod, severity, ambiguous, summary, vaultRedactions, forceLive)
     }
   }
 
-  attachConnection(onError?: (reason: string) => void): { feed: (chunk: Buffer) => void; close: () => void } {
+  attachConnection(connOpts?: { live?: boolean; driveVault?: boolean; onError?: (reason: string) => void }): { feed: (chunk: Buffer) => void; close: () => void } {
     const conn = ++this.connSeq
+    const forceLive = connOpts?.live === true
+    const driveBuf = connOpts?.driveVault && this.opts.vault ? this.opts.vault.createDriveBuffer() : undefined
     let connFailed = false
     const failConn = (reason: string) => {
       if (connFailed) return
       connFailed = true
-      onError?.(reason)
+      driveBuf?.clear()
+      connOpts?.onError?.(reason)
     }
 
     const parser = new WsFrameParser(
@@ -1096,12 +1101,14 @@ export class CdpSessionTap {
           }
           const sid = scrubCdpSessionId(sessionMatch?.[1], this.opts.vault)
           vaultRedactions += sid.vaultRedactions
+          const live = forceLive || this.opts.isLive()
           this.appendRecord({
             t: new Date().toISOString(),
             conn,
             ...(sid.value && { cdpSession: sid.value }),
             method: '_tap.oversized',
             severity: 'high',
+            ...(live && { live: true as const }),
             summary: {
               bytes: msg.totalBytes,
               ...(msg.budgetDropped && { reason: 'budget' }),
@@ -1113,7 +1120,16 @@ export class CdpSessionTap {
           return
         }
         const text = msg.head.toString('utf8')
-        this.handleCommand(conn, text, undefined, 0, msg.sha256, msg.totalBytes)
+        this.handleCommand(
+          conn,
+          text,
+          undefined,
+          0,
+          msg.sha256,
+          msg.totalBytes,
+          forceLive,
+          driveBuf ? (m, p) => driveBuf.onEvent(m, p) : undefined,
+        )
       },
       reason => failConn(reason),
       this.getParserCharger(),
@@ -1130,6 +1146,7 @@ export class CdpSessionTap {
       },
       close: () => {
         parser.close()
+        driveBuf?.flush()
         for (const [key, slot] of [...this.slots.entries()]) {
           if (slot.conn === conn) this.flushSlot(key)
         }
