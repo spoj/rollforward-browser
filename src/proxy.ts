@@ -400,7 +400,7 @@ export function startProxy(
     const avail = maxLogBytes - logBytes - inflightSiteWrites * MAX_ENTRY_BYTES
     const isSiteWrite = scrubbed.isWrite && matches(site.hosts, scrubbed.authority.split(':')[0])
 
-    if (bytes > avail) {
+    if (bytes > avail && !hadSiteWriteReservation) {
       if (!isSiteWrite) droppedGets++
       else refusedFullCount++
       return null

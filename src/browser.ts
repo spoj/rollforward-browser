@@ -55,6 +55,7 @@ export type SealSnapshot = {
 }
 
 const MAX_SHOTS = 60
+const MAX_SINGLE_SHOT_BYTES = 5 * 1024 * 1024
 const MAX_SHOT_BYTES = 20 * 1024 * 1024
 const SHOT_SETTLE_MS = 500
 const SHOT_MIN_INTERVAL_MS = 1_500
@@ -354,7 +355,7 @@ export class BrowserSession {
       if (!(await this.isSafeForShot(p))) return
       if (this.stopped || this.isLiveOrCooldown() || this.driverGen !== gen || p.isClosed()) return
       const jpeg = await p.screenshot({ type: 'jpeg', quality: 65, timeout: 3000 }).catch(() => null)
-      if (!jpeg || jpeg.length > MAX_SHOT_BYTES || this.stopped || this.isLiveOrCooldown() || this.driverGen !== gen || p.isClosed() || p.url() !== urlBefore) return
+      if (!jpeg || jpeg.length > MAX_SINGLE_SHOT_BYTES || this.stopped || this.isLiveOrCooldown() || this.driverGen !== gen || p.isClosed() || p.url() !== urlBefore) return
       this.lastShotAt = Date.now()
       if (this.lastJpeg?.equals(jpeg)) return
       this.lastJpeg = jpeg
