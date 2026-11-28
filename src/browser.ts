@@ -128,6 +128,7 @@ export class BrowserSession {
   private opts: BrowserSessionOptions
   private lastShotAt = 0
   private lastJpeg?: Buffer
+  private containerStarted = false
   private shotTimer?: NodeJS.Timeout
   private shotPage?: Page
   private shotTrigger: ShotTrigger = 'nav'
@@ -279,6 +280,7 @@ export class BrowserSession {
       () => this.driverGen,
       proxyOpts,
     )
+    this.containerStarted = true
     await podman(['run', '-d', '--rm', '--name', this.container, '--label', this.label, ...containerFlags, '-v', `${this.dir}:/run/rollforward-browser`, 'rollforward-browser', spki])
     for (let i = 0; !this.wsPath; i++) {
       this.wsPath = await cdpVersion(this.cdpSocket).catch(e => { if (i === 100) throw e; return '' })
@@ -413,7 +415,7 @@ export class BrowserSession {
       state = this.pw?.isConnected() ? await withTimeout(this.pw.contexts()[0].storageState(), timeoutMs, null) : null
     } finally {
       if (this.pw) await withTimeout(this.pw.close(), timeoutMs, undefined)
-      await podman(['rm', '-f', '-i', '-t', '0', this.container]).catch(() => {})
+      if (this.containerStarted) await podman(['rm', '-f', '-i', '-t', '0', this.container]).catch(() => {})
       fs.rmSync(this.dir, { recursive: true, force: true })
     }
 
