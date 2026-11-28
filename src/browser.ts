@@ -13,7 +13,7 @@ import {
   type Site,
   type V2Entry,
 } from './proxy.ts'
-import { SecretVault, isAuthUrl, sanitizeUrl, scrubText } from './redact.ts'
+import { SecretVault, isAuthUrl, sanitizeUrl, scrubDeep, scrubText } from './redact.ts'
 
 export type ShotTrigger = 'nav' | 'load' | 'write' | 'download' | 'tab' | 'file-upload'
 
@@ -215,7 +215,7 @@ export class BrowserSession {
     if (e.isWrite) this.hudWriteCount++
     if (e.blocked) this.hudBlockedCount++
     const rawDetail = e.authority ? `${e.authority}${e.path}` : e.path || '/'
-    const detail = scrubText(rawDetail.slice(0, 160), this.vault).text
+    const detail = scrubDeep(scrubText(rawDetail.slice(0, 160)).text, this.vault)
     this.pushHudEvent({
       t: e.t,
       kind: 'http',
@@ -234,11 +234,11 @@ export class BrowserSession {
     if (typeof entry.summary?.url === 'string') {
       const parsed = URL.parse(entry.summary.url)
       if (parsed) {
-        const san = sanitizeUrl(parsed, { projection: 'semantic', vault: this.vault })
+        const san = sanitizeUrl(parsed, { projection: 'semantic' })
         hostPath = ` ${san.authority}${san.path}`
       }
     }
-    const detail = scrubText(`${entry.method}${hostPath}`.slice(0, 160), this.vault).text
+    const detail = scrubDeep(scrubText(`${entry.method}${hostPath}`.slice(0, 160)).text, this.vault)
     this.pushHudEvent({
       t: entry.t,
       kind: 'cdp',
@@ -428,7 +428,7 @@ export class BrowserSession {
       this.lastShotAt = Date.now()
       if (this.lastJpeg?.equals(jpeg)) return
       this.lastJpeg = jpeg
-      const sanUrl = sanitizeUrl(urlBefore, { projection: this.auditV2.projection ?? 'semantic', vault: this.vault }).url
+      const sanUrl = scrubDeep(sanitizeUrl(urlBefore, { projection: 'semantic' }).url, this.vault)
       this.shots.push({
         seq: ++this.shotSeq,
         at: new Date().toISOString(),

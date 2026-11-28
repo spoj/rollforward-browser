@@ -21,6 +21,7 @@ import {
   SecretVault,
   isAuthUrl,
   sanitizeUrl,
+  scrubDeep,
   scrubText,
   truncateUtf8HeadTail,
   type ProjectionMode,
@@ -67,7 +68,6 @@ export type SafeRequestProjection = {
   bodyShape?: Record<string, string>
   graphqlOp?: GraphqlOp
   dupKeys?: true
-  vaultRedactions?: number
   cdpCursor?: number
   httpCursor?: number
   live?: true
@@ -662,10 +662,11 @@ export function startProxy(
     }
 
     finalEntry.n = ++cursorCounter
-    log.push(finalEntry)
+    const scrubbedEntry = scrubDeep(finalEntry, vault)
+    log.push(scrubbedEntry)
     logBytes += bytes
-    opts?.onEntry?.(finalEntry)
-    return finalEntry.n
+    opts?.onEntry?.(scrubbedEntry)
+    return scrubbedEntry.n
   }
 
   const appendLateOutcome = (rec: Omit<LateOutcomeEntry, 'n'>): void => {
@@ -677,7 +678,7 @@ export function startProxy(
       droppedLateOutcomes++
       return
     }
-    const full: LateOutcomeEntry = { n: ++cursorCounter, ...rec }
+    const full = scrubDeep({ n: ++cursorCounter, ...rec }, vault)
     log.push(full)
     tailLogBytes += bytes
     opts?.onEntry?.(full)
@@ -704,9 +705,9 @@ export function startProxy(
   }): Promise<{ safe: SafeRequestProjection; releaseDecoded: () => void }> => {
     const { req, url, seq, t, kind, arrival, liveAtStart, genAtStart } = params
     const hdrs = params.effectiveHeaders ?? req.headers
-    const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
+    const sanUrl = url ? sanitizeUrl(url, { projection }) : sanitizeUrl(req.url ?? '/', { projection })
     const dest = sanitizeDest(hdrs)
-    const from = typeof hdrs.referer === 'string' && hdrs.referer ? sanitizeUrl(hdrs.referer, { projection, vault }).url : undefined
+    const from = typeof hdrs.referer === 'string' && hdrs.referer ? sanitizeUrl(hdrs.referer, { projection }).url : undefined
     const prefixBuf = params.prefixBuf ?? Buffer.alloc(0)
     const transport = params.transport ?? 'not-read'
     const bodyComplete = params.bodyComplete ?? false
@@ -748,7 +749,7 @@ export function startProxy(
       }
     }
 
-    const reqType = normalizeContentType(typeof hdrs['content-type'] === 'string' ? hdrs['content-type'] : undefined, vault)
+    const reqType = normalizeContentType(typeof hdrs['content-type'] === 'string' ? hdrs['content-type'] : undefined)
     const liveOrChanged = liveAtStart || isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart)
 
     let decodeRes = undefined
@@ -800,7 +801,6 @@ export function startProxy(
       isAuth: arrival.isAuth,
       isLive: liveAfterDecode,
       projection,
-      vault,
       sampleBudgetOk: sampleBytes < maxSampleBytes,
     })
 
@@ -1001,7 +1001,7 @@ export function startProxy(
       activeInFlight.delete(seq)
       const ms = Math.round(performance.now() - startMs)
       const ll = applyLateLive(safe, liveAtStart, genAtStart)
-      const scrubbedErr = errorMsg ? scrubText(errorMsg, vault).text : undefined
+      const scrubbedErr = errorMsg ? scrubText(errorMsg).text : undefined
       const ownRes = reserved
       reserved = 0
       emittedN = appendV2Entry({
@@ -1041,7 +1041,7 @@ export function startProxy(
     const emitLate = (incomplete?: true) => {
       if (!timedOutStream || !emitStarted || lateEmitted || sealed) return
       lateEmitted = true
-      const scrubbedErr = errorMsg ? scrubText(errorMsg, vault).text : undefined
+      const scrubbedErr = errorMsg ? scrubText(errorMsg).text : undefined
       const rec: Omit<LateOutcomeEntry, 'n' | 'ref'> = {
         rec: 'http_end',
         t: new Date().toISOString(),
@@ -1077,7 +1077,7 @@ export function startProxy(
         incompleteAtSeal++
         clearTimeout(streamTimer)
         const fallbackSafe = resolvedBuilt?.safe ?? (() => {
-          const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
+          const sanUrl = url ? sanitizeUrl(url, { projection }) : sanitizeUrl(req.url ?? '/', { projection })
           return {
             descV: DESC_V, redactV: REDACT_V, extractorV: EXTRACTOR_V,
             surface: 'browser' as const, target: { site: siteName }, seq, t, kind: 'http' as const,
@@ -1101,7 +1101,7 @@ export function startProxy(
       headerMs = Math.round(performance.now() - startMs)
       status = r.statusCode ?? 0
       vault?.ingestSetCookie(r.headers['set-cookie'])
-      resType = normalizeContentType(r.headers['content-type'], vault)
+      resType = normalizeContentType(r.headers['content-type'])
 
       const headers = { ...r.headers }
       for (const h of hopByHop) delete headers[h]
@@ -1274,7 +1274,7 @@ export function startProxy(
         socket.end(`HTTP/1.1 ${r.statusCode} ${r.statusMessage}\r\nconnection: close\r\n\r\n`)
       })
       up.on('error', e => {
-        commitUpgrade(safe, { status: 502, error: scrubText(e.message, vault).text, dispatch: 'dispatched' })
+        commitUpgrade(safe, { status: 502, error: scrubText(e.message).text, dispatch: 'dispatched' })
         socket.end('HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n')
       })
       up.end()

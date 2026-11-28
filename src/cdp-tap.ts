@@ -3,6 +3,7 @@ import {
   isDataLikeKey,
   isSensitiveValue,
   sanitizeUrl,
+  scrubDeep,
   scrubStructuralKey,
   scrubText,
   truncateUtf8HeadTail,
@@ -40,7 +41,6 @@ export type CdpEntry = {
   ambiguous?: true
   live?: true
   summary?: Record<string, unknown>
-  vaultRedactions?: number
 }
 
 export type CdpTapSummary = {
@@ -461,25 +461,17 @@ const NET_SIMPLE_METHODS = new Set([
 
 const hash64 = (s: string) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 16)
 
-function scrubCdpIdent(raw: unknown, vault?: SecretVault, maxBytes = 64): { value?: string; vaultRedactions: number } {
-  if (typeof raw !== 'string' || !raw) return { vaultRedactions: 0 }
-  const s = scrubText(raw, vault)
-  if (s.vaultRedactions > 0 || s.text.includes('[REDACTED')) {
-    return { value: '[REDACTED]', vaultRedactions: s.vaultRedactions }
-  }
-  if (isSensitiveValue(s.text)) return { value: '[REDACTED]', vaultRedactions: 0 }
-  return { value: truncateUtf8HeadTail(s.text, maxBytes), vaultRedactions: 0 }
+function scrubCdpIdent(raw: unknown, maxBytes = 64): string | undefined {
+  if (typeof raw !== 'string' || !raw) return undefined
+  const s = scrubText(raw).text
+  if (s.includes('[REDACTED') || isSensitiveValue(s)) return '[REDACTED]'
+  return truncateUtf8HeadTail(s, maxBytes)
 }
 
-function scrubCdpSessionId(raw: unknown, vault?: SecretVault): { value?: string; vaultRedactions: number } {
-  if (typeof raw !== 'string' || !raw) return { vaultRedactions: 0 }
-  if (vault) {
-    const s = vault.scrub(raw)
-    if (s.count > 0) return { value: '[REDACTED:vault]', vaultRedactions: s.count }
-  }
-  // Standard Chromium target/session IDs are 32-char uppercase hex (or short test IDs); hash anything weird/long
-  if (/^[A-Fa-f0-9_-]{1,40}$/.test(raw) && !isSensitiveValue(raw)) return { value: raw, vaultRedactions: 0 }
-  return { value: `sid:${hash64(raw)}`, vaultRedactions: 0 }
+function scrubCdpSessionId(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || !raw) return undefined
+  if (/^[A-Fa-f0-9_-]{1,40}$/.test(raw) && !isSensitiveValue(raw)) return raw
+  return `sid:${hash64(raw)}`
 }
 
 function summarizeArg(
@@ -549,7 +541,6 @@ type CoalesceSlot = {
   ambiguous?: true
   live?: true
   summary?: Record<string, unknown>
-  vaultRedactions: number
   timer: NodeJS.Timeout
 }
 
@@ -664,10 +655,11 @@ export class CdpSessionTap {
     }
 
     capped.entry.n = ++this.cursor
-    this.entries.push(capped.entry)
+    const scrubbed = scrubDeep(capped.entry, this.opts.vault)
+    this.entries.push(scrubbed)
     this.bytes += capped.bytes
-    this.opts.onEvent?.(capped.entry)
-    return capped.entry
+    this.opts.onEvent?.(scrubbed)
+    return scrubbed
   }
 
   private flushSlot(key: string) {
@@ -687,7 +679,6 @@ export class CdpSessionTap {
       ...(slot.ambiguous && { ambiguous: true as const }),
       ...(slot.live && { live: true as const }),
       ...(slot.summary && { summary: slot.summary }),
-      ...(slot.vaultRedactions > 0 && { vaultRedactions: slot.vaultRedactions }),
     })
   }
 
@@ -698,7 +689,6 @@ export class CdpSessionTap {
     severity: 'high' | undefined,
     ambiguous: boolean,
     summary: Record<string, unknown> | undefined,
-    vaultRedactions: number,
     forceLive = false,
   ) {
     if (this.sealed) return
@@ -717,7 +707,6 @@ export class CdpSessionTap {
     if (existing) {
       existing.count++
       existing.lastT = now
-      existing.vaultRedactions += vaultRedactions
       return
     }
 
@@ -727,7 +716,7 @@ export class CdpSessionTap {
     }
 
     const timer = setTimeout(() => this.flushSlot(key), this.coalesceMs)
-    timer.unref?.()
+    timer.unref()
     this.slots.set(key, {
       key,
       conn,
@@ -740,7 +729,6 @@ export class CdpSessionTap {
       ambiguous: ambiguous ? true : undefined,
       live: live ? true : undefined,
       summary,
-      vaultRedactions,
       timer,
     })
     this.lastKeyByConnSession.set(csKey, key)
@@ -753,7 +741,7 @@ export class CdpSessionTap {
       parsed = JSON.parse(rawText)
     } catch {
       this.countMethod('_unparsed')
-      this.enqueue(conn, cdpSessionFallback, '_tap.unparsed', 'high', false, { bytes: Buffer.byteLength(rawText, 'utf8') }, 0, forceLive)
+      this.enqueue(conn, cdpSessionFallback, '_tap.unparsed', 'high', false, { bytes: Buffer.byteLength(rawText, 'utf8') }, forceLive)
       return
     }
     if (!parsed || typeof parsed !== 'object' || typeof parsed.method !== 'string') {
@@ -761,11 +749,8 @@ export class CdpSessionTap {
       return
     }
 
-    const vault = this.opts.vault
     const rawMethod: string = parsed.method
-    const sidScrub = scrubCdpSessionId(typeof parsed.sessionId === 'string' ? parsed.sessionId : cdpSessionFallback, vault)
-    const cdpSession = sidScrub.value
-    let vaultRedactions = sidScrub.vaultRedactions
+    const cdpSession = scrubCdpSessionId(typeof parsed.sessionId === 'string' ? parsed.sessionId : cdpSessionFallback)
 
     const params: Record<string, unknown> = parsed.params && typeof parsed.params === 'object' ? parsed.params : {}
     onParsed?.(rawMethod, params)
@@ -773,15 +758,12 @@ export class CdpSessionTap {
     const samples = this.opts.projection === 'semantic+samples'
 
     this.countMethod(rawMethod)
-    const methodIdent = scrubCdpIdent(rawMethod, vault, MAX_METHOD_NAME_BYTES)
-    vaultRedactions += methodIdent.vaultRedactions
-    const safeMethod = methodIdent.value ?? '_unknown'
+    const safeMethod = scrubCdpIdent(rawMethod, MAX_METHOD_NAME_BYTES) ?? '_unknown'
 
-    // Recursion for Target.sendMessageToTarget (max depth 2)
     if (rawMethod === 'Target.sendMessageToTarget' && typeof params.message === 'string') {
       if (depth >= 2) {
         this.depthLimited++
-        this.enqueue(conn, cdpSession, safeMethod, 'high', ambiguous, { depthLimited: true }, vaultRedactions, forceLive)
+        this.enqueue(conn, cdpSession, safeMethod, 'high', ambiguous, { depthLimited: true }, forceLive)
         return
       }
       const innerSession = typeof params.sessionId === 'string' ? params.sessionId : cdpSession
@@ -793,17 +775,8 @@ export class CdpSessionTap {
     let summary: Record<string, unknown> | undefined
     let capture = false
 
-    const scrubUrlField = (u: string): string => {
-      const res = sanitizeUrl(u, { projection: this.opts.projection, vault })
-      vaultRedactions += res.vaultRedactions
-      return res.url
-    }
-
-    const scrubSampleExpr = (expr: string): string => {
-      const s = scrubText(expr, vault)
-      vaultRedactions += s.vaultRedactions
-      return truncateUtf8HeadTail(s.text, MAX_SAMPLE_EXPR_BYTES, 768, 252)
-    }
+    const scrubSampleExpr = (expr: string): string =>
+      truncateUtf8HeadTail(scrubText(expr).text, MAX_SAMPLE_EXPR_BYTES, 768, 252)
 
     if (rawMethod === 'Runtime.callFunctionOn') {
       capture = true
@@ -836,14 +809,8 @@ export class CdpSessionTap {
     } else if (HIGH_SEVERITY_METHODS.has(rawMethod)) {
       capture = true
       severity = 'high'
-      if (rawMethod === 'DOM.setAttributeValue') {
-        const n = scrubCdpIdent(params.name, vault, 128)
-        vaultRedactions += n.vaultRedactions
-        summary = { name: n.value ?? '' }
-      } else if (rawMethod === 'Runtime.addBinding') {
-        const n = scrubCdpIdent(params.name, vault, 128)
-        vaultRedactions += n.vaultRedactions
-        summary = { name: n.value ?? '' }
+      if (rawMethod === 'DOM.setAttributeValue' || rawMethod === 'Runtime.addBinding') {
+        summary = { name: scrubCdpIdent(params.name, 128) ?? '' }
       } else if (rawMethod === 'Runtime.compileScript' || rawMethod === 'Debugger.evaluateOnCallFrame' || rawMethod === 'Debugger.setScriptSource') {
         const expr = typeof params.expression === 'string' ? params.expression : typeof params.scriptSource === 'string' ? params.scriptSource : ''
         summary = { exprLen: Buffer.byteLength(expr, 'utf8'), exprHash64: hash64(expr) }
@@ -857,124 +824,33 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Page.navigate' || rawMethod === 'Target.createTarget') {
       capture = true
       const rawUrl = typeof params.url === 'string' ? params.url : ''
-      const stripControls = (s: string) => s.replace(/[\u0000-\u001f]+/g, '')
-      const extractCanonicalAuthority = (rawTarget: string, parsedHost: string): { canonical: boolean; rawAuthority: string } => {
-        const m = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]+)(?:[/?#]|$)/i.exec(rawTarget)
-        if (!m) return { canonical: false, rawAuthority: '' }
-        const auth = m[1]
-        const at = auth.lastIndexOf('@')
-        const hostPort = at >= 0 ? auth.slice(at + 1) : auth
-        const rawHost = hostPort.startsWith('[')
-          ? hostPort.slice(0, hostPort.indexOf(']') + 1)
-          : hostPort.split(':')[0]
-        return {
-          canonical: rawHost.length > 0 && rawHost.toLowerCase() === parsedHost.toLowerCase(),
-          rawAuthority: auth,
-        }
-      }
-
-      // Linear O(N) C0/space trim + WHATWG C0/tab/newline strip (exact original case preserved!)
-      let uStart = 0
-      let uEnd = rawUrl.length
-      while (uStart < uEnd && rawUrl.charCodeAt(uStart) <= 0x20) uStart++
-      while (uEnd > uStart && rawUrl.charCodeAt(uEnd - 1) <= 0x20) uEnd--
-      const trimmedUrl = rawUrl.slice(uStart, uEnd)
-      const strippedUrl = stripControls(trimmedUrl)
-
-      // Unified pre-lowercasing vault check on complete rawUrl + distinct hits revealed by control stripping
-      const rawScrub = vault ? vault.scrub(rawUrl) : { text: rawUrl, count: 0 }
-      const strippedAfterRaw = vault ? vault.scrub(stripControls(rawScrub.text)) : { text: strippedUrl, count: 0 }
-      const strippedOnlyCount = vault && strippedUrl !== rawUrl ? vault.scrub(strippedUrl).count : 0
-      const preHitCount = Math.max(rawScrub.count + strippedAfterRaw.count, strippedOnlyCount)
-
+      const strippedUrl = rawUrl.trim().replace(/[\u0000-\u001f]+/g, '')
+      const vault = this.opts.vault
+      const rawHit = Boolean(vault && (vault.scrub(rawUrl).count > 0 || (strippedUrl !== rawUrl && vault.scrub(strippedUrl).count > 0)))
       let navUrl: string
       let extra: Record<string, unknown> = {}
 
       if (/^https?:/i.test(strippedUrl)) {
-        const scheme = /^https:/i.test(strippedUrl) ? 'https:' : 'http:'
         const parsed = URL.parse(strippedUrl)
-        const san = sanitizeUrl(strippedUrl, { projection: this.opts.projection, vault })
-        const parsedHost = parsed?.hostname ?? ''
-        const canonStripped = parsed ? extractCanonicalAuthority(strippedUrl, parsedHost) : { canonical: false, rawAuthority: '' }
-        const canonTrimmed = parsed ? extractCanonicalAuthority(trimmedUrl, parsedHost) : { canonical: false, rawAuthority: '' }
-        const canonicalHostMatch = canonStripped.canonical && canonTrimmed.canonical
-        const hostVaultHit = Boolean(
-          vault && (
-            (parsedHost && vault.scrub(parsedHost).count > 0) ||
-            (canonStripped.rawAuthority && vault.scrub(canonStripped.rawAuthority).count > 0) ||
-            (canonTrimmed.rawAuthority && vault.scrub(canonTrimmed.rawAuthority).count > 0)
-          ),
-        )
-        if (hostVaultHit || !canonicalHostMatch || (preHitCount > 0 && san.vaultRedactions < preHitCount)) {
-          navUrl = `${scheme}//[REDACTED]`
-          vaultRedactions += Math.max(san.vaultRedactions, preHitCount, hostVaultHit ? 1 : 0)
-        } else {
-          navUrl = san.url
-          vaultRedactions += san.vaultRedactions
-        }
+        navUrl = parsed ? sanitizeUrl(parsed, { projection: this.opts.projection }).url : `${/^https:/i.test(strippedUrl) ? 'https:' : 'http:'}//[REDACTED]`
+      } else if (/^data:/i.test(strippedUrl)) {
+        severity = 'high'
+        const comma = strippedUrl.indexOf(',')
+        const rawMeta = (comma >= 0 ? strippedUrl.slice(5, comma) : strippedUrl.slice(5)).split(';')[0].trim()
+        const safeMime = !rawHit && /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(rawMeta) ? rawMeta.toLowerCase() : '[REDACTED]'
+        navUrl = `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}`
+      } else if (/^(?:javascript|vbscript):/i.test(strippedUrl)) {
+        severity = 'high'
+        const scheme = /^vbscript:/i.test(strippedUrl) ? 'vbscript' : 'javascript'
+        navUrl = `${scheme}:[REDACTED]`
+        extra = { exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
+      } else if (/^about:(?:blank|srcdoc)$/i.test(strippedUrl)) {
+        navUrl = rawHit ? 'about:[REDACTED]' : strippedUrl.toLowerCase()
       } else {
-        if (preHitCount > 0) vaultRedactions += preHitCount
-
-        if (/^(?:javascript|vbscript):/i.test(strippedUrl)) {
-          severity = 'high'
-          const scheme = /^vbscript:/i.test(strippedUrl) ? 'vbscript' : 'javascript'
-          navUrl = `${scheme}:[REDACTED]`
-          extra = { exprLen: Buffer.byteLength(rawUrl, 'utf8'), exprHash64: hash64(rawUrl) }
-        } else if (/^about:(?:blank|srcdoc)$/i.test(strippedUrl)) {
-          navUrl = preHitCount > 0 ? 'about:[REDACTED]' : strippedUrl.toLowerCase()
-        } else if (/^data:/i.test(strippedUrl)) {
-          severity = 'high'
-          if (preHitCount > 0) {
-            navUrl = `data:[REDACTED];len=${Buffer.byteLength(rawUrl, 'utf8')}`
-          } else {
-            const comma = strippedUrl.indexOf(',')
-            const rawMeta = (comma >= 0 ? strippedUrl.slice(5, comma) : strippedUrl.slice(5)).split(';')[0].trim()
-            const safeMime = /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(rawMeta) ? rawMeta.toLowerCase() : 'unknown'
-            navUrl = `data:${safeMime};len=${Buffer.byteLength(rawUrl, 'utf8')}`
-          }
-        } else if (/^blob:/i.test(strippedUrl)) {
-          if (preHitCount > 0) {
-            navUrl = 'blob:[REDACTED]'
-          } else {
-            const rawInner = strippedUrl.slice(5)
-            const inner = URL.parse(rawInner)
-            if (!inner) {
-              navUrl = 'blob:[REDACTED]'
-            } else if (inner.origin === 'null') {
-              navUrl = 'blob:null'
-            } else {
-              const originScrub = vault ? vault.scrub(inner.origin) : { count: 0, text: inner.origin }
-              if (originScrub.count > 0) {
-                vaultRedactions += originScrub.count
-                navUrl = 'blob:[REDACTED]'
-              } else {
-                const canon = extractCanonicalAuthority(rawInner, inner.hostname)
-                navUrl = canon.canonical ? `blob:${inner.origin}` : 'blob:[REDACTED]'
-              }
-            }
-          }
-        } else {
-          const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(strippedUrl)
-          const rawScheme = schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown'
-          const SAFE_KNOWN_SCHEMES = new Set(['file', 'mailto', 'tel', 'ftp', 'ws', 'wss', 'chrome', 'edge', 'about'])
-          if (preHitCount > 0) {
-            navUrl = SAFE_KNOWN_SCHEMES.has(rawScheme) ? `${rawScheme}:[REDACTED]` : '[REDACTED]'
-          } else {
-            navUrl = `${rawScheme}:[REDACTED]`
-          }
-          extra = { len: Buffer.byteLength(rawUrl, 'utf8') }
-        }
-      }
-      // Unconditional single exit gate: NO emitted summary can ever contain a vault value after normalization/lowercasing!
-      if (vault) {
-        const finalCheck = vault.scrub(navUrl)
-        if (finalCheck.count > 0) {
-          vaultRedactions += finalCheck.count
-          const candidate = navUrl.endsWith(':[REDACTED]') || navUrl.endsWith('//[REDACTED]')
-            ? '[REDACTED]'
-            : finalCheck.text
-          navUrl = vault.scrub(candidate).count > 0 ? '' : candidate
-        }
+        const schemeMatch = /^([a-z][a-z0-9+.-]{0,15}):/i.exec(strippedUrl)
+        const rawScheme = schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown'
+        navUrl = rawHit ? '[REDACTED]' : `${rawScheme}:[REDACTED]`
+        extra = { len: Buffer.byteLength(rawUrl, 'utf8') }
       }
       summary = { url: navUrl, ...extra }
     } else if (NAV_SIMPLE_METHODS.has(rawMethod)) {
@@ -983,11 +859,7 @@ export class CdpSessionTap {
     } else if (rawMethod === 'DOM.setFileInputFiles') {
       capture = true
       const files = Array.isArray(params.files)
-        ? params.files.filter((f): f is string => typeof f === 'string').slice(0, 32).map(f => {
-            const s = scrubText(f, vault)
-            vaultRedactions += s.vaultRedactions
-            return truncateUtf8HeadTail(s.text, 256)
-          })
+        ? params.files.filter((f): f is string => typeof f === 'string').slice(0, 32).map(f => truncateUtf8HeadTail(scrubText(f).text, 256))
         : []
       summary = { files }
       this.opts.onFileUpload?.()
@@ -1017,43 +889,31 @@ export class CdpSessionTap {
     } else if (rawMethod === 'Network.setExtraHTTPHeaders') {
       capture = true
       const hdrs = params.headers && typeof params.headers === 'object'
-        ? Object.keys(params.headers as Record<string, unknown>).slice(0, 64).map(k => {
-            const sk = scrubStructuralKey(k, vault)
-            vaultRedactions += sk.vaultRedactions
-            return truncateUtf8HeadTail(sk.key, 64)
-          })
+        ? Object.keys(params.headers as Record<string, unknown>).slice(0, 64).map(k => truncateUtf8HeadTail(scrubStructuralKey(k).key, 64))
         : []
       summary = { headerNames: hdrs }
     } else if (rawMethod === 'Network.setCookie') {
       capture = true
-      const cn = scrubCdpIdent(params.name, vault, 64)
-      const cd = scrubCdpIdent(params.domain, vault, 128)
-      vaultRedactions += cn.vaultRedactions + cd.vaultRedactions
-      summary = { name: cn.value, domain: cd.value }
+      summary = { name: scrubCdpIdent(params.name, 64), domain: scrubCdpIdent(params.domain, 128) }
     } else if (rawMethod === 'Storage.setCookies') {
       capture = true
       const cookies = Array.isArray(params.cookies)
-        ? params.cookies.slice(0, 32).map(c => {
-            const cn = scrubCdpIdent((c as any)?.name, vault, 64)
-            const cd = scrubCdpIdent((c as any)?.domain, vault, 128)
-            vaultRedactions += cn.vaultRedactions + cd.vaultRedactions
-            return { name: cn.value, domain: cd.value }
-          })
+        ? params.cookies.slice(0, 32).map(c => ({
+            name: scrubCdpIdent((c as any)?.name, 64),
+            domain: scrubCdpIdent((c as any)?.domain, 128),
+          }))
         : []
       summary = { cookies }
     } else if (rawMethod === 'DOMStorage.setDOMStorageItem') {
       capture = true
-      const key = typeof params.key === 'string' ? scrubStructuralKey(params.key, vault) : { key: '', vaultRedactions: 0 }
-      vaultRedactions += key.vaultRedactions
-      summary = { key: truncateUtf8HeadTail(key.key, 64) }
+      const key = typeof params.key === 'string' ? scrubStructuralKey(params.key).key : ''
+      summary = { key: truncateUtf8HeadTail(key, 64) }
     } else if (rawMethod === 'Storage.setStorageItems') {
       capture = true
       const items = Array.isArray(params.items)
         ? params.items.slice(0, 32).map(it => {
             const rawK = typeof (it as any)?.key === 'string' ? (it as any).key : ''
-            const sk = scrubStructuralKey(rawK, vault)
-            vaultRedactions += sk.vaultRedactions
-            return truncateUtf8HeadTail(sk.key, 64)
+            return truncateUtf8HeadTail(scrubStructuralKey(rawK).key, 64)
           })
         : []
       summary = { keys: items }
@@ -1063,7 +923,7 @@ export class CdpSessionTap {
     }
 
     if (capture || ambiguous) {
-      this.enqueue(conn, cdpSession, safeMethod, severity, ambiguous, summary, vaultRedactions, forceLive)
+      this.enqueue(conn, cdpSession, safeMethod, severity, ambiguous, summary, forceLive)
     }
   }
 
@@ -1092,20 +952,17 @@ export class CdpSessionTap {
           const sessionMatch = /"sessionId"\s*:\s*"([^"]{1,128})"/.exec(headText)
           const rawInner = methodMatch?.[1]
           let safeInner: string | undefined
-          let vaultRedactions = 0
           if (rawInner) {
             this.countMethod(rawInner)
-            const si = scrubCdpIdent(rawInner, this.opts.vault, MAX_METHOD_NAME_BYTES)
-            vaultRedactions += si.vaultRedactions
-            safeInner = si.value && SAFE_CDP_IDENT_RE.test(si.value) && !isDataLikeKey(si.value) ? si.value : '_unknown'
+            const si = scrubCdpIdent(rawInner, MAX_METHOD_NAME_BYTES)
+            safeInner = si && SAFE_CDP_IDENT_RE.test(si) && !isDataLikeKey(si) ? si : '_unknown'
           }
-          const sid = scrubCdpSessionId(sessionMatch?.[1], this.opts.vault)
-          vaultRedactions += sid.vaultRedactions
+          const sid = scrubCdpSessionId(sessionMatch?.[1])
           const live = forceLive || this.opts.isLive()
           this.appendRecord({
             t: new Date().toISOString(),
             conn,
-            ...(sid.value && { cdpSession: sid.value }),
+            ...(sid && { cdpSession: sid }),
             method: '_tap.oversized',
             severity: 'high',
             ...(live && { live: true as const }),
@@ -1115,7 +972,6 @@ export class CdpSessionTap {
               ...(safeInner && { innerMethod: safeInner }),
               sha256: msg.sha256.slice(0, 16),
             },
-            ...(vaultRedactions > 0 && { vaultRedactions }),
           })
           return
         }
@@ -1177,7 +1033,7 @@ export class CdpSessionTap {
     }
     if (this.bytes + size <= this.maxBytes || this.entries.length === 0) {
       summary.n = ++this.cursor
-      this.entries.push(summary)
+      this.entries.push(scrubDeep(summary, this.opts.vault))
       this.bytes += size
     }
     this.sealed = true

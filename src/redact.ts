@@ -160,24 +160,11 @@ export class SecretVault {
   private trustedDriveBytes = 0
   private lru = new Map<string, number>()
   private lruBytes = 0
-  private defaultDriveBuf: DriveInputBuffer
   private dirty = false
   private regex: RegExp | null = null
 
-  constructor() {
-    this.defaultDriveBuf = new DriveInputBuffer(this)
-  }
-
   get empty(): boolean {
     return this.trustedHeaders.size === 0 && this.trustedDrive.size === 0 && this.lru.size === 0
-  }
-
-  get trustedSize(): number {
-    return this.trustedHeaders.size + this.trustedDrive.size
-  }
-
-  get lruSize(): number {
-    return this.lru.size
   }
 
   addTrustedHeader(value: string): boolean {
@@ -320,20 +307,14 @@ export class SecretVault {
     return new DriveInputBuffer(this)
   }
 
-  onDriveEvent(method: string, params?: Record<string, unknown>): void {
-    this.defaultDriveBuf.onEvent(method, params)
-  }
-
-  flushDriveBuffer(): void {
-    this.defaultDriveBuf.flush()
-  }
-
   private compile(): RegExp | null {
     if (!this.dirty) return this.regex
     this.dirty = false
     const variants = new Set<string>()
     const addVariants = (secret: string) => {
       variants.add(secret)
+      const lower = secret.length >= 8 ? secret.toLowerCase() : secret
+      if (lower !== secret) variants.add(lower)
       try {
         const enc = encodeURIComponent(secret)
         if (enc !== secret) variants.add(enc)
@@ -377,10 +358,28 @@ export class SecretVault {
     this.trustedDriveBytes = 0
     this.lru.clear()
     this.lruBytes = 0
-    this.defaultDriveBuf.clear()
     this.dirty = false
     this.regex = null
   }
+}
+
+export function scrubDeep<T>(value: T, vault?: SecretVault): T {
+  if (!vault || vault.empty || value == null) return value
+  const walk = (v: unknown, depth: number): unknown => {
+    if (depth > 16 || v == null) return v
+    if (typeof v === 'string') return vault.scrub(v).text
+    if (Array.isArray(v)) return v.map(el => walk(el, depth + 1))
+    if (typeof v === 'object') {
+      const out: Record<string, unknown> = {}
+      for (const [k, child] of Object.entries(v as Record<string, unknown>)) {
+        const sk = vault.scrub(k)
+        out[sk.count > 0 ? '[REDACTED:vault]' : k] = walk(child, depth + 1)
+      }
+      return out
+    }
+    return v
+  }
+  return walk(value, 0) as T
 }
 
 export function normalizePathForAuth(rawPath: string): string {
@@ -978,33 +977,9 @@ export function redactFormBody(raw: string, vault?: SecretVault): { text: string
   return { text: parts.join('&'), vaultRedactions }
 }
 
-export function redactPlainText(raw: string, vault?: SecretVault): { text: string; vaultRedactions: number } {
-  return scrubText(raw, vault)
-}
-
 const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff
 const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff
 
-export function truncateHeadTail(str: string, maxLen = 2048, headLen = 1536, tailLen = 512): string {
-  if (str.length <= maxLen) return str
-  let h = Math.min(headLen, maxLen - 1)
-  let t = Math.min(tailLen, maxLen - h - 1)
-  if (t < 0) t = 0
-  let headEnd = h
-  while (headEnd > 0 && isHighSurrogate(str.charCodeAt(headEnd - 1))) headEnd--
-  if (headEnd >= 1 && str[headEnd - 1] === '%') headEnd -= 1
-  else if (headEnd >= 2 && str[headEnd - 2] === '%' && /[0-9a-fA-F]/.test(str[headEnd - 1])) headEnd -= 2
-
-  let tailStart = str.length - t
-  while (tailStart < str.length && isLowSurrogate(str.charCodeAt(tailStart))) tailStart++
-  if (tailStart >= 1 && str[tailStart - 1] === '%') tailStart = Math.min(str.length, tailStart + 2)
-  else if (tailStart >= 2 && str[tailStart - 2] === '%' && /[0-9a-fA-F]/.test(str[tailStart - 1])) tailStart = Math.min(str.length, tailStart + 1)
-
-  if (tailStart <= headEnd) return str.slice(0, maxLen)
-  return `${str.slice(0, headEnd)}…${str.slice(tailStart)}`
-}
-
-// Strict UTF-8 byte-bounded head+tail truncation without splitting UTF-16 surrogates or %XX.
 export function truncateUtf8HeadTail(str: string, maxBytes: number, headBytes?: number, tailBytes?: number): string {
   if (maxBytes <= 0) return ''
   if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str

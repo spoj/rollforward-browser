@@ -816,7 +816,6 @@ export type ExtractOutput = {
   reqBody?: string
   reqTrunc?: true
   reqOmitted?: BodyOmittedReason
-  vaultRedactions: number
 }
 
 const E1_ENDPOINTS = new Set(['formservice', 'appstack', 'dataservice', 'orchestrator', 'file', 'tokenrequest', 'discover', 'defaultconfig'])
@@ -824,33 +823,21 @@ const STRUCT_IDENT_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,47}$/
 const E1_CONTROL_ID_RE = /^[A-Za-z0-9_.-]{1,32}$/
 const GQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,47}$/
 
-function validateStructuralIdent(
-  val: unknown,
-  pattern: RegExp,
-  vault?: SecretVault,
-  allowNumeric = false,
-): { value?: string; vaultRedactions: number } {
-  if (typeof val !== 'string' || !val) return { vaultRedactions: 0 }
-  if (vault) {
-    const sv = vault.scrub(val)
-    if (sv.count > 0) return { vaultRedactions: sv.count }
-  }
-  if (!pattern.test(val)) return { vaultRedactions: 0 }
-  if (isSensitiveValue(val)) return { vaultRedactions: 0 }
-  if (!allowNumeric && isDataLikeKey(val)) return { vaultRedactions: 0 }
-  return { value: val, vaultRedactions: 0 }
+function validateStructuralIdent(val: unknown, pattern: RegExp, allowNumeric = false): string | undefined {
+  if (typeof val !== 'string' || !val) return undefined
+  if (!pattern.test(val) || isSensitiveValue(val)) return undefined
+  if (!allowNumeric && isDataLikeKey(val)) return undefined
+  return val
 }
 
 export function extractSemantic(input: ExtractInput): ExtractOutput {
   const reasons: string[] = [...(input.transportReasons ?? [])]
-  let vaultRedactions = 0
 
   if (input.kind === 'upgrade') {
     return {
       actions: [{ family: 'upgrade', op: 'upgrade:websocket', resource: input.sanitizedPath, coverage: 'complete' }],
       completeness: { transport: 'not-read', decode: 'none', extract: 'complete', ...(reasons.length && { reasons }) },
       decodeComplete: true,
-      vaultRedactions: 0,
     }
   }
 
@@ -873,7 +860,6 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         completeness: { transport: input.transport, decode: decodeRes.budgetExceeded ? 'truncated' : 'error', extract: 'none', ...(reasons.length && { reasons }) },
         decodeComplete: false,
         reqOmitted: input.isLive ? 'live' : input.isAuth ? 'auth-url' : decodeRes.budgetExceeded ? 'budget' : 'decompress-err',
-        vaultRedactions,
       }
     }
 
@@ -918,13 +904,9 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
     let bodyShape: Record<string, string> | undefined
     if (!input.isLive && hasBody && !isBinary) {
       if (isJson && parsedJson !== null && typeof parsedJson === 'object') {
-        const bs = buildBodyShape(parsedJson, input.vault)
-        bodyShape = bs.shape
-        vaultRedactions += bs.vaultRedactions
+        bodyShape = buildBodyShape(parsedJson).shape
       } else if (decodedText !== undefined && input.reqType === 'application/x-www-form-urlencoded') {
-        const bs = buildFormBodyShape(decodedText, input.vault)
-        bodyShape = bs.shape
-        vaultRedactions += bs.vaultRedactions
+        bodyShape = buildFormBodyShape(decodedText).shape
       }
     }
 
@@ -959,26 +941,21 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
             ? obj.targetName
             : undefined
 
-      const formIdent = validateStructuralIdent(rawFormName, STRUCT_IDENT_RE, input.vault)
-      vaultRedactions += formIdent.vaultRedactions
-      if (formIdent.value) details.formName = formIdent.value
+      const formIdent = validateStructuralIdent(rawFormName, STRUCT_IDENT_RE)
+      if (formIdent) details.formName = formIdent
 
-      const verIdent = validateStructuralIdent(obj?.version, STRUCT_IDENT_RE, input.vault)
-      vaultRedactions += verIdent.vaultRedactions
-      if (verIdent.value) details.version = verIdent.value
+      const verIdent = validateStructuralIdent(obj?.version, STRUCT_IDENT_RE)
+      if (verIdent) details.version = verIdent
 
       const rawAction = typeof obj?.action === 'string' ? obj.action : typeof obj?.formServiceAction === 'string' ? obj.formServiceAction : undefined
-      const actIdent = validateStructuralIdent(rawAction, /^[A-Za-z][A-Za-z0-9_-]{0,23}$/, input.vault)
-      vaultRedactions += actIdent.vaultRedactions
-      if (actIdent.value) details.action = actIdent.value
+      const actIdent = validateStructuralIdent(rawAction, /^[A-Za-z][A-Za-z0-9_-]{0,23}$/)
+      if (actIdent) details.action = actIdent
 
-      const targetTypeIdent = validateStructuralIdent(obj?.targetType, STRUCT_IDENT_RE, input.vault)
-      vaultRedactions += targetTypeIdent.vaultRedactions
-      if (targetTypeIdent.value) details.targetType = targetTypeIdent.value
+      const targetTypeIdent = validateStructuralIdent(obj?.targetType, STRUCT_IDENT_RE)
+      if (targetTypeIdent) details.targetType = targetTypeIdent
 
-      const dsTypeIdent = validateStructuralIdent(obj?.dataServiceType, STRUCT_IDENT_RE, input.vault)
-      vaultRedactions += dsTypeIdent.vaultRedactions
-      if (dsTypeIdent.value) details.dataServiceType = dsTypeIdent.value
+      const dsTypeIdent = validateStructuralIdent(obj?.dataServiceType, STRUCT_IDENT_RE)
+      if (dsTypeIdent) details.dataServiceType = dsTypeIdent
 
       const rawActions = Array.isArray(obj?.formActions)
         ? obj.formActions
@@ -992,20 +969,18 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
           if (!a || typeof a !== 'object') return { command: 'unknown' }
           const rec = a as Record<string, unknown>
           const item: Record<string, string> = {}
-          const cmd = validateStructuralIdent(rec.command, STRUCT_IDENT_RE, input.vault)
-          vaultRedactions += cmd.vaultRedactions
-          if (cmd.value) item.command = cmd.value
-          const cid = validateStructuralIdent(rec.controlID, E1_CONTROL_ID_RE, input.vault, true)
-          vaultRedactions += cid.vaultRedactions
-          if (cid.value) item.controlID = cid.value
+          const cmd = validateStructuralIdent(rec.command, STRUCT_IDENT_RE)
+          if (cmd) item.command = cmd
+          const cid = validateStructuralIdent(rec.controlID, E1_CONTROL_ID_RE, true)
+          if (cid) item.controlID = cid
           return item
         })
         details.formActions = summarized
         if (rawActions.length > 32) details.formActionsTruncated = true
       }
 
-      const op = actIdent.value ? `${endpoint}:${actIdent.value}` : `${endpoint}:${input.effectiveMethod}`
-      const resource = formIdent.value ?? input.sanitizedPath
+      const op = actIdent ? `${endpoint}:${actIdent}` : `${endpoint}:${input.effectiveMethod}`
+      const resource = formIdent ?? input.sanitizedPath
       actions.push({
         family: 'e1-ais',
         op,
@@ -1040,9 +1015,8 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         }
         if (input.hdr?.['x-http-method']) details.override = input.hdr['x-http-method']
         const rawMetaType = (obj?.__metadata as any)?.type ?? obj?.['@odata.type']
-        const metaIdent = validateStructuralIdent(rawMetaType, /^[#A-Za-z][A-Za-z0-9_.-]{0,63}$/, input.vault)
-        vaultRedactions += metaIdent.vaultRedactions
-        if (metaIdent.value) details.metadataType = metaIdent.value
+        const metaIdent = validateStructuralIdent(rawMetaType, /^[#A-Za-z][A-Za-z0-9_.-]{0,63}$/)
+        if (metaIdent) details.metadataType = metaIdent
 
         actions.push({
           family: 'sharepoint',
@@ -1055,7 +1029,7 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       }
     }
 
-    // 3. GraphQL (classify ALL items in bounded <=64KiB batch; cap emitted actions at 16!)
+    // 3. GraphQL
     else if (
       lowerPath.includes('/graphql') ||
       (obj && (typeof obj.query === 'string' || (obj.extensions && typeof obj.extensions === 'object' && 'persistedQuery' in (obj.extensions as Record<string, unknown>)))) ||
@@ -1072,16 +1046,11 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         const opNameRaw = typeof rec.operationName === 'string' ? rec.operationName : undefined
         const hasPersisted = Boolean(rec.extensions && typeof rec.extensions === 'object' && 'persistedQuery' in (rec.extensions as Record<string, unknown>))
 
-        const safeOpName = validateStructuralIdent(opNameRaw, GQL_IDENT_RE, input.vault)
-        vaultRedactions += safeOpName.vaultRedactions
+        const safeOpName = validateStructuralIdent(opNameRaw, GQL_IDENT_RE)
 
         let varKeys: string[] | undefined
         if (idx < 16 && rec.variables && typeof rec.variables === 'object' && !Array.isArray(rec.variables)) {
-          varKeys = Object.keys(rec.variables as Record<string, unknown>).slice(0, 32).map(k => {
-            const sk = scrubStructuralKey(k, input.vault)
-            vaultRedactions += sk.vaultRedactions
-            return sk.key
-          })
+          varKeys = Object.keys(rec.variables as Record<string, unknown>).slice(0, 32).map(k => scrubStructuralKey(k).key)
         }
 
         if (!qStr && hasPersisted) {
@@ -1090,7 +1059,7 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
             actions.push({
               family: 'graphql',
               op: 'graphql:persisted',
-              resource: safeOpName.value ?? input.sanitizedPath,
+              resource: safeOpName ?? input.sanitizedPath,
               details: { ...(varKeys && { variableKeys: varKeys }) },
               coverage: 'persisted-query-unknown',
             })
@@ -1102,13 +1071,8 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
           const itemOp: GraphqlOp = dupKeys ? 'mixed' : res.op
           opsSeen.push(itemOp)
           if (idx < 16) {
-            const safeNames = res.opNames.slice(0, 16).map(n => {
-              if (n === '<anonymous>') return n
-              const v = validateStructuralIdent(n, GQL_IDENT_RE, input.vault)
-              vaultRedactions += v.vaultRedactions
-              return v.value ?? '<redacted>'
-            })
-            const resource = safeOpName.value ?? (safeNames.length === 1 && safeNames[0] !== '<anonymous>' && safeNames[0] !== '<redacted>' ? safeNames[0] : input.sanitizedPath)
+            const safeNames = res.opNames.slice(0, 16).map(n => n === '<anonymous>' ? n : (validateStructuralIdent(n, GQL_IDENT_RE) ?? '<redacted>'))
+            const resource = safeOpName ?? (safeNames.length === 1 && safeNames[0] !== '<anonymous>' && safeNames[0] !== '<redacted>' ? safeNames[0] : input.sanitizedPath)
             actions.push({
               family: 'graphql',
               op: `graphql:${itemOp}`,
@@ -1166,13 +1130,10 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       const bodyRootRaw = decodedText ? extractSoapBodyRoot(decodedText) : undefined
       let soapAction: string | undefined
       if (claimedRaw) {
-        const s = scrubText(truncateUtf8HeadTail(claimedRaw, 128), input.vault)
-        vaultRedactions += s.vaultRedactions
-        if (!isSensitiveValue(s.text)) soapAction = s.text
+        const s = scrubText(truncateUtf8HeadTail(claimedRaw, 128)).text
+        if (!isSensitiveValue(s)) soapAction = s
       }
-      const rootIdent = validateStructuralIdent(bodyRootRaw, /^[A-Za-z_][\w.-]{0,47}(?::[A-Za-z_][\w.-]{0,47})?$/, input.vault)
-      vaultRedactions += rootIdent.vaultRedactions
-      const bodyRoot = rootIdent.value
+      const bodyRoot = validateStructuralIdent(bodyRootRaw, /^[A-Za-z_][\w.-]{0,47}(?::[A-Za-z_][\w.-]{0,47})?$/)
       const rootLocal = bodyRoot?.includes(':') ? bodyRoot.split(':')[1] : bodyRoot
       const actionMismatch = Boolean(soapAction && rootLocal && !soapAction.toLowerCase().includes(rootLocal.toLowerCase()))
       actions.push({
@@ -1215,7 +1176,6 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       } else if (input.projection === 'semantic') {
         reqOmitted = 'policy-profile'
       } else if (structuredJsonParseFailed) {
-        // Never fall back to plaintext on truncated/malformed JSON where sensitive-key inheritance would be lost!
         reqOmitted = 'policy-profile'
         reqTrunc = true
       } else if (input.sampleBudgetOk === false) {
@@ -1233,24 +1193,18 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
 
         let redactedText: string | undefined
         if (isJson) {
-          const rj = redactJsonValue(parsedJson, input.vault, false)
-          vaultRedactions += rj.vaultRedactions
-          redactedText = JSON.stringify(rj.value)
+          redactedText = JSON.stringify(redactJsonValue(parsedJson, input.vault, false).value)
         } else if (isForm) {
-          const rf = redactFormBody(decodedText, input.vault)
-          vaultRedactions += rf.vaultRedactions
-          redactedText = rf.text
+          redactedText = redactFormBody(decodedText, input.vault).text
         } else if (isXml) {
           const rx = redactXmlBody(decodedText, input.vault)
           if (rx.ok) {
-            vaultRedactions += rx.vaultRedactions
             redactedText = rx.text
           } else {
             reqOmitted = 'policy-profile'
             reasons.push('malformed-xml')
           }
         } else {
-          // Omit unstructured plain text where key-based redaction cannot protect passwords
           reqOmitted = 'policy-profile'
           reasons.push('unstructured-text')
         }
@@ -1284,7 +1238,6 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
       ...(reqBody !== undefined && { reqBody }),
       ...(reqTrunc && { reqTrunc }),
       ...(reqOmitted && { reqOmitted }),
-      vaultRedactions,
     }
   } catch {
     return {
@@ -1298,7 +1251,6 @@ export function extractSemantic(input: ExtractInput): ExtractOutput {
         reasons: [...reasons, 'extractor-error'],
       },
       decodeComplete: false,
-      vaultRedactions,
     }
   }
 }
