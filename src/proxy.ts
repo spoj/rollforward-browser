@@ -55,7 +55,6 @@ export type SafeRequestProjection = {
   methodSource: 'wire' | 'x-http-method' | 'x-http-method-override' | 'x-method-override'
   isWrite: boolean
   hdr?: Record<string, string>
-  hdrConflict?: true
   dest?: string
   from?: string
   reqType?: string
@@ -252,86 +251,37 @@ const plain = (socket: net.Socket) => {
   return d
 }
 
-type SemanticMethodInfo = {
-  wireMethod: string
-  effectiveMethod: string
-  methodSource: SafeRequestProjection['methodSource']
-  hdr?: Record<string, string>
-  hdrConflict: boolean
-  invalidOrConflictingOverride: boolean
-  vaultRedactions: number
-}
-
-function parseSemanticMethods(
-  method: string | undefined,
-  headers: Record<string, string | string[] | undefined>,
-  vault?: SecretVault,
-): SemanticMethodInfo {
+function classifyMethod(method: string | undefined, headers: Record<string, string | string[] | undefined>) {
   const wireMethod = (method ?? 'GET').toUpperCase()
   const hdr: Record<string, string> = {}
-  let vaultRedactions = 0
-  let invalid = false
-  const validTokens: Array<{ header: typeof OVERRIDE_HEADERS[number]; verb: string }> = []
-
+  let ovHdr: typeof OVERRIDE_HEADERS[number] | undefined
+  let ovVal: string | undefined
   for (const name of OVERRIDE_HEADERS) {
-    const rawVal = headers[name]
-    if (rawVal === undefined) continue
-    const joined = Array.isArray(rawVal) ? rawVal.join(',') : rawVal
-    const scrubbed = scrubText(truncateUtf8HeadTail(joined, 256), vault)
-    vaultRedactions += scrubbed.vaultRedactions
-    hdr[name] = scrubbed.text
-
-    // Validate EVERY comma-separated member without silently dropping empty ones!
-    const parts = joined.split(',').map(p => p.trim().toUpperCase())
-    if (!parts.length) {
-      invalid = true
-      continue
-    }
-    for (const p of parts) {
-      if (!p || !VALID_VERB_RE.test(p)) invalid = true
-      else validTokens.push({ header: name, verb: p })
+    const raw = headers[name]
+    if (raw === undefined) continue
+    const joined = Array.isArray(raw) ? raw.join(',') : raw
+    hdr[name] = truncateUtf8HeadTail(joined, 256)
+    if (ovVal === undefined && typeof raw === 'string') {
+      ovHdr = name
+      ovVal = raw.trim().toUpperCase()
     }
   }
-
-  const soapRaw = headers['soapaction']
-  if (soapRaw !== undefined) {
-    const joined = Array.isArray(soapRaw) ? soapRaw.join(',') : soapRaw
-    const scrubbed = scrubText(truncateUtf8HeadTail(joined, 256), vault)
-    vaultRedactions += scrubbed.vaultRedactions
-    hdr.soapaction = scrubbed.text
+  if (headers['soapaction'] !== undefined) {
+    const raw = headers['soapaction']
+    hdr.soapaction = truncateUtf8HeadTail(Array.isArray(raw) ? raw.join(',') : raw, 256)
   }
+  const hasOverride = OVERRIDE_HEADERS.some(h => headers[h] !== undefined)
+  const validOv = Boolean(ovVal && VALID_VERB_RE.test(ovVal))
+  const effectiveMethod = validOv && (SAFE_METHODS.has(wireMethod) || !SAFE_METHODS.has(ovVal!)) ? ovVal! : wireMethod
+  const methodSource: SafeRequestProjection['methodSource'] = validOv && effectiveMethod === ovVal && ovHdr ? ovHdr : 'wire'
+  return { wireMethod, effectiveMethod, methodSource, hasOverride, hdr: Object.keys(hdr).length ? hdr : undefined }
+}
 
-  const distinctVerbs = [...new Set(validTokens.map(v => v.verb))]
-  const hdrConflict = distinctVerbs.length > 1
-  const invalidOrConflictingOverride = invalid || hdrConflict
-
-  let effectiveMethod = wireMethod
-  let methodSource: SafeRequestProjection['methodSource'] = 'wire'
-
-  if (validTokens.length > 0) {
-    const unsafe = validTokens.find(v => !SAFE_METHODS.has(v.verb))
-    if (unsafe) {
-      effectiveMethod = unsafe.verb
-      methodSource = unsafe.header
-    } else if (SAFE_METHODS.has(wireMethod)) {
-      effectiveMethod = validTokens[0].verb
-      methodSource = validTokens[0].header
-    } else {
-      // Never downgrade write -> read
-      effectiveMethod = wireMethod
-      methodSource = 'wire'
-    }
-  }
-
-  return {
-    wireMethod,
-    effectiveMethod,
-    methodSource,
-    hdr: Object.keys(hdr).length ? hdr : undefined,
-    hdrConflict,
-    invalidOrConflictingOverride,
-    vaultRedactions,
-  }
+function sanitizeDest(headers: Record<string, string | string[] | undefined>): string | undefined {
+  const raw = headers['sec-fetch-dest']
+  if (typeof raw !== 'string' || !raw) return undefined
+  const v = raw.trim().toLowerCase()
+  return ALLOWED_FETCH_DESTS.has(v) ? v : 'other'
 }
 
 function parseDeclaredBytes(headers: Record<string, string | string[] | undefined>): number | undefined {
@@ -511,7 +461,6 @@ export function startProxy(
   const activeTunnels = new Set<net.Socket>()
   const activeUpgradeSockets = new Set<net.Socket>()
   const activeInFlight = new Map<number, { finalize: () => void }>()
-  const activeAbortControllers = new Set<AbortController>()
 
   const matches = (list: string[], host: string) => list.some(h => h.toLowerCase() === host || h.startsWith('*.') && host.endsWith(h.slice(1).toLowerCase()))
   const isSiteHost = (url: URL | null) => Boolean(url && matches(site.hosts, url.hostname))
@@ -604,23 +553,13 @@ export function startProxy(
 
   const classifyArrival = (req: http.IncomingMessage, url: URL | null, effectiveHeaders?: Record<string, string | string[] | undefined>) => {
     const hdrs = effectiveHeaders ?? req.headers
-    const sem = parseSemanticMethods(req.method, hdrs, vault)
+    const sem = classifyMethod(req.method, hdrs)
     const declaredBytes = parseDeclaredBytes(hdrs)
-    // Check inbound req.headers['transfer-encoding'] too because buildOutboundSnapshot strips hop-by-hop headers!
     const hasBodyHint = (declaredBytes ?? 0) > 0 || Boolean(req.headers['transfer-encoding']) || Boolean(hdrs['transfer-encoding'])
     const hasPotentialBody = !SAFE_METHODS.has(sem.wireMethod) || hasBodyHint
-    const isWrite = !SAFE_METHODS.has(sem.wireMethod) || !SAFE_METHODS.has(sem.effectiveMethod) || sem.invalidOrConflictingOverride || (SAFE_METHODS.has(sem.wireMethod) && hasBodyHint)
+    const isWrite = !SAFE_METHODS.has(sem.wireMethod) || sem.hasOverride || hasBodyHint
     const isAuth = url ? isAuthUrl(url) : false
     return { sem, declaredBytes, hasPotentialBody, isWrite, isAuth }
-  }
-
-  const sanitizeDestHeader = (headers: Record<string, string | string[] | undefined>): { dest?: string; vaultRedactions: number } => {
-    const raw = headers['sec-fetch-dest']
-    if (typeof raw !== 'string' || !raw) return { vaultRedactions: 0 }
-    const lower = raw.trim().toLowerCase()
-    if (ALLOWED_FETCH_DESTS.has(lower)) return { dest: lower, vaultRedactions: 0 }
-    const s = scrubText(truncateUtf8HeadTail(raw, 32), vault)
-    return { dest: s.vaultRedactions > 0 ? '[REDACTED:vault]' : 'other', vaultRedactions: s.vaultRedactions }
   }
 
   const applyLateLive = (safe: SafeRequestProjection, liveAtStart: boolean, genAtStart: number | undefined): { safe: SafeRequestProjection; liveAtEnd?: true } => {
@@ -744,87 +683,72 @@ export function startProxy(
     opts?.onEntry?.(full)
   }
 
-  const buildFallbackProjection = (params: {
-    req: http.IncomingMessage
-    url: URL | null
-    seq: number
-    t: string
-    kind: 'http' | 'upgrade'
-    arrival: ReturnType<typeof classifyArrival>
-    liveAtStart: boolean
-    httpCursorAtArrival: number
-    cdpCursorAtArrival: number
-    reason: string
-  }): SafeRequestProjection => {
-    const sanUrl = params.url ? sanitizeUrl(params.url, { projection, vault }) : sanitizeUrl(params.req.url ?? '/', { projection, vault })
-    const destInfo = sanitizeDestHeader(params.req.headers)
-    const dest = destInfo.dest
-    return {
-      descV: DESC_V,
-      redactV: REDACT_V,
-      extractorV: EXTRACTOR_V,
-      surface: 'browser',
-      target: { site: siteName },
-      seq: params.seq,
-      t: params.t,
-      kind: params.kind,
-      scheme: sanUrl.scheme,
-      authority: sanUrl.authority,
-      path: sanUrl.path,
-      url: sanUrl.url,
-      method: params.arrival.sem.wireMethod,
-      effectiveMethod: params.arrival.sem.effectiveMethod,
-      methodSource: params.arrival.sem.methodSource,
-      isWrite: params.arrival.isWrite,
-      ...(params.arrival.sem.hdr && { hdr: params.arrival.sem.hdr }),
-      ...(params.arrival.sem.hdrConflict && { hdrConflict: true as const }),
-      ...(dest && { dest }),
-      ...(params.arrival.declaredBytes !== undefined && { declaredBytes: params.arrival.declaredBytes }),
-      prefixBytes: 0,
-      bodyComplete: false,
-      decodeComplete: false,
-      completeness: { transport: 'not-read', decode: 'none', extract: 'none', reasons: [params.reason] },
-      actions: params.kind === 'upgrade' ? [{ family: 'upgrade', op: 'upgrade:websocket', resource: sanUrl.path, coverage: 'complete' }] : [],
-      cdpCursor: params.cdpCursorAtArrival,
-      httpCursor: params.httpCursorAtArrival,
-      ...(params.liveAtStart && { live: true as const }),
-    }
-  }
-
-  const buildSafeProjection = async (params: {
+  const buildProjection = async (params: {
     req: http.IncomingMessage
     effectiveHeaders?: Record<string, string | string[] | undefined>
     url: URL | null
     seq: number
     t: string
     kind: 'http' | 'upgrade'
-    prefixBuf: Buffer
-    bodyComplete: boolean
-    transport: 'complete' | 'truncated' | 'not-read'
-    transportReasons: string[]
-    liveAtStart: boolean
-    genAtStart: number | undefined
     arrival: ReturnType<typeof classifyArrival>
-    hasBody: boolean
+    liveAtStart: boolean
+    genAtStart?: number
     httpCursorAtArrival: number
     cdpCursorAtArrival: number
+    prefixBuf?: Buffer
+    bodyComplete?: boolean
+    transport?: 'complete' | 'truncated' | 'not-read'
+    transportReasons?: string[]
+    hasBody?: boolean
+    fallbackReason?: string
   }): Promise<{ safe: SafeRequestProjection; releaseDecoded: () => void }> => {
-    const { req, url, seq, t, kind, prefixBuf, bodyComplete, transport, transportReasons, liveAtStart, genAtStart, arrival, hasBody } = params
+    const { req, url, seq, t, kind, arrival, liveAtStart, genAtStart } = params
     const hdrs = params.effectiveHeaders ?? req.headers
     const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
+    const dest = sanitizeDest(hdrs)
+    const from = typeof hdrs.referer === 'string' && hdrs.referer ? sanitizeUrl(hdrs.referer, { projection, vault }).url : undefined
+    const prefixBuf = params.prefixBuf ?? Buffer.alloc(0)
+    const transport = params.transport ?? 'not-read'
+    const bodyComplete = params.bodyComplete ?? false
+    const isWrite = arrival.isWrite || (SAFE_METHODS.has(arrival.sem.wireMethod) && (Boolean(params.hasBody) || prefixBuf.length > 0))
 
-    const destInfo = sanitizeDestHeader(hdrs)
-    const dest = destInfo.dest
-    let vaultRedactions = sanUrl.vaultRedactions + arrival.sem.vaultRedactions + destInfo.vaultRedactions
-    let from: string | undefined
-    if (typeof hdrs.referer === 'string' && hdrs.referer) {
-      const sanFrom = sanitizeUrl(hdrs.referer, { projection, vault })
-      from = sanFrom.url
-      vaultRedactions += sanFrom.vaultRedactions
+    if (params.fallbackReason) {
+      return {
+        safe: {
+          descV: DESC_V,
+          redactV: REDACT_V,
+          extractorV: EXTRACTOR_V,
+          surface: 'browser',
+          target: { site: siteName },
+          seq,
+          t,
+          kind,
+          scheme: sanUrl.scheme,
+          authority: sanUrl.authority,
+          path: sanUrl.path,
+          url: sanUrl.url,
+          method: arrival.sem.wireMethod,
+          effectiveMethod: arrival.sem.effectiveMethod,
+          methodSource: arrival.sem.methodSource,
+          isWrite,
+          ...(arrival.sem.hdr && { hdr: arrival.sem.hdr }),
+          ...(dest && { dest }),
+          ...(from && { from }),
+          ...(arrival.declaredBytes !== undefined && { declaredBytes: arrival.declaredBytes }),
+          prefixBytes: 0,
+          bodyComplete: false,
+          decodeComplete: false,
+          completeness: { transport: 'not-read', decode: 'none', extract: 'none', reasons: [params.fallbackReason] },
+          actions: kind === 'upgrade' ? [{ family: 'upgrade', op: 'upgrade:websocket', resource: sanUrl.path, coverage: 'complete' }] : [],
+          cdpCursor: params.cdpCursorAtArrival,
+          httpCursor: params.httpCursorAtArrival,
+          ...(liveAtStart && { live: true as const }),
+        },
+        releaseDecoded: () => {},
+      }
     }
 
     const reqType = normalizeContentType(typeof hdrs['content-type'] === 'string' ? hdrs['content-type'] : undefined, vault)
-    const isWrite = arrival.isWrite || (SAFE_METHODS.has(arrival.sem.wireMethod) && (hasBody || prefixBuf.length > 0))
     const liveOrChanged = liveAtStart || isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart)
 
     let decodeRes = undefined
@@ -871,7 +795,7 @@ export function startProxy(
       decodeResult: decodeRes,
       bodyComplete: transport === 'complete' && bodyComplete,
       transport,
-      transportReasons,
+      transportReasons: params.transportReasons ?? [],
       isWrite,
       isAuth: arrival.isAuth,
       isLive: liveAfterDecode,
@@ -879,7 +803,6 @@ export function startProxy(
       vault,
       sampleBudgetOk: sampleBytes < maxSampleBytes,
     })
-    vaultRedactions += extracted.vaultRedactions
 
     const safe: SafeRequestProjection = {
       descV: DESC_V,
@@ -899,7 +822,6 @@ export function startProxy(
       methodSource: arrival.sem.methodSource,
       isWrite,
       ...(arrival.sem.hdr && { hdr: arrival.sem.hdr }),
-      ...(arrival.sem.hdrConflict && { hdrConflict: true as const }),
       ...(dest && { dest }),
       ...(from && { from }),
       ...(reqType && { reqType }),
@@ -912,7 +834,6 @@ export function startProxy(
       ...(extracted.bodyShape && { bodyShape: extracted.bodyShape }),
       ...(extracted.graphqlOp && { graphqlOp: extracted.graphqlOp }),
       ...(extracted.dupKeys && { dupKeys: true as const }),
-      ...(vaultRedactions > 0 && { vaultRedactions }),
       cdpCursor: params.cdpCursorAtArrival,
       httpCursor: params.httpCursorAtArrival,
       ...(liveAtStart && { live: true as const }),
@@ -933,123 +854,39 @@ export function startProxy(
     const t = new Date().toISOString()
     const url = urlOf(req)
     const seq = ++seqCounter
-    void handleV2Request(req, res, url, seq, t, startMs).catch(() => {
-      const inflight = activeInFlight.get(seq)
-      if (inflight) inflight.finalize()
-      if (!res.headersSent && !res.destroyed) {
-        res.writeHead(500, { 'content-type': 'text/plain' }).end('rollforward-browser: internal proxy error\n')
-      }
-    })
-  }
-
-  const handleV2Request = async (
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-    url: URL | null,
-    seq: number,
-    t: string,
-    startMs: number,
-  ) => {
     const httpCursorAtArrival = cursorCounter
     const cdpCursorAtArrival = opts?.getCdpCursor?.() ?? 0
     const liveAtStart = isLiveNow()
     const genAtStart = liveGen?.()
 
-    try { vault?.ingestRequestHeaders(req.headers) } catch {}
-
+    vault?.ingestRequestHeaders(req.headers)
     const outboundSnap = url ? buildOutboundSnapshot(req, url) : undefined
     const arrival = classifyArrival(req, url, outboundSnap?.headers)
 
-    const abortController = new AbortController()
-    activeAbortControllers.add(abortController)
-    const onReqErr = () => abortController.abort()
-    const onResClose = () => { if (!res.writableFinished) abortController.abort() }
-    req.on('error', onReqErr)
-    res.on('close', onResClose)
-    const cleanupCancellation = () => {
-      activeAbortControllers.delete(abortController)
-      req.off('error', onReqErr)
-      res.off('close', onResClose)
-    }
-
-    let reserved = 0
-    let terminalCommitted = false
-    let cleanupExtra: (() => void) | undefined
-    const stateRef = {
-      status: 0,
-      dispatch: 'not_dispatched' as 'not_dispatched' | 'dispatched' | 'unknown',
-      reqBytes: 0,
-      resBytes: 0,
-      error: undefined as string | undefined,
-    }
-
-    const commitFallback = (reason: string, incomplete = true) => {
-      if (terminalCommitted) return
-      terminalCommitted = true
-      activeInFlight.delete(seq)
-      cleanupCancellation()
-      cleanupExtra?.()
-      const fb = buildFallbackProjection({
-        req, url, seq, t, kind: 'http', arrival, liveAtStart,
-        httpCursorAtArrival, cdpCursorAtArrival, reason,
-      })
-      const lateLive = !liveAtStart && (isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart))
-      appendV2Entry({
-        ...fb,
-        status: stateRef.status,
-        ...(stateRef.error && { error: scrubText(stateRef.error, vault).text }),
-        reqBytes: stateRef.reqBytes,
-        resBytes: stateRef.resBytes,
-        ms: Math.round(performance.now() - startMs),
-        dispatch: stateRef.dispatch,
-        ...(lateLive && { liveAtEnd: true as const }),
-        ...(incomplete && { incomplete: true as const }),
-      }, reserved)
-      reserved = 0
-    }
-
-    activeInFlight.set(seq, {
-      finalize: () => {
-        incompleteAtSeal++
-        if (stateRef.dispatch === 'dispatched') stateRef.dispatch = 'unknown'
-        commitFallback('sealed-in-flight', true)
-      },
-    })
-
     const blocked = check(url)
     if (blocked) {
-      const built = await buildSafeProjection({
-        req, url, seq, t, kind: 'http', prefixBuf: Buffer.alloc(0), bodyComplete: false,
-        transport: 'not-read', transportReasons: [], liveAtStart, genAtStart, arrival,
-        hasBody: false, httpCursorAtArrival, cdpCursorAtArrival,
+      void buildProjection({
+        req, url, seq, t, kind: 'http', arrival, liveAtStart, genAtStart,
+        httpCursorAtArrival, cdpCursorAtArrival,
+      }).then(({ safe, releaseDecoded }) => {
+        releaseDecoded()
+        appendV2Entry({ ...safe, status: 403, blocked, dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) })
       })
-      built.releaseDecoded()
-      if (!terminalCommitted) {
-        terminalCommitted = true
-        activeInFlight.delete(seq)
-        cleanupCancellation()
-        appendV2Entry({ ...built.safe, status: 403, blocked, dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
-        reserved = 0
-      }
       res.writeHead(403, { 'content-type': 'text/plain' }).end(`rollforward-browser: ${blocked}: ${req.method} ${url?.href ?? req.url}\n`)
       return
     }
 
-    // Reserve log space atomically before dispatching writes to site.hosts; other writes count-and-drop
+    let reserved = 0
     if (arrival.isWrite && isSiteHost(url)) {
       reserved = tryReserveLogSpace()
       if (reserved < 0) {
-        reserved = 0
-        terminalCommitted = true
-        activeInFlight.delete(seq)
-        cleanupCancellation()
         refusedFullCount++
         res.writeHead(403, { 'content-type': 'application/json', connection: 'close' }).end(JSON.stringify({ error: 'audit log full' }))
         return
       }
     }
 
-    // Observe-mode bounded 64 KiB prefix tee
+    // 1. Bounded 64 KiB prefix tee
     const teeChunks: Buffer[] = []
     let teeLen = 0
     let teeAcquired = 0
@@ -1059,18 +896,46 @@ export function startProxy(
     const teeReasons: string[] = []
     let totalReqBytes = 0
     let budgetHit = false
-    let prefixFrozenResolve: (() => void) | undefined
-    const prefixFrozenPromise = new Promise<void>(r => { prefixFrozenResolve = r })
+    let prefixTimer: NodeJS.Timeout | undefined
+    let builtPromise: Promise<{ safe: SafeRequestProjection; releaseDecoded: () => void }> | undefined
+    let resolvedBuilt: { safe: SafeRequestProjection; releaseDecoded: () => void } | undefined
+    let teeReleased = false
 
-    const releaseTeeBudget = () => {
+    const releaseTee = () => {
+      clearTimeout(prefixTimer)
+      if (teeReleased) return
+      teeReleased = true
       if (teeAcquired > 0) {
         inFlightTracker.release(clientId, sessionId, teeAcquired)
         teeAcquired = 0
       }
       teeChunks.length = 0
+      resolvedBuilt?.releaseDecoded()
     }
 
-    let prefixTimer: NodeJS.Timeout | undefined
+    const startBuild = () => {
+      if (builtPromise) return builtPromise
+      const prefixBuf = teeChunks.length === 1 ? teeChunks[0] : Buffer.concat(teeChunks)
+      teeChunks.length = 0
+      builtPromise = buildProjection({
+        req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'http',
+        arrival, liveAtStart, genAtStart, httpCursorAtArrival, cdpCursorAtArrival,
+        prefixBuf, bodyComplete: teeComplete, transport: teeTransport, transportReasons: teeReasons,
+        hasBody: totalReqBytes > 0,
+      }).then(built => {
+        resolvedBuilt = built
+        if (budgetHit && built.safe.isWrite && (!built.safe.reqOmitted || built.safe.reqOmitted === 'policy-profile')) {
+          built.safe.reqOmitted = 'budget'
+        }
+        if (sealed || teeReleased) {
+          built.releaseDecoded()
+          releaseTee()
+        }
+        return built
+      })
+      return builtPromise
+    }
+
     const freezeTee = (complete: boolean, reason?: string) => {
       if (teeFrozen) return
       teeFrozen = true
@@ -1078,278 +943,164 @@ export function startProxy(
       teeComplete = complete
       teeTransport = complete ? 'complete' : 'truncated'
       if (reason && !teeReasons.includes(reason)) teeReasons.push(reason)
-      prefixFrozenResolve?.()
+      if (!sealed) void startBuild().catch(() => {})
     }
 
     if (arrival.hasPotentialBody) {
       prefixTimer = setTimeout(() => freezeTee(false, 'prefix-timeout'), prefixTimeoutMs)
-      prefixTimer.unref?.()
+      prefixTimer.unref()
     } else {
-      prefixFrozenResolve?.()
+      void startBuild().catch(() => {})
     }
 
     req.on('data', (chunk: Buffer) => {
-      try {
-        totalReqBytes += chunk.length
-        stateRef.reqBytes = totalReqBytes
-        if (!arrival.hasPotentialBody && teeTransport === 'not-read') {
-          teeFrozen = false
-          teeComplete = false
-          teeTransport = 'truncated'
-        }
-        if (teeFrozen) return
-        if (teeLen >= MAX_PREFIX_BYTES) {
-          freezeTee(false, '>64KiB')
-          return
-        }
-        const take = Math.min(chunk.length, MAX_PREFIX_BYTES - teeLen)
-        if (!inFlightTracker.tryAcquire(clientId, sessionId, take)) {
-          budgetHit = true
-          freezeTee(false, 'budget')
-          return
-        }
-        teeAcquired += take
-        teeChunks.push(Buffer.from(chunk.subarray(0, take)))
-        teeLen += take
-        if (chunk.length > take) {
-          freezeTee(false, '>64KiB')
-        } else if (teeLen === MAX_PREFIX_BYTES) {
-          if (req.readableEnded) freezeTee(true)
-          else freezeTee(false, '>=64KiB')
-        }
-      } catch {}
-    })
-    req.on('end', () => {
-      if (!teeFrozen) freezeTee(true)
-    })
-
-    let builtPromise: Promise<{ safe: SafeRequestProjection; releaseDecoded: () => void }> | undefined
-    let resolvedBuilt: { safe: SafeRequestProjection; releaseDecoded: () => void } | undefined
-    let released = false
-
-    const releaseObserve = (built?: { safe: SafeRequestProjection; releaseDecoded: () => void }) => {
-      if (built) resolvedBuilt = built
-      if (released) return
-      released = true
-      resolvedBuilt?.releaseDecoded()
-      releaseTeeBudget()
-    }
-
-    const buildObserveDescriptor = async () => {
-      const prefixBuf = teeChunks.length === 1 ? teeChunks[0] : Buffer.concat(teeChunks)
-      teeChunks.length = 0
-      const built = await buildSafeProjection({
-        req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'http', prefixBuf,
-        bodyComplete: teeComplete,
-        transport: teeTransport,
-        transportReasons: teeReasons,
-        liveAtStart, genAtStart, arrival, hasBody: totalReqBytes > 0,
-        httpCursorAtArrival, cdpCursorAtArrival,
-      })
-      resolvedBuilt = built
-      if (budgetHit && built.safe.isWrite && (!built.safe.reqOmitted || built.safe.reqOmitted === 'policy-profile')) {
-        built.safe.reqOmitted = 'budget'
+      totalReqBytes += chunk.length
+      if (!arrival.hasPotentialBody && teeTransport === 'not-read') {
+        teeFrozen = false
+        teeComplete = false
+        teeTransport = 'truncated'
       }
-      if (sealed || released) {
-        built.releaseDecoded()
-        releaseTeeBudget()
+      if (teeFrozen) return
+      if (teeLen >= MAX_PREFIX_BYTES) return freezeTee(false, '>64KiB')
+      const take = Math.min(chunk.length, MAX_PREFIX_BYTES - teeLen)
+      if (!inFlightTracker.tryAcquire(clientId, sessionId, take)) {
+        budgetHit = true
+        return freezeTee(false, 'budget')
       }
-      return built
-    }
-
-    const getBuilt = () => {
-      if (!teeFrozen) freezeTee(req.readableEnded)
-      return (builtPromise ??= buildObserveDescriptor())
-    }
-
-    cleanupExtra = () => {
-      clearTimeout(prefixTimer)
-      if (builtPromise) void builtPromise.then(b => b.releaseDecoded(), () => {})
-      releaseObserve()
-    }
-
-    void prefixFrozenPromise.then(() => {
-      if (!sealed) void getBuilt().catch(() => {})
+      teeAcquired += take
+      teeChunks.push(Buffer.from(chunk.subarray(0, take)))
+      teeLen += take
+      if (chunk.length > take) freezeTee(false, '>64KiB')
+      else if (teeLen === MAX_PREFIX_BYTES) freezeTee(req.readableEnded, req.readableEnded ? undefined : '>=64KiB')
     })
+    req.on('end', () => { if (!teeFrozen) freezeTee(true) })
 
-    dispatchUpstream({
-      req, res, url: url!, outboundSnap: outboundSnap!, seq, t, startMs,
-      liveAtStart, genAtStart, arrival,
-      httpCursorAtArrival, cdpCursorAtArrival,
-      getReserved: () => { const r = reserved; reserved = 0; return r },
-      abortController, cleanupCancellation,
-      isCommitted: () => terminalCommitted,
-      markCommitted: () => { terminalCommitted = true; activeInFlight.delete(seq) },
-      stateRef,
-      getLazySafe: async () => {
-        let desc: { safe: SafeRequestProjection; releaseDecoded: () => void } | undefined
-        try {
-          desc = await getBuilt()
-          return desc.safe
-        } finally {
-          releaseObserve(desc)
-        }
-      },
-      getResolvedSafe: () => resolvedBuilt?.safe,
-      onSealFinalize: () => cleanupExtra(),
-      getReqBytes: () => totalReqBytes,
-      onCleanupTee: () => { clearTimeout(prefixTimer) },
-    })
-  }
-
-  const dispatchUpstream = (ctx: {
-    req: http.IncomingMessage
-    res: http.ServerResponse
-    url: URL
-    outboundSnap: ReturnType<typeof buildOutboundSnapshot>
-    seq: number
-    t: string
-    startMs: number
-    liveAtStart: boolean
-    genAtStart: number | undefined
-    arrival: ReturnType<typeof classifyArrival>
-    httpCursorAtArrival: number
-    cdpCursorAtArrival: number
-    getReserved: () => number
-    abortController: AbortController
-    cleanupCancellation: () => void
-    isCommitted: () => boolean
-    markCommitted: () => void
-    stateRef: { status: number; dispatch: 'not_dispatched' | 'dispatched' | 'unknown'; reqBytes: number; resBytes: number; error?: string }
-    getLazySafe: () => Promise<SafeRequestProjection>
-    getResolvedSafe: () => SafeRequestProjection | undefined
-    onSealFinalize: () => void
-    getReqBytes: () => number
-    onCleanupTee: () => void
-  }) => {
-    const { req, res, url, outboundSnap, seq, t, startMs, liveAtStart, genAtStart, arrival, abortController, cleanupCancellation, stateRef } = ctx
+    // 2. Dispatch upstream + single finalize-once path + seal hook
     let resBytes = 0
     let status = 0
     let resType: string | undefined
     let headerMs: number | undefined
     let errorMsg: string | undefined
     let emitStarted = false
+    let committed = false
     let emittedN: number | null = null
     let timedOutStream = false
     let reqDone = req.readableEnded || !arrival.hasPotentialBody
     let resDone = false
     let lateEmitted = false
-    const pendingLateOutcomes: Array<Omit<LateOutcomeEntry, 'n' | 'ref'>> = []
-
-    const totalReqBytes = () => ctx.getReqBytes()
+    const pendingLate: Array<Omit<LateOutcomeEntry, 'n' | 'ref'>> = []
 
     const flushPendingLate = () => {
       if (emittedN === null || sealed) return
-      while (pendingLateOutcomes.length > 0) {
-        const item = pendingLateOutcomes.shift()!
-        appendLateOutcome({ ...item, ref: emittedN })
-      }
+      while (pendingLate.length) appendLateOutcome({ ...pendingLate.shift()!, ref: emittedN })
     }
 
-    const commitProjection = (safe: SafeRequestProjection, optsEmit: { incomplete?: true; forceDispatch?: 'unknown' }) => {
-      if (ctx.isCommitted()) return
-      ctx.markCommitted()
+    const commit = (safe: SafeRequestProjection, extra: { incomplete?: true; forceDispatch?: 'unknown' }) => {
+      if (committed) return
+      committed = true
+      activeInFlight.delete(seq)
       const ms = Math.round(performance.now() - startMs)
-      const lateLive = !liveAtStart && (isLiveNow() || (genAtStart !== undefined && liveGen?.() !== genAtStart))
-      const finalSafe: SafeRequestProjection = { ...safe }
-      if (lateLive && finalSafe.reqBody !== undefined) {
-        delete finalSafe.reqBody
-        finalSafe.reqOmitted = 'live'
-      }
+      const ll = applyLateLive(safe, liveAtStart, genAtStart)
       const scrubbedErr = errorMsg ? scrubText(errorMsg, vault).text : undefined
-
-      const n = appendV2Entry({
-        ...finalSafe,
+      const ownRes = reserved
+      reserved = 0
+      emittedN = appendV2Entry({
+        ...ll.safe,
         status,
         ...(scrubbedErr && { error: scrubbedErr }),
         ...(resType && { resType }),
-        reqBytes: totalReqBytes(),
+        reqBytes: totalReqBytes,
         resBytes,
         ...(headerMs !== undefined && { headerMs }),
         ms,
-        dispatch: optsEmit.forceDispatch ?? 'dispatched',
-        ...(lateLive && { liveAtEnd: true as const }),
-        ...(optsEmit.incomplete && { incomplete: true as const }),
-      }, ctx.getReserved())
-
-      emittedN = n
+        dispatch: extra.forceDispatch ?? 'dispatched',
+        ...(ll.liveAtEnd && { liveAtEnd: true as const }),
+        ...(extra.incomplete && { incomplete: true as const }),
+      }, ownRes)
       flushPendingLate()
     }
 
-    const emitOnce = (optsEmit: { incomplete?: true }) => {
-      if (emitStarted || ctx.isCommitted()) return
+    const finalizeOnce = (extra: { incomplete?: true }) => {
+      if (emitStarted || committed) return
       emitStarted = true
       clearTimeout(streamTimer)
-      ctx.onCleanupTee()
-
-      void ctx.getLazySafe().then(
-        safe => commitProjection(safe, optsEmit),
-        () => {
-          const fb = buildFallbackProjection({
-            req, url, seq, t, kind: 'http', arrival, liveAtStart,
-            httpCursorAtArrival: ctx.httpCursorAtArrival, cdpCursorAtArrival: ctx.cdpCursorAtArrival,
-            reason: 'extractor-error',
+      if (!teeFrozen) freezeTee(req.readableEnded)
+      void startBuild().then(
+        built => { commit(built.safe, extra); releaseTee() },
+        async () => {
+          const { safe } = await buildProjection({
+            req, url, seq, t, kind: 'http', arrival, liveAtStart, genAtStart,
+            httpCursorAtArrival, cdpCursorAtArrival, fallbackReason: 'extractor-error',
           })
-          commitProjection(fb, optsEmit)
+          commit(safe, extra)
+          releaseTee()
         },
       )
     }
 
-    const queueOrEmitLate = (incomplete?: true) => {
+    const emitLate = (incomplete?: true) => {
       if (!timedOutStream || !emitStarted || lateEmitted || sealed) return
       lateEmitted = true
       const scrubbedErr = errorMsg ? scrubText(errorMsg, vault).text : undefined
       const rec: Omit<LateOutcomeEntry, 'n' | 'ref'> = {
         rec: 'http_end',
         t: new Date().toISOString(),
-        reqBytes: totalReqBytes(),
+        reqBytes: totalReqBytes,
         resBytes,
         ms: Math.round(performance.now() - startMs),
         ...(scrubbedErr && { error: scrubbedErr }),
         ...(incomplete && { incomplete: true as const }),
       }
       if (emittedN !== null) appendLateOutcome({ ...rec, ref: emittedN })
-      else pendingLateOutcomes.push(rec)
+      else pendingLate.push(rec)
     }
 
-    const tryCompleteBoth = () => {
+    const tryComplete = () => {
       if (reqDone && resDone) {
-        cleanupCancellation()
-        if (!emitStarted) emitOnce({})
-        else queueOrEmitLate()
+        if (!emitStarted) finalizeOnce({})
+        else emitLate()
       }
     }
 
     const streamTimer = setTimeout(() => {
       if (!emitStarted && !(reqDone && resDone)) {
         timedOutStream = true
-        emitOnce({ incomplete: true })
+        finalizeOnce({ incomplete: true })
       }
     }, streamTimeoutMs)
-    streamTimer.unref?.()
+    streamTimer.unref()
 
+    // 3. Register synchronous seal finalizer
     activeInFlight.set(seq, {
       finalize: () => {
-        if (ctx.isCommitted()) return
+        if (committed) return
         incompleteAtSeal++
         clearTimeout(streamTimer)
-        ctx.onCleanupTee()
-        const safe = ctx.getResolvedSafe() ?? buildFallbackProjection({
-          req, url, seq, t, kind: 'http', arrival, liveAtStart,
-          httpCursorAtArrival: ctx.httpCursorAtArrival, cdpCursorAtArrival: ctx.cdpCursorAtArrival,
-          reason: 'sealed-in-flight',
-        })
-        ctx.onSealFinalize()
-        cleanupCancellation()
-        commitProjection(safe, { incomplete: true, forceDispatch: 'unknown' })
+        const fallbackSafe = resolvedBuilt?.safe ?? (() => {
+          const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
+          return {
+            descV: DESC_V, redactV: REDACT_V, extractorV: EXTRACTOR_V,
+            surface: 'browser' as const, target: { site: siteName }, seq, t, kind: 'http' as const,
+            scheme: sanUrl.scheme, authority: sanUrl.authority, path: sanUrl.path, url: sanUrl.url,
+            method: arrival.sem.wireMethod, effectiveMethod: arrival.sem.effectiveMethod, methodSource: arrival.sem.methodSource,
+            isWrite: arrival.isWrite,
+            ...(arrival.sem.hdr && { hdr: arrival.sem.hdr }),
+            ...(sanitizeDest(req.headers) && { dest: sanitizeDest(req.headers) }),
+            prefixBytes: 0, bodyComplete: false, decodeComplete: false,
+            completeness: { transport: 'not-read' as const, decode: 'none' as const, extract: 'none' as const, reasons: ['sealed-in-flight'] },
+            actions: [], cdpCursor: cdpCursorAtArrival, httpCursor: httpCursorAtArrival,
+            ...(liveAtStart && { live: true as const }),
+          }
+        })()
+        releaseTee()
+        commit(fallbackSafe, { incomplete: true, forceDispatch: 'unknown' })
       },
     })
 
-    const up = (url.protocol === 'https:' ? https : http).request(url, outboundSnap, r => {
+    const up = (url!.protocol === 'https:' ? https : http).request(url!, outboundSnap!, r => {
       headerMs = Math.round(performance.now() - startMs)
       status = r.statusCode ?? 0
-      stateRef.status = status
-      try { vault?.ingestSetCookie(r.headers['set-cookie']) } catch {}
+      vault?.ingestSetCookie(r.headers['set-cookie'])
       resType = normalizeContentType(r.headers['content-type'], vault)
 
       const headers = { ...r.headers }
@@ -1359,13 +1110,10 @@ export function startProxy(
         r.pipe(res)
       }
 
-      r.on('data', (c: Buffer) => {
-        resBytes += c.length
-        stateRef.resBytes = resBytes
-      })
+      r.on('data', (c: Buffer) => { resBytes += c.length })
       r.on('end', () => {
         resDone = true
-        tryCompleteBoth()
+        tryComplete()
         const dest = typeof req.headers['sec-fetch-dest'] === 'string' ? req.headers['sec-fetch-dest'] : undefined
         if (!liveAtStart && arrival.isWrite && !isLiveNow() && liveGen?.() === genAtStart) {
           opts?.onWriteDetail?.({ dest, isWrite: true })
@@ -1373,55 +1121,38 @@ export function startProxy(
         }
       })
       r.on('aborted', () => {
-        resDone = true
-        reqDone = true
-        cleanupCancellation()
+        resDone = true; reqDone = true
         errorMsg ||= 'upstream response aborted'
-        stateRef.error = errorMsg
-        if (!emitStarted) emitOnce({ incomplete: true })
-        else queueOrEmitLate(true)
+        if (!emitStarted) finalizeOnce({ incomplete: true })
+        else emitLate(true)
       })
       r.on('error', e => {
-        resDone = true
-        reqDone = true
-        cleanupCancellation()
+        resDone = true; reqDone = true
         errorMsg ||= e.message
-        stateRef.error = errorMsg
-        if (!emitStarted) emitOnce({ incomplete: true })
-        else queueOrEmitLate(true)
+        if (!emitStarted) finalizeOnce({ incomplete: true })
+        else emitLate(true)
         if (!res.destroyed) res.destroy()
       })
     })
-    stateRef.dispatch = 'dispatched'
     activeUpstreams.add(up)
     up.on('close', () => activeUpstreams.delete(up))
 
-    const onAbort = () => {
-      reqDone = true
-      resDone = true
+    const onCancel = () => {
+      if (reqDone && resDone) return
+      reqDone = true; resDone = true
       up.destroy()
-      cleanupCancellation()
-      if (!emitStarted) emitOnce({ incomplete: true })
-      else queueOrEmitLate(true)
+      if (!emitStarted) finalizeOnce({ incomplete: true })
+      else emitLate(true)
     }
-    if (abortController.signal.aborted) {
-      onAbort()
-      return
-    }
-    abortController.signal.addEventListener('abort', onAbort, { once: true })
+    req.on('error', onCancel)
+    res.on('close', () => { if (!res.writableFinished) onCancel() })
 
     up.on('error', e => {
-      reqDone = true
-      resDone = true
-      cleanupCancellation()
+      reqDone = true; resDone = true
       errorMsg ||= e.message
-      stateRef.error = errorMsg
-      if (status === 0) {
-        status = 502
-        stateRef.status = 502
-      }
-      if (!emitStarted) emitOnce({})
-      else queueOrEmitLate(true)
+      if (status === 0) status = 502
+      if (!emitStarted) finalizeOnce({})
+      else emitLate(true)
       if (!res.headersSent && !res.destroyed) {
         res.writeHead(502, { 'content-type': 'text/plain' }).end(`rollforward-browser: ${e.message}\n`)
       } else if (!res.destroyed) {
@@ -1429,9 +1160,7 @@ export function startProxy(
       }
     })
 
-    if (!reqDone) {
-      req.once('end', () => { reqDone = true; tryCompleteBoth() })
-    }
+    if (!reqDone) req.once('end', () => { reqDone = true; tryComplete() })
     req.pipe(up)
   }
 
@@ -1446,79 +1175,74 @@ export function startProxy(
     const startMs = performance.now()
     const t = new Date().toISOString()
     const url = urlOf(req)
-
     const seq = ++seqCounter
-    void (async () => {
-      const httpCursorAtArrival = cursorCounter
-      const cdpCursorAtArrival = opts?.getCdpCursor?.() ?? 0
-      const liveAtStart = isLiveNow()
-      const genAtStart = liveGen?.()
-      try { vault?.ingestRequestHeaders(req.headers) } catch {}
+    const httpCursorAtArrival = cursorCounter
+    const cdpCursorAtArrival = opts?.getCdpCursor?.() ?? 0
+    const liveAtStart = isLiveNow()
+    const genAtStart = liveGen?.()
 
-      const outboundSnap = url ? buildOutboundSnapshot(req, url) : undefined
-      const arrival = classifyArrival(req, url, outboundSnap?.headers)
+    vault?.ingestRequestHeaders(req.headers)
+    const outboundSnap = url ? buildOutboundSnapshot(req, url) : undefined
+    const arrival = classifyArrival(req, url, outboundSnap?.headers)
 
-      let committed = false
-      let reserved = 0
-      let dispatchState: 'not_dispatched' | 'dispatched' | 'unknown' = 'not_dispatched'
-      activeInFlight.set(seq, {
-        finalize: () => {
-          if (committed) return
-          committed = true
-          incompleteAtSeal++
-          activeInFlight.delete(seq)
-          const fb = buildFallbackProjection({
-            req, url, seq, t, kind: 'upgrade', arrival, liveAtStart,
-            httpCursorAtArrival, cdpCursorAtArrival, reason: 'sealed-in-flight',
-          })
-          appendV2Entry({ ...fb, status: 0, dispatch: dispatchState === 'dispatched' ? 'unknown' : 'not_dispatched', incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        },
-      })
+    let committed = false
+    let reserved = 0
+    let dispatchState: 'not_dispatched' | 'dispatched' | 'unknown' = 'not_dispatched'
 
-      const built = await buildSafeProjection({
-        req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'upgrade', prefixBuf: Buffer.alloc(0), bodyComplete: false,
-        transport: 'not-read', transportReasons: [], liveAtStart, genAtStart, arrival,
-        hasBody: false, httpCursorAtArrival, cdpCursorAtArrival,
-      })
-      built.releaseDecoded()
+    const commitUpgrade = (safe: SafeRequestProjection, extra: { status: number; blocked?: string; error?: string; dispatch?: 'not_dispatched' | 'dispatched' | 'unknown'; incomplete?: true }) => {
+      if (committed) return
+      committed = true
+      activeInFlight.delete(seq)
+      const ll = applyLateLive(safe, liveAtStart, genAtStart)
+      const ownRes = reserved
+      reserved = 0
+      appendV2Entry({
+        ...ll.safe,
+        status: extra.status,
+        ...(extra.blocked && { blocked: extra.blocked }),
+        ...(extra.error && { error: extra.error }),
+        dispatch: extra.dispatch ?? dispatchState,
+        ...(ll.liveAtEnd && { liveAtEnd: true as const }),
+        ...(extra.incomplete && { incomplete: true as const }),
+        ms: Math.round(performance.now() - startMs),
+      }, ownRes)
+    }
 
+    void buildProjection({
+      req, effectiveHeaders: outboundSnap?.headers, url, seq, t, kind: 'upgrade',
+      arrival, liveAtStart, genAtStart, httpCursorAtArrival, cdpCursorAtArrival,
+    }).then(({ safe, releaseDecoded }) => {
+      releaseDecoded()
       const blocked = check(url)
       if (blocked) {
-        if (!committed) {
-          committed = true
-          activeInFlight.delete(seq)
-          appendV2Entry({ ...built.safe, status: 403, blocked, dispatch: 'not_dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        }
+        commitUpgrade(safe, { status: 403, blocked, dispatch: 'not_dispatched' })
         socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n')
         return
       }
-
       if (arrival.isWrite && isSiteHost(url)) {
         reserved = tryReserveLogSpace()
         if (reserved < 0) {
           reserved = 0
           committed = true
-          activeInFlight.delete(seq)
           refusedFullCount++
           const fullJson = JSON.stringify({ error: 'audit log full' })
           socket.end(`HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(fullJson)}\r\nconnection: close\r\n\r\n${fullJson}`)
           return
         }
       }
-
       if (socket.destroyed || sealed || admissionStopped) {
-        if (!committed) {
-          committed = true
-          activeInFlight.delete(seq)
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 0, dispatch: 'not_dispatched', incomplete: true, ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        }
+        commitUpgrade(safe, { status: 0, dispatch: 'not_dispatched', incomplete: true })
         socket.destroy()
         return
       }
+
+      activeInFlight.set(seq, {
+        finalize: () => {
+          if (committed) return
+          incompleteAtSeal++
+          commitUpgrade(safe, { status: 0, dispatch: dispatchState === 'dispatched' ? 'unknown' : 'not_dispatched', incomplete: true })
+        },
+      })
 
       const uOpts = outboundSnap!
       uOpts.headers.connection = 'upgrade'
@@ -1537,14 +1261,8 @@ export function startProxy(
         upSocket.on('close', () => { activeUpstreams.delete(upSocket); socket.off('close', destroyUpSock) })
         upSocket.on('error', () => socket.destroy())
         socket.once('close', destroyUpSock)
-        try { vault?.ingestSetCookie(r.headers['set-cookie']) } catch {}
-        if (!committed) {
-          committed = true
-          activeInFlight.delete(seq)
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 101, dispatch: 'dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        }
+        vault?.ingestSetCookie(r.headers['set-cookie'])
+        commitUpgrade(safe, { status: 101, dispatch: 'dispatched' })
         socket.write(`HTTP/1.1 101 Switching Protocols\r\n${Object.entries(r.headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`)
         upSocket.write(head)
         socket.write(upHead)
@@ -1552,28 +1270,15 @@ export function startProxy(
       })
       up.on('response', r => {
         r.resume()
-        if (!committed) {
-          committed = true
-          activeInFlight.delete(seq)
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: r.statusCode ?? 0, dispatch: 'dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        }
+        commitUpgrade(safe, { status: r.statusCode ?? 0, dispatch: 'dispatched' })
         socket.end(`HTTP/1.1 ${r.statusCode} ${r.statusMessage}\r\nconnection: close\r\n\r\n`)
       })
       up.on('error', e => {
-        const err = scrubText(e.message, vault).text
-        if (!committed) {
-          committed = true
-          activeInFlight.delete(seq)
-          const ll = applyLateLive(built.safe, liveAtStart, genAtStart)
-          appendV2Entry({ ...ll.safe, ...(ll.liveAtEnd && { liveAtEnd: true as const }), status: 502, error: err, dispatch: 'dispatched', ms: Math.round(performance.now() - startMs) }, reserved)
-          reserved = 0
-        }
+        commitUpgrade(safe, { status: 502, error: scrubText(e.message, vault).text, dispatch: 'dispatched' })
         socket.end('HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n')
       })
       up.end()
-    })().catch(() => {
+    }).catch(() => {
       activeInFlight.get(seq)?.finalize()
       socket.destroy()
     })
@@ -1598,18 +1303,12 @@ export function startProxy(
     const url = urlOf(req)
     const seq = ++seqCounter
     const arrival = classifyArrival(req, url)
-    const sanUrl = url ? sanitizeUrl(url, { projection, vault }) : sanitizeUrl(req.url ?? '/', { projection, vault })
-    appendV2Entry({
-      descV: DESC_V, redactV: REDACT_V, extractorV: EXTRACTOR_V,
-      surface: 'browser', target: { site: siteName }, seq, t: new Date().toISOString(),
-      kind: 'http', scheme: sanUrl.scheme, authority: sanUrl.authority, path: sanUrl.path, url: sanUrl.url,
-      method: arrival.sem.wireMethod, effectiveMethod: arrival.sem.effectiveMethod, methodSource: arrival.sem.methodSource,
-      isWrite: arrival.isWrite,
-      ...(arrival.sem.hdr && { hdr: arrival.sem.hdr }),
-      ...(arrival.sem.hdrConflict && { hdrConflict: true as const }),
-      prefixBytes: 0, bodyComplete: false, decodeComplete: false,
-      completeness: { transport: 'not-read', decode: 'none', extract: 'none', reasons: ['expectation-failed'] },
-      actions: [], status: 417, blocked: 'expectation failed', dispatch: 'not_dispatched',
+    void buildProjection({
+      req, url, seq, t: new Date().toISOString(), kind: 'http', arrival,
+      liveAtStart: isLiveNow(), httpCursorAtArrival: cursorCounter, cdpCursorAtArrival: opts?.getCdpCursor?.() ?? 0,
+      fallbackReason: 'expectation-failed',
+    }).then(({ safe }) => {
+      appendV2Entry({ ...safe, status: 417, blocked: 'expectation failed', dispatch: 'not_dispatched' })
     })
     res.writeHead(417, { 'content-type': 'text/plain', connection: 'close' }).end('rollforward-browser: 417 Expectation Failed\n')
   }
@@ -1652,11 +1351,9 @@ export function startProxy(
     if (admissionStopped) return
     admissionStopped = true
     outer.close()
-    outer.closeAllConnections?.()
+    outer.closeAllConnections()
     inner.close()
-    inner.closeAllConnections?.()
-    for (const ac of activeAbortControllers) ac.abort()
-    activeAbortControllers.clear()
+    inner.closeAllConnections()
     for (const sock of activeTunnels) sock.destroy()
     activeTunnels.clear()
     for (const sock of activeUpgradeSockets) sock.destroy()
@@ -1669,19 +1366,11 @@ export function startProxy(
     stopAdmission,
     finalizeAtSeal: () => {
       if (sealed) return { logCursor: cursorCounter, droppedGets, refusedFull: refusedFullCount }
-      // Stop accepting new connections first; snapshot pending abort controllers before finalize() unregisters them,
-      // finalize all in-flight entries with exact dispatch ('unknown' / 'not_dispatched'), then abort all controllers
-      // and destroy every tunnel, downstream upgrade socket, and upstream cleanly!
       admissionStopped = true
       outer.close()
       inner.close()
-      const pendingAborts = [...activeAbortControllers]
-      activeAbortControllers.clear()
       for (const item of [...activeInFlight.values()]) item.finalize()
       activeInFlight.clear()
-      for (const ac of pendingAborts) ac.abort()
-      for (const ac of activeAbortControllers) ac.abort()
-      activeAbortControllers.clear()
       const summary: SummaryEntry = {
         n: ++cursorCounter,
         rec: '_summary',
