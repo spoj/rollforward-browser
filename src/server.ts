@@ -14,8 +14,7 @@ const port = Number(process.env.BROWSER_PORT ?? 8797)
 const host = process.env.BROWSER_HOST ?? '127.0.0.1'
 const auditV2Enabled = process.env.BROWSER_AUDIT_V2 !== '0'
 const postTtlGcMs = Number(process.env.BROWSER_POST_TTL_GC_MS ?? 25 * 60_000)
-const maxClientRetainedBytes = Number(process.env.BROWSER_MAX_CLIENT_BYTES ?? 64 * 1024 * 1024)
-const maxProcessRetainedBytes = Number(process.env.BROWSER_MAX_PROCESS_BYTES ?? 256 * 1024 * 1024)
+const maxSealedPerClient = Number(process.env.BROWSER_MAX_SEALED_PER_CLIENT ?? 8)
 
 const keys = process.env.BROWSER_KEYS ?? (process.env.BROWSER_KEY ? `default:${process.env.BROWSER_KEY}` : '')
 if (!keys.trim()) throw new Error('BROWSER_KEYS or BROWSER_KEY must be set')
@@ -59,9 +58,7 @@ const sealSession = (s: Session, scheduleGc = false): Promise<SealSnapshot> => {
   if (!s.closing) {
     s.closing = s.seal()
   }
-  // Scope post-TTL 25-min GC strictly to auditV2 sessions (or during active SIGUSR2 drain) so legacy v0.9 sessions keep v0.2.2 retention!
-  if (scheduleGc && !s.gcTimer && (s.auditV2 || drainUntil > 0)) {
-    // Start post-TTL GC timer ONLY after seal() finishes publishing the frozen snapshot!
+  if (scheduleGc && !s.gcTimer) {
     void s.closing.then(() => {
       if (!sessions.has(s.id) || s.gcTimer) return
       s.gcTimer = setTimeout(() => {
@@ -69,7 +66,7 @@ const sealSession = (s: Session, scheduleGc = false): Promise<SealSnapshot> => {
         s.reclaim()
         sessions.delete(s.id)
       }, postTtlGcMs)
-      s.gcTimer.unref?.()
+      s.gcTimer.unref()
     }).catch(() => {})
   }
   return s.closing
@@ -95,39 +92,13 @@ function validateAuditV2(raw: unknown): AuditV2Config | undefined {
   }
 }
 
-function enforceRetainedMemoryCeiling(clientName: string) {
-  const usage = () => {
-    let clientBytes = 0
-    let processBytes = 0
-    for (const s of sessions.values()) {
-      // Exclude non-evictable legacy sessions from ceiling accounting (unless draining) so they cannot 503 new auditV2 sessions!
-      if (!s.auditV2 && drainUntil === 0) continue
-      const b = s.getRetainedBytes()
-      processBytes += b
-      if (s.client === clientName) clientBytes += b
-    }
-    return { clientBytes, processBytes }
+function checkSealedCap(clientName: string) {
+  let count = 0
+  for (const s of sessions.values()) {
+    if (s.client === clientName && s.closing) count++
   }
-
-  let { clientBytes, processBytes } = usage()
-  if (clientBytes < maxClientRetainedBytes && processBytes < maxProcessRetainedBytes) return
-
-  // GC ONLY sealed auditV2 sessions whose snapshot has ALREADY finished publishing (never evict legacy non-auditV2 sessions unless draining!)
-  const sealed = [...sessions.values()]
-    .filter(s => s.isSealed() && (Boolean(s.auditV2) || drainUntil > 0))
-    .sort((a, b) => (a.sealedAt ?? 0) - (b.sealedAt ?? 0))
-
-  for (const s of sealed) {
-    if (clientBytes < maxClientRetainedBytes && processBytes < maxProcessRetainedBytes) break
-    if (clientBytes >= maxClientRetainedBytes && s.client !== clientName && processBytes < maxProcessRetainedBytes) continue
-    clearTimeout(s.gcTimer)
-    s.reclaim()
-    sessions.delete(s.id)
-    ;({ clientBytes, processBytes } = usage())
-  }
-
-  if (clientBytes >= maxClientRetainedBytes || processBytes >= maxProcessRetainedBytes) {
-    throw fail(503, 'memory budget exceeded')
+  if (count >= maxSealedPerClient) {
+    throw fail(503, 'too many sealed undrained sessions')
   }
 }
 
@@ -145,7 +116,7 @@ async function open(spec: any, client: typeof clients[number]) {
     throw fail(400, e.message)
   }
   if (site.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
-  enforceRetainedMemoryCeiling(client.name)
+  checkSealedCap(client.name)
 
   const id = crypto.randomBytes(8).toString('hex')
   const s: Session = Object.assign(
@@ -223,7 +194,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   }
 
   if (rest === '/seal' && req.method === 'POST') {
-    const snap = await sealSession(s)
+    const snap = await sealSession(s, true)
     return json(res, 200, snap)
   }
 

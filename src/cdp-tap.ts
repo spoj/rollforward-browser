@@ -625,10 +625,6 @@ export class CdpSessionTap {
     return this.droppedCdp
   }
 
-  getRetainedBytes(): number {
-    return this.bytes
-  }
-
   private countMethod(rawMethod: string) {
     const vault = this.opts.vault
     const name = rawMethod

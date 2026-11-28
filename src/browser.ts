@@ -56,7 +56,8 @@ export type SealSnapshot = {
 }
 
 const MAX_SHOTS = 60
-const MAX_SINGLE_SHOT_JPEG_BYTES = 5 * 1024 * 1024 // guarantees base64 + envelope <= 8 MiB
+const MAX_SHOT_BYTES = 20 * 1024 * 1024
+const MAX_SINGLE_SHOT_JPEG_BYTES = 5 * 1024 * 1024
 const SHOT_SETTLE_MS = 500
 const SHOT_MIN_INTERVAL_MS = 1_500
 const SHOT_BG_WRITE_INTERVAL_MS = 10_000
@@ -147,7 +148,7 @@ export class BrowserSession {
   private stopped = false
   private sealPromise?: Promise<SealSnapshot>
   private sealedSnapshot?: SealSnapshot
-  private stateBytes = 0
+  private shotBytes = 0
 
   // B1 Activity HUD ring buffer (100 entries)
   private hudEvents: HudEvent[] = []
@@ -496,8 +497,10 @@ export class BrowserSession {
         cdpCursor: this.cdpTap?.currentCursor ?? 0,
         jpeg,
       })
-      if (this.shots.length > MAX_SHOTS) {
-        this.shots.shift()
+      this.shotBytes += jpeg.length
+      while (this.shots.length > MAX_SHOTS || (this.shotBytes > MAX_SHOT_BYTES && this.shots.length > 1)) {
+        const evicted = this.shots.shift()!
+        this.shotBytes -= evicted.jpeg.length
         this.shotsDropped++
       }
     } catch {
@@ -553,14 +556,6 @@ export class BrowserSession {
     }
   }
 
-  getRetainedBytes(): number {
-    let total = this.proxy?.controller.getRetainedBytes() ?? 0
-    total += this.cdpTap?.getRetainedBytes() ?? 0
-    for (const s of this.shots) total += s.jpeg.length
-    total += this.stateBytes
-    return total
-  }
-
   seal(): Promise<SealSnapshot> {
     return (this.sealPromise ??= this.doSeal())
   }
@@ -587,10 +582,6 @@ export class BrowserSession {
 
     const cSnap = this.cdpTap?.seal() ?? { cdpCursor: 0, droppedCdp: 0 }
 
-    if (state) {
-      try { this.stateBytes = Buffer.byteLength(JSON.stringify(state), 'utf8') } catch {}
-    }
-
     this.sealedSnapshot = {
       sealed: true,
       state,
@@ -612,10 +603,10 @@ export class BrowserSession {
     this.cdpTap?.clear()
     this.log.length = 0
     this.shots = []
+    this.shotBytes = 0
     this.lastJpeg = undefined
     this.hudEvents = []
     this.vault.clear()
-    this.stateBytes = 0
     if (this.sealedSnapshot) this.sealedSnapshot.state = null
   }
 

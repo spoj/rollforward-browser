@@ -262,7 +262,6 @@ export type ProxyController = {
     entries: LogRecord[]
   }
   getCurrentCursor: () => number
-  getRetainedBytes: () => number
   clear: () => void
 }
 
@@ -2630,7 +2629,6 @@ export function startProxy(
       return { oldestCursor, nextCursor, hasMore, dropped: droppedGets, entries: out }
     },
     getCurrentCursor: () => cursorCounter,
-    getRetainedBytes: () => logBytes + tailLogBytes,
     clear: () => {
       log.length = 0
       logBytes = 0
