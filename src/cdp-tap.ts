@@ -553,7 +553,6 @@ type CoalesceSlot = {
   timer: NodeJS.Timeout
 }
 
-const PW_UTILITY_WRAPPER = '(utilityScript, ...args) => utilityScript.evaluate(...args)'
 const DEFAULT_CDP_PARSER_BUDGET = 1024 * 1024 // 1 MiB dedicated per-session CDP parser budget (isolated from HTTP proxy & drive tap)
 const RESERVED_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
@@ -810,64 +809,15 @@ export class CdpSessionTap {
       const fnLen = Buffer.byteLength(fn, 'utf8')
       const fnHash64 = hash64(fn)
       const args = Array.isArray(params.arguments) ? params.arguments : []
-      // Require EXACT match on Playwright 1.64's utilityScript.evaluate wrapper (defeats comment-smuggling impostors!)
-      const isPwUtility =
-        fn === PW_UTILITY_WRAPPER &&
-        args.length >= 5 &&
-        typeof (args[1] as any)?.value === 'boolean' &&
-        typeof (args[2] as any)?.value === 'boolean' &&
-        typeof (args[3] as any)?.value === 'string' &&
-        typeof (args[4] as any)?.value === 'number'
-
       const isAllowlistedInjected = rawSha256 ? this.opts.injectedScriptSha256Allowlist?.has(rawSha256) === true : false
-
-      if (isPwUtility) {
-        const isFunction = (args[1] as any).value as boolean
-        const returnByValue = (args[2] as any).value as boolean
-        const expr = (args[3] as any).value as string
-        const argc = (args[4] as any).value as number
-        const userArgs = args.slice(5)
-        const isFillOrType = /\b(?:fill|type)\b/i.test(expr)
-        const previewBudgetBytes = { left: 1024 }
-        const argSummary = userArgs.slice(0, 16).map(a => {
-          const r = summarizeArg(a, samples && !isFillOrType, vault, previewBudgetBytes)
-          vaultRedactions += r.vaultRedactions
-          return r.item
-        })
-        summary = {
-          wrapper: 'playwright-utility',
-          fnLen,
-          fnHash64,
-          isFunction,
-          returnByValue,
-          argc,
-          exprLen: Buffer.byteLength(expr, 'utf8'),
-          exprHash64: hash64(expr),
-          ...(argSummary.length > 0 && { argSummary }),
-          ...(samples && { expr: scrubSampleExpr(expr) }),
-        }
-        if ((Buffer.byteLength(expr, 'utf8') > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
-          severity = 'high'
-        }
-      } else {
-        const previewBudgetBytes = { left: 1024 }
-        const argSummary = args.slice(0, 16).map(a => {
-          const r = summarizeArg(a, samples, vault, previewBudgetBytes)
-          vaultRedactions += r.vaultRedactions
-          return r.item
-        })
-        const isImpostor = fn.includes('utilityScript.evaluate')
-        summary = {
-          wrapper: isImpostor ? 'impostor' : 'custom',
-          fnLen,
-          fnHash64,
-          argCount: args.length,
-          ...(argSummary.length > 0 && { argSummary }),
-          ...(samples && { fn: scrubSampleExpr(fn) }),
-        }
-        if (isImpostor || ((fnLen > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected)) {
-          severity = 'high'
-        }
+      summary = {
+        fnLen,
+        fnHash64,
+        argCount: args.length,
+        ...(samples && fn && { fn: scrubSampleExpr(fn) }),
+      }
+      if ((fnLen > 16_384 || (rawTotalBytes ?? 0) > 16_384) && !isAllowlistedInjected) {
+        severity = 'high'
       }
     } else if (rawMethod === 'Runtime.evaluate' || rawMethod === 'Page.addScriptToEvaluateOnNewDocument') {
       capture = true
