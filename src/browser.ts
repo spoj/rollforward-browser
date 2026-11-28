@@ -63,6 +63,15 @@ const SHOT_BG_WRITE_INTERVAL_MS = 10_000
 const MAX_SHOTS_PAGE_BYTES = 8 * 1024 * 1024
 const LIVE_COOLDOWN_MS = 5_000
 const MAX_HUD_EVENTS = 100
+const SEAL_STEP_TIMEOUT_MS = 10_000
+
+const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> => {
+  let timer: NodeJS.Timeout | undefined
+  return Promise.race([
+    p.catch(() => fallback),
+    new Promise<T>(r => { timer = setTimeout(() => r(fallback), ms); timer.unref() }),
+  ]).finally(() => clearTimeout(timer))
+}
 
 const pem = execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-subj', '/CN=rollforward-browser', '-days', '3650', '-keyout', '-', '-out', '-'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString()
 const tlsKey = { key: pem.slice(0, pem.indexOf('-----BEGIN CERTIFICATE')), cert: pem.slice(pem.indexOf('-----BEGIN CERTIFICATE')) }
@@ -92,6 +101,7 @@ export type BrowserSessionOptions = {
   inFlightTracker?: InFlightBudgetTracker
   clientId?: string
   policyHook?: PolicyHookConfig
+  sealTimeoutMs?: number
 }
 
 export class BrowserSession {
@@ -565,11 +575,12 @@ export class BrowserSession {
     // so in-flight writes record dispatch:'unknown' and accurate incompleteAtSeal counts!
     const pSnap = this.proxy?.controller.finalizeAtSeal() ?? { logCursor: 0, droppedGets: 0, refusedFull: 0 }
 
+    const timeoutMs = this.opts.sealTimeoutMs ?? SEAL_STEP_TIMEOUT_MS
     let state: unknown = null
     try {
-      state = this.pw?.isConnected() ? await this.pw.contexts()[0].storageState().catch(() => null) : null
+      state = this.pw?.isConnected() ? await withTimeout(this.pw.contexts()[0].storageState(), timeoutMs, null) : null
     } finally {
-      await this.pw?.close().catch(() => {})
+      if (this.pw) await withTimeout(this.pw.close(), timeoutMs, undefined)
       await podman(['rm', '-f', '-i', '-t', '0', this.container]).catch(() => {})
       fs.rmSync(this.dir, { recursive: true, force: true })
     }
