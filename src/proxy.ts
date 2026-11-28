@@ -262,7 +262,7 @@ export function startProxy(
   const siteName = opts?.siteName ?? (site.start_url ? URL.parse(site.start_url)?.hostname : undefined) ?? site.hosts[0] ?? 'site'
   const byteBudget = opts?.byteBudget ?? new ByteBudget()
   const prefixTimeoutMs = opts?.prefixTimeoutMs ?? 10_000
-  const streamTimeoutMs = opts?.streamTimeoutMs ?? 30_000
+  const streamTimeoutMs = opts?.streamTimeoutMs ?? 35_000
   const maxLogBytes = opts?.maxLogBytes ?? 6 * 1024 * 1024
   const isLiveNow = opts?.isLiveOrCooldown ?? isLive
 
@@ -401,7 +401,7 @@ export function startProxy(
     const isSiteWrite = scrubbed.isWrite && matches(site.hosts, scrubbed.authority.split(':')[0])
 
     if (bytes > avail) {
-      if (!isSiteWrite && !scrubbed.blocked && !scrubbed.error) droppedGets++
+      if (!isSiteWrite) droppedGets++
       else refusedFullCount++
       return null
     }
