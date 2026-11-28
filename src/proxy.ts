@@ -786,6 +786,7 @@ export function startProxy(
   const activeAbortControllers = new Set<AbortController>()
 
   const matches = (list: string[], host: string) => list.some(h => h.toLowerCase() === host || h.startsWith('*.') && host.endsWith(h.slice(1).toLowerCase()))
+  const isSiteHost = (url: URL | null) => Boolean(url && matches(site.hosts, url.hostname))
   const exact = (host: string) => site.hosts.some(h => h.toLowerCase() === host)
   const via = (host: string) => !!site.via && matches(site.via.hosts, host.replace(/\.$/, ''))
   const origin = site.start_url && new URL(site.start_url).origin
@@ -955,7 +956,8 @@ export function startProxy(
 
     // Account for OTHER concurrent requests' active reservations!
     const avail = normalLimit() - logBytes - reservedBytes
-    if (!draft.isWrite && !draft.blocked && !draft.error && avail < MINIMAL_RESERVE_BYTES) {
+    const isSiteWrite = draft.isWrite && matches(site.hosts, draft.authority.split(':')[0])
+    if (!isSiteWrite && !draft.blocked && !draft.error && avail < MINIMAL_RESERVE_BYTES) {
       droppedGets++
       return null
     }
@@ -978,7 +980,7 @@ export function startProxy(
 
     // Strict hard-ceiling guard (even unreserved denials/417s cannot overshoot maxLogHardBytes - TAIL_RESERVE_BYTES)
     if (bytes > avail) {
-      if (!finalEntry.isWrite && !finalEntry.blocked && !finalEntry.error) droppedGets++
+      if (!isSiteWrite && !finalEntry.blocked && !finalEntry.error) droppedGets++
       else refusedFullCount++
       return null
     }
@@ -1517,8 +1519,8 @@ export function startProxy(
       return
     }
 
-    // Reserve log space atomically before dispatching writes
-    if (arrival.isWrite) {
+    // Reserve log space atomically before dispatching writes to site.hosts; other writes count-and-drop
+    if (arrival.isWrite && isSiteHost(url)) {
       reserved = tryReserveLogSpace()
       if (reserved < 0) {
         reserved = 0
@@ -2315,17 +2317,18 @@ export function startProxy(
         return
       }
 
-      // Reserve log capacity for upgrades (especially write-classified upgrades) before policy/upstream dispatch!
-      reserved = tryReserveLogSpace()
-      if (reserved < 0) {
-        reserved = 0
-        committed = true
-        activeInFlight.delete(seq)
-        cleanupAbort()
-        refusedFullCount++
-        const fullJson = JSON.stringify({ error: 'audit log full' })
-        socket.end(`HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(fullJson)}\r\nconnection: close\r\n\r\n${fullJson}`)
-        return
+      if (arrival.isWrite && isSiteHost(url)) {
+        reserved = tryReserveLogSpace()
+        if (reserved < 0) {
+          reserved = 0
+          committed = true
+          activeInFlight.delete(seq)
+          cleanupAbort()
+          refusedFullCount++
+          const fullJson = JSON.stringify({ error: 'audit log full' })
+          socket.end(`HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(fullJson)}\r\nconnection: close\r\n\r\n${fullJson}`)
+          return
+        }
       }
 
       const activeHook = selectActiveHook(policyHook, liveAtStart)
