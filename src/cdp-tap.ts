@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { page } from './page.ts'
 import {
   isDataLikeKey,
   isSensitiveValue,
@@ -556,7 +557,6 @@ export type CdpTapOptions = {
   maxParserBytes?: number
   injectedScriptSha256Allowlist?: Set<string>
   charger?: BudgetCharger
-  onEvent?: (entry: CdpEntry) => void
   onFileUpload?: () => void
 }
 
@@ -658,7 +658,6 @@ export class CdpSessionTap {
     const scrubbed = scrubDeep(capped.entry, this.opts.vault)
     this.entries.push(scrubbed)
     this.bytes += capped.bytes
-    this.opts.onEvent?.(scrubbed)
     return scrubbed
   }
 
@@ -1040,40 +1039,8 @@ export class CdpSessionTap {
     return { cdpCursor: this.cursor, droppedCdp: this.droppedCdp }
   }
 
-  getPage(after: number, limit = 500): {
-    oldestCursor: number
-    nextCursor: number
-    hasMore: boolean
-    dropped: number
-    entries: CdpLogRecord[]
-  } {
-    const cappedLimit = Math.min(500, Math.max(1, limit))
-    const oldestCursor = this.entries.length ? this.entries[0].n : this.cursor
-    const out: CdpLogRecord[] = []
-    let pageBytes = 128 // envelope overhead
-    let lastCheckedIdx = -1
-
-    for (let i = 0; i < this.entries.length; i++) {
-      const e = this.entries[i]
-      if (e.n <= after) continue
-      const size = Buffer.byteLength(JSON.stringify(e), 'utf8') + 1
-      if (out.length > 0 && (out.length >= cappedLimit || pageBytes + size > MAX_PAGE_BYTES)) {
-        break
-      }
-      out.push(e)
-      pageBytes += size
-      lastCheckedIdx = i
-    }
-
-    const hasMore = lastCheckedIdx >= 0 && lastCheckedIdx < this.entries.length - 1
-    const nextCursor = out.length > 0 ? out[out.length - 1].n : Math.max(after, oldestCursor)
-    return {
-      oldestCursor,
-      nextCursor,
-      hasMore,
-      dropped: this.droppedCdp,
-      entries: out,
-    }
+  getPage(after: number, limit = 500) {
+    return page(this.entries, e => e.n, this.cursor, after, Math.min(500, Math.max(1, limit)), MAX_PAGE_BYTES, this.droppedCdp)
   }
 
   clear(): void {

@@ -4,8 +4,9 @@ import fs from 'node:fs'
 import http from 'node:http'
 import { chromium, type Browser, type Page } from 'playwright-core'
 import { CdpSessionTap, type CdpEntry } from './cdp-tap.ts'
+import { page } from './page.ts'
 import {
-  InFlightBudgetTracker,
+  ByteBudget,
   startProxy,
   type AuditV2Config,
   type LogRecord,
@@ -13,7 +14,7 @@ import {
   type Site,
   type V2Entry,
 } from './proxy.ts'
-import { SecretVault, isAuthUrl, sanitizeUrl, scrubDeep, scrubText } from './redact.ts'
+import { SecretVault, isAuthUrl, sanitizeUrl, scrubDeep } from './redact.ts'
 
 export type ShotTrigger = 'nav' | 'load' | 'write' | 'download' | 'tab' | 'file-upload'
 
@@ -30,7 +31,7 @@ export type AuditShot = {
 export type HudEvent = {
   n: number
   t: string
-  kind: 'http' | 'cdp' | 'live_start' | 'live_end'
+  kind: 'http' | 'cdp'
   method?: string
   status?: number
   blocked?: string
@@ -61,8 +62,8 @@ const SHOT_MIN_INTERVAL_MS = 1_500
 const SHOT_BG_WRITE_INTERVAL_MS = 10_000
 const MAX_SHOTS_PAGE_BYTES = 8 * 1024 * 1024
 const LIVE_COOLDOWN_MS = 5_000
-const MAX_HUD_EVENTS = 100
 const SEAL_STEP_TIMEOUT_MS = 10_000
+const HUD_CURSOR_STRIDE = 1_000_000
 
 const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> => {
   let timer: NodeJS.Timeout | undefined
@@ -97,8 +98,7 @@ const cdpVersion = (sock: string) => new Promise<string>((resolve, reject) =>
 
 export type BrowserSessionOptions = {
   auditV2?: AuditV2Config
-  inFlightTracker?: InFlightBudgetTracker
-  clientId?: string
+  byteBudget?: ByteBudget
   sealTimeoutMs?: number
 }
 
@@ -145,12 +145,6 @@ export class BrowserSession {
   private sealedSnapshot?: SealSnapshot
   private shotBytes = 0
 
-  // B1 Activity HUD ring buffer (100 entries)
-  private hudEvents: HudEvent[] = []
-  private hudCursor = 0
-  private hudWriteCount = 0
-  private hudBlockedCount = 0
-
   constructor(id: string, dir: string, label: string, site: Site, audit = false, opts: BrowserSessionOptions = {}) {
     this.id = id
     this.dir = dir
@@ -175,7 +169,6 @@ export class BrowserSession {
         projection: this.auditV2.projection ?? 'semantic',
         vault: this.vault,
         isLive: () => this.isLiveOrCooldown(),
-        onEvent: e => this.recordHudCdp(e),
         onFileUpload: () => this.scheduleShot(undefined, 'file-upload', false),
       })
     }
@@ -196,74 +189,82 @@ export class BrowserSession {
     return a.length === b.length && crypto.timingSafeEqual(a, b)
   }
 
-  private pushHudEvent(ev: Omit<HudEvent, 'n'>) {
-    if (!this.auditV2 || this.auditV2.hud === false) return
-    const item: HudEvent = { n: ++this.hudCursor, ...ev }
-    this.hudEvents.push(item)
-    if (this.hudEvents.length > MAX_HUD_EVENTS) {
-      this.hudEvents.shift()
-    }
-  }
-
-  private recordHudHttp(rec: LogRecord) {
-    if (!this.auditV2 || this.auditV2.hud === false) return
-    const r = rec as any
-    if (r.rec === '_summary' || r.rec === 'http_end') return
-    // Suppress live, liveAtEnd, and 5s cooldown at insertion (§4)
-    if (this.isLiveOrCooldown() || r.live || r.liveAtEnd) return
-    const e = rec as V2Entry
-    if (e.isWrite) this.hudWriteCount++
-    if (e.blocked) this.hudBlockedCount++
-    const rawDetail = e.authority ? `${e.authority}${e.path}` : e.path || '/'
-    const detail = scrubDeep(scrubText(rawDetail.slice(0, 160)).text, this.vault)
-    this.pushHudEvent({
-      t: e.t,
-      kind: 'http',
-      method: e.effectiveMethod ?? e.method,
-      status: e.status,
-      ...(e.blocked && { blocked: e.blocked }),
-      ...(e.isWrite && { isWrite: true }),
-      detail,
-    })
-  }
-
-  private recordHudCdp(entry: CdpEntry) {
-    if (!this.auditV2 || this.auditV2.hud === false) return
-    if (this.isLiveOrCooldown() || entry.live) return
-    let hostPath = ''
-    if (typeof entry.summary?.url === 'string') {
-      const parsed = URL.parse(entry.summary.url)
-      if (parsed) {
-        const san = sanitizeUrl(parsed, { projection: 'semantic' })
-        hostPath = ` ${san.authority}${san.path}`
-      }
-    }
-    const detail = scrubDeep(scrubText(`${entry.method}${hostPath}`.slice(0, 160)).text, this.vault)
-    this.pushHudEvent({
-      t: entry.t,
-      kind: 'cdp',
-      method: entry.method,
-      ...(entry.severity && { severity: entry.severity }),
-      detail,
-    })
-  }
-
   getActivity(after: number) {
-    const oldestCursor = this.hudEvents.length ? this.hudEvents[0].n : this.hudCursor
-    const events = this.hudEvents.filter(e => e.n > after)
-    // Report dropped count strictly relative to caller's `after` cursor!
-    const dropped = this.hudEvents.length > 0
-      ? Math.max(0, (this.hudEvents[0].n - 1) - after)
-      : Math.max(0, this.hudCursor - after)
-    const nextCursor = events.length ? events[events.length - 1].n : Math.max(after, oldestCursor)
+    const afterHttp = Math.floor(after / HUD_CURSOR_STRIDE)
+    const afterCdp = after % HUD_CURSOR_STRIDE
+    let writeCount = 0
+    let blockedCount = 0
+    let latestHttp = afterHttp
+    let latestCdp = afterCdp
+
+    const raw: Array<Omit<HudEvent, 'n'> & { srcN: number }> = []
+    const httpTail: V2Entry[] = []
+    for (const r of this.log) {
+      if (r.rec === '_summary' || r.rec === 'http_end') continue
+      if (r.live || r.liveAtEnd) continue
+      if (r.isWrite) writeCount++
+      if (r.blocked) blockedCount++
+      if (r.n > latestHttp) latestHttp = r.n
+      if (r.n > afterHttp) httpTail.push(r)
+    }
+    for (const e of httpTail.slice(-100)) {
+      const detail = (e.authority ? `${e.authority}${e.path}` : e.path || '/').slice(0, 160)
+      raw.push({
+        srcN: e.n,
+        t: e.t,
+        kind: 'http',
+        method: e.effectiveMethod ?? e.method,
+        status: e.status,
+        ...(e.blocked && { blocked: e.blocked }),
+        ...(e.isWrite && { isWrite: true }),
+        detail,
+      })
+    }
+
+    const cdpTail: CdpEntry[] = []
+    for (const r of this.cdpTap?.entries ?? []) {
+      if (r.rec === '_tap.summary' || r.live) continue
+      if (r.n > latestCdp) latestCdp = r.n
+      if (r.n > afterCdp) cdpTail.push(r)
+    }
+    for (const e of cdpTail.slice(-100)) {
+      let hostPath = ''
+      if (typeof e.summary?.url === 'string') {
+        const parsed = URL.parse(e.summary.url)
+        if (parsed) {
+          const san = sanitizeUrl(parsed, { projection: 'semantic' })
+          hostPath = ` ${san.authority}${san.path}`
+        }
+      }
+      raw.push({
+        srcN: e.n,
+        t: e.t,
+        kind: 'cdp',
+        method: e.method,
+        ...(e.severity && { severity: e.severity }),
+        detail: `${e.method}${hostPath}`.slice(0, 160),
+      })
+    }
+
+    raw.sort((a, b) => a.t.localeCompare(b.t))
+    let h = afterHttp
+    let c = afterCdp
+    const merged: HudEvent[] = raw.map(({ srcN, ...rest }) => {
+      if (rest.kind === 'http') h = Math.max(h, srcN)
+      else c = Math.max(c, srcN)
+      return { n: h * HUD_CURSOR_STRIDE + c, ...rest }
+    })
+
+    const cur = latestHttp * HUD_CURSOR_STRIDE + latestCdp
+    const p = page(merged, e => e.n, cur, after, 100, 256 * 1024, 0)
     return {
       live: this.drivers > 0,
-      oldestCursor,
-      nextCursor,
-      dropped,
-      writeCount: this.hudWriteCount,
-      blockedCount: this.hudBlockedCount,
-      events,
+      oldestCursor: p.oldestCursor,
+      nextCursor: p.nextCursor,
+      dropped: p.dropped,
+      writeCount,
+      blockedCount,
+      events: p.entries,
     }
   }
 
@@ -271,15 +272,12 @@ export class BrowserSession {
     if (state) this.vault.ingestStorageState(state)
     fs.mkdirSync(this.dir, { mode: 0o700 })
     const proxyOpts = {
-      sessionId: this.id,
-      clientId: this.opts.clientId ?? 'default',
       auditV2: this.auditV2,
       vault: this.vault,
       getCdpCursor: () => this.cdpTap?.currentCursor ?? 0,
       isLiveOrCooldown: () => this.isLiveOrCooldown(),
-      onEntry: (entry: LogRecord) => this.recordHudHttp(entry),
       onWriteDetail: this.audit ? ({ dest }: { dest?: string }) => this.scheduleShot(undefined, 'write', dest === 'empty') : undefined,
-      inFlightTracker: this.opts.inFlightTracker,
+      byteBudget: this.opts.byteBudget,
     }
     this.proxy = startProxy(
       `${this.dir}/proxy.sock`,
@@ -332,7 +330,6 @@ export class BrowserSession {
   }
 
   onDriverStart() {
-    const wasIdle = this.drivers === 0
     this.drivers++
     this.driverGen++
     this.taintOpenPages()
@@ -342,9 +339,6 @@ export class BrowserSession {
     this.shotPriority = 0
     this.pendingShot = false
     this.pendingShotPriority = 0
-    if (wasIdle) {
-      this.pushHudEvent({ t: new Date().toISOString(), kind: 'live_start', detail: 'Human took control' })
-    }
   }
 
   onDriverEnd() {
@@ -352,9 +346,6 @@ export class BrowserSession {
     this.drivers = Math.max(0, this.drivers - 1)
     this.driverGen++
     this.lastDriverEndedAt = Date.now()
-    if (this.drivers === 0) {
-      this.pushHudEvent({ t: new Date().toISOString(), kind: 'live_end', detail: 'Control returned' })
-    }
   }
 
   private scheduleShot(page?: Page, trigger: ShotTrigger = 'nav', bgWrite = false) {
@@ -459,42 +450,16 @@ export class BrowserSession {
   }
 
   getShotsV2(after: number) {
-    const oldestSeq = this.shots.length ? this.shots[0].seq : this.shotSeq
-    const dropped = this.shots.length > 0
-      ? Math.max(0, (this.shots[0].seq - 1) - after)
-      : Math.max(0, this.shotSeq - after)
-    const items: Array<{ seq: number; at: string; url: string; trigger: ShotTrigger; httpCursor: number; cdpCursor: number; jpeg: string }> = []
-    let pageBytes = 128 // envelope overhead
-    let lastIdx = -1
-
-    for (let i = 0; i < this.shots.length; i++) {
-      const s = this.shots[i]
-      if (s.seq <= after) continue
-      const item = {
-        seq: s.seq,
-        at: s.at,
-        url: s.url,
-        trigger: s.trigger,
-        httpCursor: s.httpCursor,
-        cdpCursor: s.cdpCursor,
-        jpeg: s.jpeg.toString('base64'),
-      }
-      const entryBytes = Buffer.byteLength(JSON.stringify(item), 'utf8') + 1
-      if (items.length > 0 && pageBytes + entryBytes > MAX_SHOTS_PAGE_BYTES) break
-      items.push(item)
-      pageBytes += entryBytes
-      lastIdx = i
-    }
-
-    const hasMore = lastIdx >= 0 && lastIdx < this.shots.length - 1
-    const nextSeq = items.length > 0 ? items[items.length - 1].seq : Math.max(after, oldestSeq)
-    return {
-      oldestSeq,
-      nextSeq,
-      hasMore,
-      dropped,
-      items,
-    }
+    const p = page(this.shots, s => s.seq, this.shotSeq, after, 50, MAX_SHOTS_PAGE_BYTES, this.shotsDropped, s => ({
+      seq: s.seq,
+      at: s.at,
+      url: s.url,
+      trigger: s.trigger,
+      httpCursor: s.httpCursor,
+      cdpCursor: s.cdpCursor,
+      jpeg: s.jpeg.toString('base64'),
+    }))
+    return { oldestSeq: p.oldestCursor, nextSeq: p.nextCursor, hasMore: p.hasMore, dropped: p.dropped, items: p.entries }
   }
 
   seal(): Promise<SealSnapshot> {
@@ -546,7 +511,6 @@ export class BrowserSession {
     this.shots = []
     this.shotBytes = 0
     this.lastJpeg = undefined
-    this.hudEvents = []
     this.vault.clear()
     if (this.sealedSnapshot) this.sealedSnapshot.state = null
   }

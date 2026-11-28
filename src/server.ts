@@ -7,7 +7,7 @@ import { domainToASCII } from 'node:url'
 import { BrowserSession, podman, type SealSnapshot } from './browser.ts'
 import { blocklist, isBlocked, loadBlocklists } from './blocklists.ts'
 import { createDriveVaultTap } from './cdp-tap.ts'
-import { InFlightBudgetTracker, type AuditV2Config, type V2Entry } from './proxy.ts'
+import { ByteBudget, type AuditV2Config, type V2Entry } from './proxy.ts'
 
 const VERSION = '0.3.0'
 const port = Number(process.env.BROWSER_PORT ?? 8797)
@@ -27,9 +27,7 @@ if (new Set(clients.map(c => c.name)).size !== clients.length || new Set(clients
 const runDir = `${os.tmpdir()}/rollforward-browser-${port}`
 const label = `rollforward-browser=${port}`
 const viewPage = fs.readFileSync(new URL('view.html', import.meta.url))
-const inFlightTracker = new InFlightBudgetTracker()
-// Dedicated /view/drive parser budget (256 KiB/session, 1 MiB/client, 8 MiB/process), isolated from HTTP proxy & external CDP!
-const driveParserTracker = new InFlightBudgetTracker(8 * 1024 * 1024, 1 * 1024 * 1024, 256 * 1024)
+const byteBudget = new ByteBudget()
 
 type Session = BrowserSession & {
   client: string
@@ -128,8 +126,7 @@ async function open(spec: any, client: typeof clients[number]) {
   const s: Session = Object.assign(
     new BrowserSession(id, `${runDir}/${id}`, label, siteCfg, spec.audit === true, {
       auditV2,
-      inFlightTracker,
-      clientId: client.name,
+      byteBudget,
     }),
     { client: client.name },
   )
@@ -334,13 +331,6 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   if (rest === '/view/watch') {
     watchOnly(socket, up, head)
   } else {
-    // Shared per-session/client/process /view/drive parser budget (isolated from HTTP proxy & external CDP!)
-    const driveCharger = tapDriveVault
-      ? {
-          tryAcquire: (b: number) => driveParserTracker.tryAcquire(client.name, s.id, b),
-          release: (b: number) => driveParserTracker.release(client.name, s.id, b),
-        }
-      : undefined
     const onTapError = () => {
       socket.destroy()
       up.destroy()
@@ -350,7 +340,7 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
       : tapDriveVault
         ? (s.cdpTap
             ? s.cdpTap.attachConnection({ live: true, driveVault: true, onError: onTapError })
-            : createDriveVaultTap(s.vault, driveCharger, onTapError))
+            : createDriveVaultTap(s.vault, undefined, onTapError))
         : undefined
     if (tap && head.length) {
       tap.feed(head)

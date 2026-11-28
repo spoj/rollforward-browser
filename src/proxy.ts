@@ -5,6 +5,7 @@ import net from 'node:net'
 import dns from 'node:dns'
 import { Duplex } from 'node:stream'
 import { isBlocked } from './blocklists.ts'
+import { page } from './page.ts'
 import {
   EXTRACTOR_V,
   MAX_PREFIX_BYTES,
@@ -90,7 +91,6 @@ export type V2Entry = SafeRequestProjection & {
   dispatch: 'not_dispatched' | 'dispatched' | 'unknown'
   liveAtEnd?: true
   incomplete?: true
-  logCapped?: true
 }
 
 export type LateOutcomeEntry = {
@@ -109,7 +109,6 @@ export type SummaryEntry = {
   n: number
   rec: '_summary'
   t: string
-  collapsedGets: Record<string, { count: number; bytes: number }>
   droppedGets: number
   refusedFullCount: number
   incompleteAtSeal: number
@@ -119,75 +118,41 @@ export type SummaryEntry = {
 export type LogRecord = V2Entry | LateOutcomeEntry | SummaryEntry
 export type Entry = V2Entry
 
-export class InFlightBudgetTracker {
-  private processBytes = 0
-  private clientBytes = new Map<string, number>()
-  private sessionBytes = new Map<string, number>()
-  readonly maxProcessBytes: number
-  readonly maxClientBytes: number
-  readonly maxSessionBytes: number
+export class ByteBudget {
+  private used = 0
+  readonly maxBytes: number
 
-  constructor(
-    maxProcessBytes = 32 * 1024 * 1024,
-    maxClientBytes = 4 * 1024 * 1024,
-    maxSessionBytes = 1 * 1024 * 1024,
-  ) {
-    this.maxProcessBytes = maxProcessBytes
-    this.maxClientBytes = maxClientBytes
-    this.maxSessionBytes = maxSessionBytes
+  constructor(maxBytes = 32 * 1024 * 1024) {
+    this.maxBytes = maxBytes
   }
 
-  tryAcquire(clientId: string, sessionId: string, bytes: number): boolean {
+  tryAcquire(bytes: number): boolean {
     if (bytes <= 0) return true
-    const cCur = this.clientBytes.get(clientId) ?? 0
-    const sCur = this.sessionBytes.get(sessionId) ?? 0
-    if (
-      this.processBytes + bytes > this.maxProcessBytes ||
-      cCur + bytes > this.maxClientBytes ||
-      sCur + bytes > this.maxSessionBytes
-    ) {
-      return false
-    }
-    this.processBytes += bytes
-    this.clientBytes.set(clientId, cCur + bytes)
-    this.sessionBytes.set(sessionId, sCur + bytes)
+    if (this.used + bytes > this.maxBytes) return false
+    this.used += bytes
     return true
   }
 
-  release(clientId: string, sessionId: string, bytes: number): void {
-    if (bytes <= 0) return
-    this.processBytes = Math.max(0, this.processBytes - bytes)
-    const cNext = Math.max(0, (this.clientBytes.get(clientId) ?? 0) - bytes)
-    if (cNext === 0) this.clientBytes.delete(clientId)
-    else this.clientBytes.set(clientId, cNext)
-    const sNext = Math.max(0, (this.sessionBytes.get(sessionId) ?? 0) - bytes)
-    if (sNext === 0) this.sessionBytes.delete(sessionId)
-    else this.sessionBytes.set(sessionId, sNext)
+  release(bytes: number): void {
+    if (bytes > 0) this.used = Math.max(0, this.used - bytes)
   }
 
-  getProcessBytes(): number {
-    return this.processBytes
+  getUsedBytes(): number {
+    return this.used
   }
 }
 
 export type ProxyV2Options = {
   siteName?: string
-  sessionId?: string
-  clientId?: string
   auditV2?: AuditV2Config
   vault?: SecretVault
   getCdpCursor?: () => number
   isLiveOrCooldown?: () => boolean
-  onEntry?: (entry: LogRecord) => void
   onWriteDetail?: (info: { dest?: string; isWrite: boolean }) => void
-  inFlightTracker?: InFlightBudgetTracker
+  byteBudget?: ByteBudget
   prefixTimeoutMs?: number
   streamTimeoutMs?: number
-  maxLogSoftBytes?: number
-  maxLogHardBytes?: number
-  maxSampleBytes?: number
-  collapseGetsAfterBytes?: number
-  collapseGetsAfterEntries?: number
+  maxLogBytes?: number
 }
 
 export type ProxyController = {
@@ -212,7 +177,6 @@ type Target = { scheme: string, authority: string }
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 const OVERRIDE_HEADERS = ['x-http-method', 'x-http-method-override', 'x-method-override'] as const
 const VALID_VERB_RE = /^[A-Z]{3,16}$/
-const STATIC_DESTS = new Set(['image', 'font', 'style', 'script', 'audio', 'video'])
 const ALLOWED_FETCH_DESTS = new Set([
   'audio', 'audioworklet', 'document', 'embed', 'empty', 'fencedframe', 'font', 'frame',
   'iframe', 'image', 'manifest', 'object', 'paintworklet', 'report', 'script',
@@ -220,10 +184,7 @@ const ALLOWED_FETCH_DESTS = new Set([
 ])
 
 const MAX_ENTRY_BYTES = 12 * 1024
-const MINIMAL_RESERVE_BYTES = 1024
-const TAIL_RESERVE_BYTES = 64 * 1024
 const MAX_PAGE_BYTES = 4 * 1024 * 1024
-const MAX_COLLAPSE_BUCKETS = 64
 
 const internal = new net.BlockList(), never = new net.BlockList()
 for (const [a, n] of [['0.0.0.0', 8], ['127.0.0.0', 8], ['169.254.0.0', 16], ['168.63.129.16', 32]] as const) for (const l of [internal, never]) l.addSubnet(a, n, 'ipv4')
@@ -291,134 +252,6 @@ function parseDeclaredBytes(headers: Record<string, string | string[] | undefine
   return Number.isInteger(n) && n >= 0 ? n : undefined
 }
 
-function capEntryTo12KiB(entry: V2Entry): { entry: V2Entry; bytes: number } {
-  let bytes = Buffer.byteLength(JSON.stringify(entry), 'utf8')
-  if (bytes <= MAX_ENTRY_BYTES) return { entry, bytes }
-
-  const copy: V2Entry = { ...entry }
-  if (copy.reqBody !== undefined) {
-    const excess = bytes - MAX_ENTRY_BYTES + 128
-    const curBodyBytes = Buffer.byteLength(copy.reqBody, 'utf8')
-    const targetBytes = Math.max(0, curBodyBytes - excess)
-    if (targetBytes <= 64) {
-      delete copy.reqBody
-      copy.reqTrunc = true
-    } else {
-      copy.reqBody = truncateUtf8HeadTail(copy.reqBody, targetBytes)
-      copy.reqTrunc = true
-    }
-    bytes = Buffer.byteLength(JSON.stringify(copy), 'utf8')
-    if (bytes <= MAX_ENTRY_BYTES) return { entry: copy, bytes }
-  }
-
-  if (copy.bodyShape) {
-    const keys = Object.keys(copy.bodyShape)
-    if (keys.length > 16) {
-      const trimmed: Record<string, string> = {}
-      for (const k of keys.slice(0, 16)) trimmed[k] = copy.bodyShape[k]
-      copy.bodyShape = trimmed
-    } else {
-      delete copy.bodyShape
-    }
-    copy.reqTrunc = true
-    bytes = Buffer.byteLength(JSON.stringify(copy), 'utf8')
-    if (bytes <= MAX_ENTRY_BYTES) return { entry: copy, bytes }
-  }
-
-  if (copy.actions.length) {
-    copy.actions = copy.actions.slice(0, 4).map(a => ({
-      family: a.family,
-      op: a.op,
-      ...(a.resource && { resource: truncateUtf8HeadTail(a.resource, 256) }),
-      coverage: a.coverage,
-    }))
-    bytes = Buffer.byteLength(JSON.stringify(copy), 'utf8')
-    if (bytes <= MAX_ENTRY_BYTES) return { entry: copy, bytes }
-  }
-
-  const minimal = toMinimalCappedEntry(copy)
-  return { entry: minimal, bytes: Buffer.byteLength(JSON.stringify(minimal), 'utf8') }
-}
-
-// Guaranteed <= MINIMAL_RESERVE_BYTES minimal record preserving full hostname in origin+pathname for checkRefused whenever it fits!
-function toMinimalCappedEntry(e: V2Entry): V2Entry {
-  let pathMax = 80
-  let msgMax = 48
-  let authMax = 255
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const p = truncateUtf8HeadTail(e.path || '/', pathMax)
-    const authority = truncateUtf8HeadTail(e.authority || '', authMax)
-    const originPath = authority ? `${e.scheme}://${authority}${p}` : truncateUtf8HeadTail(e.url, pathMax)
-    const minimal: V2Entry = {
-      n: e.n,
-      descV: DESC_V,
-      redactV: REDACT_V,
-      extractorV: EXTRACTOR_V,
-      surface: e.surface,
-      target: 'site' in e.target ? { site: truncateUtf8HeadTail(e.target.site, 32) } : e.target,
-      seq: e.seq,
-      t: e.t,
-      kind: e.kind,
-      scheme: e.scheme,
-      authority,
-      path: p,
-      url: originPath,
-      method: e.method.slice(0, 16),
-      effectiveMethod: e.effectiveMethod.slice(0, 16),
-      methodSource: e.methodSource,
-      isWrite: e.isWrite,
-      prefixBytes: e.prefixBytes,
-      bodyComplete: e.bodyComplete,
-      decodeComplete: e.decodeComplete,
-      completeness: { transport: e.completeness.transport, decode: e.completeness.decode, extract: 'none' },
-      actions: [],
-      status: e.status,
-      ...(e.blocked !== undefined && { blocked: truncateUtf8HeadTail(e.blocked, msgMax) }),
-      ...(e.error !== undefined && { error: truncateUtf8HeadTail(e.error, msgMax) }),
-      dispatch: e.dispatch,
-      ...(e.live && { live: true as const }),
-      ...(e.liveAtEnd && { liveAtEnd: true as const }),
-      ...(e.incomplete && { incomplete: true as const }),
-      logCapped: true,
-    }
-    if (Buffer.byteLength(JSON.stringify(minimal), 'utf8') <= MINIMAL_RESERVE_BYTES) return minimal
-    pathMax = Math.max(1, Math.floor(pathMax / 2))
-    msgMax = Math.max(8, Math.floor(msgMax / 2))
-    if (attempt >= 3) authMax = Math.max(48, Math.floor(authMax * 0.6))
-  }
-  const authority = truncateUtf8HeadTail(e.authority || '', 255)
-  const originPath = authority ? `${e.scheme}://${authority}/` : '/'
-  return {
-    n: e.n,
-    descV: DESC_V,
-    redactV: REDACT_V,
-    extractorV: EXTRACTOR_V,
-    surface: 'browser',
-    target: { site: 's' },
-    seq: e.seq,
-    t: e.t,
-    kind: e.kind,
-    scheme: e.scheme,
-    authority,
-    path: '/',
-    url: originPath,
-    method: e.method.slice(0, 16),
-    effectiveMethod: e.effectiveMethod.slice(0, 16),
-    methodSource: e.methodSource,
-    isWrite: e.isWrite,
-    prefixBytes: e.prefixBytes,
-    bodyComplete: e.bodyComplete,
-    decodeComplete: e.decodeComplete,
-    completeness: { transport: e.completeness.transport, decode: e.completeness.decode, extract: 'none' },
-    actions: [],
-    status: e.status,
-    ...(e.blocked !== undefined && { blocked: truncateUtf8HeadTail(e.blocked, 32) }),
-    ...(e.error !== undefined && { error: truncateUtf8HeadTail(e.error, 32) }),
-    dispatch: e.dispatch,
-    logCapped: true,
-  }
-}
-
 export function startProxy(
   path: string,
   site: Site,
@@ -432,31 +265,22 @@ export function startProxy(
   const projection: ProjectionMode = opts?.auditV2?.projection ?? 'semantic'
   const vault = opts?.vault
   const siteName = opts?.siteName ?? (site.start_url ? URL.parse(site.start_url)?.hostname : undefined) ?? site.hosts[0] ?? 'site'
-  const sessionId = opts?.sessionId ?? 'session'
-  const clientId = opts?.clientId ?? 'default'
-  const inFlightTracker = opts?.inFlightTracker ?? new InFlightBudgetTracker()
+  const byteBudget = opts?.byteBudget ?? new ByteBudget()
   const prefixTimeoutMs = opts?.prefixTimeoutMs ?? 10_000
   const streamTimeoutMs = opts?.streamTimeoutMs ?? 30_000
-  const maxLogSoftBytes = opts?.maxLogSoftBytes ?? 4 * 1024 * 1024
-  const maxLogHardBytes = opts?.maxLogHardBytes ?? 6 * 1024 * 1024
-  const maxSampleBytes = opts?.maxSampleBytes ?? 2 * 1024 * 1024
-  const collapseGetsAfterBytes = opts?.collapseGetsAfterBytes ?? 1 * 1024 * 1024
-  const collapseGetsAfterEntries = opts?.collapseGetsAfterEntries ?? 2_000
+  const maxLogBytes = opts?.maxLogBytes ?? 6 * 1024 * 1024
   const isLiveNow = opts?.isLiveOrCooldown ?? isLive
 
   let seqCounter = 0
   let cursorCounter = 0
   let logBytes = 0
-  let tailLogBytes = 0
-  let reservedBytes = 0
-  let sampleBytes = 0
+  let inflightSiteWrites = 0
   let droppedGets = 0
   let refusedFullCount = 0
   let incompleteAtSeal = 0
   let droppedLateOutcomes = 0
   let admissionStopped = false
   let sealed = false
-  const collapsedGets: Record<string, { count: number; bytes: number }> = {}
   const activeUpstreams = new Set<http.ClientRequest | net.Socket>()
   const activeTunnels = new Set<net.Socket>()
   const activeUpgradeSockets = new Set<net.Socket>()
@@ -573,115 +397,45 @@ export function startProxy(
     return { safe: copy, liveAtEnd: true }
   }
 
-  const normalLimit = () => Math.max(0, maxLogHardBytes - TAIL_RESERVE_BYTES)
-
-  const tryReserveLogSpace = (): number => {
-    const avail = normalLimit() - logBytes - reservedBytes
-    if (avail < MINIMAL_RESERVE_BYTES) return -1
-    const want = logBytes < maxLogSoftBytes && avail >= MAX_ENTRY_BYTES ? MAX_ENTRY_BYTES : MINIMAL_RESERVE_BYTES
-    reservedBytes += want
-    return want
+  const tryReserveSiteWrite = (): boolean => {
+    if (logBytes + (inflightSiteWrites + 1) * MAX_ENTRY_BYTES > maxLogBytes) return false
+    inflightSiteWrites++
+    return true
   }
 
-  const releaseReservation = (amount: number) => {
-    if (amount > 0) reservedBytes = Math.max(0, reservedBytes - amount)
-  }
-
-  const shouldCollapseGet = (entry: V2Entry): boolean => {
-    if (entry.isWrite || entry.blocked || entry.error || entry.kind !== 'http') return false
-    if (entry.status < 200 || entry.status >= 400) return false
-    if (logBytes < collapseGetsAfterBytes && log.length < collapseGetsAfterEntries) return false
-    return STATIC_DESTS.has(entry.dest ?? '') || entry.status === 304 || (logBytes >= maxLogSoftBytes && entry.dest !== 'document')
-  }
-
-  const recordCollapsedGet = (draft: V2Entry) => {
-    const rawBucket = `${truncateUtf8HeadTail(draft.authority || 'unknown', 48)}:${(draft.dest ?? 'other').slice(0, 12)}`
-    const key = rawBucket in collapsedGets || Object.keys(collapsedGets).length < MAX_COLLAPSE_BUCKETS ? rawBucket : '_other'
-    const cur = collapsedGets[key] ?? { count: 0, bytes: 0 }
-    cur.count++
-    cur.bytes += draft.resBytes ?? 0
-    collapsedGets[key] = cur
-  }
-
-  const appendV2Entry = (entryWithoutN: Omit<V2Entry, 'n'>, ownReservation = 0): number | null => {
-    if (sealed) {
-      releaseReservation(ownReservation)
-      return null
-    }
-    releaseReservation(ownReservation)
+  const appendV2Entry = (entryWithoutN: Omit<V2Entry, 'n'>, hadSiteWriteReservation = false): number | null => {
+    if (hadSiteWriteReservation) inflightSiteWrites = Math.max(0, inflightSiteWrites - 1)
+    if (sealed) return null
 
     const draft: V2Entry = { n: cursorCounter + 1, ...entryWithoutN }
+    const scrubbed = scrubDeep(draft, vault)
+    const bytes = Buffer.byteLength(JSON.stringify(scrubbed), 'utf8')
+    const avail = maxLogBytes - logBytes - inflightSiteWrites * MAX_ENTRY_BYTES
+    const isSiteWrite = scrubbed.isWrite && matches(site.hosts, scrubbed.authority.split(':')[0])
 
-    if (shouldCollapseGet(draft)) {
-      recordCollapsedGet(draft)
-      return null
-    }
-
-    // Atomically enforce 2 MiB sample budget at commit time!
-    if (draft.reqBody !== undefined) {
-      const bLen = Buffer.byteLength(draft.reqBody, 'utf8')
-      if (sampleBytes + bLen > maxSampleBytes) {
-        delete draft.reqBody
-        draft.reqOmitted = 'budget'
-      }
-    }
-
-    // Account for OTHER concurrent requests' active reservations!
-    const avail = normalLimit() - logBytes - reservedBytes
-    const isSiteWrite = draft.isWrite && matches(site.hosts, draft.authority.split(':')[0])
-    if (!isSiteWrite && !draft.blocked && !draft.error && avail < MINIMAL_RESERVE_BYTES) {
-      droppedGets++
-      return null
-    }
-
-    let finalEntry: V2Entry
-    let bytes: number
-    if (logBytes >= maxLogSoftBytes) {
-      finalEntry = toMinimalCappedEntry(draft)
-      bytes = Buffer.byteLength(JSON.stringify(finalEntry), 'utf8')
-    } else {
-      const capped = capEntryTo12KiB(draft)
-      if (capped.bytes <= avail) {
-        finalEntry = capped.entry
-        bytes = capped.bytes
-      } else {
-        finalEntry = toMinimalCappedEntry(draft)
-        bytes = Buffer.byteLength(JSON.stringify(finalEntry), 'utf8')
-      }
-    }
-
-    // Strict hard-ceiling guard (even unreserved denials/417s cannot overshoot maxLogHardBytes - TAIL_RESERVE_BYTES)
     if (bytes > avail) {
-      if (!isSiteWrite && !finalEntry.blocked && !finalEntry.error) droppedGets++
+      if (!isSiteWrite && !scrubbed.blocked && !scrubbed.error) droppedGets++
       else refusedFullCount++
       return null
     }
 
-    if (finalEntry.reqBody !== undefined) {
-      sampleBytes += Buffer.byteLength(finalEntry.reqBody, 'utf8')
-    }
-
-    finalEntry.n = ++cursorCounter
-    const scrubbedEntry = scrubDeep(finalEntry, vault)
-    log.push(scrubbedEntry)
+    scrubbed.n = ++cursorCounter
+    log.push(scrubbed)
     logBytes += bytes
-    opts?.onEntry?.(scrubbedEntry)
-    return scrubbedEntry.n
+    return scrubbed.n
   }
 
   const appendLateOutcome = (rec: Omit<LateOutcomeEntry, 'n'>): void => {
     if (sealed) return
-    const preview: LateOutcomeEntry = { n: cursorCounter + 1, ...rec }
-    const bytes = Buffer.byteLength(JSON.stringify(preview), 'utf8')
-    const summaryFloor = Math.min(8192, Math.floor(TAIL_RESERVE_BYTES / 2))
-    if (tailLogBytes + bytes > TAIL_RESERVE_BYTES - summaryFloor) {
+    const full = scrubDeep({ n: cursorCounter + 1, ...rec }, vault)
+    const bytes = Buffer.byteLength(JSON.stringify(full), 'utf8')
+    if (logBytes + bytes > maxLogBytes + 64 * 1024) {
       droppedLateOutcomes++
       return
     }
-    const full = scrubDeep({ n: ++cursorCounter, ...rec }, vault)
+    full.n = ++cursorCounter
     log.push(full)
-    tailLogBytes += bytes
-    opts?.onEntry?.(full)
+    logBytes += bytes
   }
 
   const buildProjection = async (params: {
@@ -756,8 +510,8 @@ export function startProxy(
     let decodedCharge = 0
     if (kind === 'http' && prefixBuf.length > 0 && !liveOrChanged) {
       const charger = {
-        tryAcquire: (b: number) => inFlightTracker.tryAcquire(clientId, sessionId, b),
-        release: (b: number) => inFlightTracker.release(clientId, sessionId, b),
+        tryAcquire: (b: number) => byteBudget.tryAcquire(b),
+        release: (b: number) => byteBudget.release(b),
       }
       try {
         decodeRes = await decompressPrefix(
@@ -776,7 +530,7 @@ export function startProxy(
 
     const releaseDecoded = () => {
       if (decodedCharge > 0) {
-        inFlightTracker.release(clientId, sessionId, decodedCharge)
+        byteBudget.release(decodedCharge)
         decodedCharge = 0
       }
     }
@@ -801,7 +555,6 @@ export function startProxy(
       isAuth: arrival.isAuth,
       isLive: liveAfterDecode,
       projection,
-      sampleBudgetOk: sampleBytes < maxSampleBytes,
     })
 
     const safe: SafeRequestProjection = {
@@ -876,14 +629,14 @@ export function startProxy(
       return
     }
 
-    let reserved = 0
+    let reserved = false
     if (arrival.isWrite && isSiteHost(url)) {
-      reserved = tryReserveLogSpace()
-      if (reserved < 0) {
+      if (!tryReserveSiteWrite()) {
         refusedFullCount++
         res.writeHead(403, { 'content-type': 'application/json', connection: 'close' }).end(JSON.stringify({ error: 'audit log full' }))
         return
       }
+      reserved = true
     }
 
     // 1. Bounded 64 KiB prefix tee
@@ -906,7 +659,7 @@ export function startProxy(
       if (teeReleased) return
       teeReleased = true
       if (teeAcquired > 0) {
-        inFlightTracker.release(clientId, sessionId, teeAcquired)
+        byteBudget.release(teeAcquired)
         teeAcquired = 0
       }
       teeChunks.length = 0
@@ -963,7 +716,7 @@ export function startProxy(
       if (teeFrozen) return
       if (teeLen >= MAX_PREFIX_BYTES) return freezeTee(false, '>64KiB')
       const take = Math.min(chunk.length, MAX_PREFIX_BYTES - teeLen)
-      if (!inFlightTracker.tryAcquire(clientId, sessionId, take)) {
+      if (!byteBudget.tryAcquire(take)) {
         budgetHit = true
         return freezeTee(false, 'budget')
       }
@@ -1001,9 +754,9 @@ export function startProxy(
       activeInFlight.delete(seq)
       const ms = Math.round(performance.now() - startMs)
       const ll = applyLateLive(safe, liveAtStart, genAtStart)
-      const scrubbedErr = errorMsg ? scrubText(errorMsg).text : undefined
+      const scrubbedErr = errorMsg ? truncateUtf8HeadTail(scrubText(errorMsg).text, 256) : undefined
       const ownRes = reserved
-      reserved = 0
+      reserved = false
       emittedN = appendV2Entry({
         ...ll.safe,
         status,
@@ -1186,7 +939,7 @@ export function startProxy(
     const arrival = classifyArrival(req, url, outboundSnap?.headers)
 
     let committed = false
-    let reserved = 0
+    let reserved = false
     let dispatchState: 'not_dispatched' | 'dispatched' | 'unknown' = 'not_dispatched'
 
     const commitUpgrade = (safe: SafeRequestProjection, extra: { status: number; blocked?: string; error?: string; dispatch?: 'not_dispatched' | 'dispatched' | 'unknown'; incomplete?: true }) => {
@@ -1195,12 +948,12 @@ export function startProxy(
       activeInFlight.delete(seq)
       const ll = applyLateLive(safe, liveAtStart, genAtStart)
       const ownRes = reserved
-      reserved = 0
+      reserved = false
       appendV2Entry({
         ...ll.safe,
         status: extra.status,
         ...(extra.blocked && { blocked: extra.blocked }),
-        ...(extra.error && { error: extra.error }),
+        ...(extra.error && { error: truncateUtf8HeadTail(extra.error, 256) }),
         dispatch: extra.dispatch ?? dispatchState,
         ...(ll.liveAtEnd && { liveAtEnd: true as const }),
         ...(extra.incomplete && { incomplete: true as const }),
@@ -1220,15 +973,14 @@ export function startProxy(
         return
       }
       if (arrival.isWrite && isSiteHost(url)) {
-        reserved = tryReserveLogSpace()
-        if (reserved < 0) {
-          reserved = 0
+        if (!tryReserveSiteWrite()) {
           committed = true
           refusedFullCount++
           const fullJson = JSON.stringify({ error: 'audit log full' })
           socket.end(`HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(fullJson)}\r\nconnection: close\r\n\r\n${fullJson}`)
           return
         }
+        reserved = true
       }
       if (socket.destroyed || sealed || admissionStopped) {
         commitUpgrade(safe, { status: 0, dispatch: 'not_dispatched', incomplete: true })
@@ -1375,17 +1127,15 @@ export function startProxy(
         n: ++cursorCounter,
         rec: '_summary',
         t: new Date().toISOString(),
-        collapsedGets: { ...collapsedGets },
         droppedGets,
         refusedFullCount,
         incompleteAtSeal,
         ...(droppedLateOutcomes > 0 && { droppedLateOutcomes }),
       }
       log.push(summary)
-      tailLogBytes += Buffer.byteLength(JSON.stringify(summary), 'utf8')
       sealed = true
-      outer.closeAllConnections?.()
-      inner.closeAllConnections?.()
+      outer.closeAllConnections()
+      inner.closeAllConnections()
       for (const sock of activeTunnels) sock.destroy()
       activeTunnels.clear()
       for (const sock of activeUpgradeSockets) sock.destroy()
@@ -1394,32 +1144,13 @@ export function startProxy(
       activeUpstreams.clear()
       return { logCursor: cursorCounter, droppedGets, refusedFull: refusedFullCount }
     },
-    getLogPage: (after: number, limit = 500) => {
-      const cappedLimit = Math.min(500, Math.max(1, limit))
-      const oldestCursor = log.length ? log[0].n : cursorCounter
-      const out: LogRecord[] = []
-      let pageBytes = 128
-      let lastIdx = -1
-      for (let i = 0; i < log.length; i++) {
-        const e = log[i]
-        if (e.n <= after) continue
-        const size = Buffer.byteLength(JSON.stringify(e), 'utf8') + 1
-        if (out.length > 0 && (out.length >= cappedLimit || pageBytes + size > MAX_PAGE_BYTES)) break
-        out.push(e)
-        pageBytes += size
-        lastIdx = i
-      }
-      const hasMore = lastIdx >= 0 && lastIdx < log.length - 1
-      const nextCursor = out.length > 0 ? out[out.length - 1].n : Math.max(after, oldestCursor)
-      return { oldestCursor, nextCursor, hasMore, dropped: droppedGets, entries: out }
-    },
+    getLogPage: (after: number, limit = 500) =>
+      page(log, e => e.n, cursorCounter, after, Math.min(500, Math.max(1, limit)), MAX_PAGE_BYTES, droppedGets),
     getCurrentCursor: () => cursorCounter,
     clear: () => {
       log.length = 0
       logBytes = 0
-      tailLogBytes = 0
-      reservedBytes = 0
-      sampleBytes = 0
+      inflightSiteWrites = 0
     },
   }
 
