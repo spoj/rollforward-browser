@@ -970,7 +970,7 @@ export function startProxy(
   })
   outer.on('close', () => {
     inner.close()
-    inner.closeAllConnections?.()
+    inner.closeAllConnections()
     agents.forEach(pool => Object.values(pool).forEach(a => a.destroy()))
   })
 

@@ -383,9 +383,7 @@ export function scrubDeep<T>(value: T, vault?: SecretVault): T {
 }
 
 export function normalizePathForAuth(rawPath: string): string {
-  // Split on '/' BEFORE percent-decoding so %2F inside a matrix parameter (e.g. /formservice;x=%2Flogin) stays in-segment.
-  // Preserve genuine routing segments after empty matrix params (/app;v=/login -> /app/login), while keeping WebLogic E1
-  // AIS `/formservice;x=/login` scoped cleanly to `/formservice` per §6.2.
+  // Split on '/' before percent-decoding so %2F inside a matrix parameter stays in-segment.
   const rawSegs = rawPath.split('/')
   const parts: string[] = []
   for (let i = 0; i < rawSegs.length; i++) {

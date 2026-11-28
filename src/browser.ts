@@ -404,8 +404,6 @@ export class BrowserSession {
     clearTimeout(this.shotTimer)
     this.shotTimer = undefined
 
-    // Finalize in-flight proxy requests & stop admission SYNCHRONOUSLY before awaiting storageState/shutdown
-    // so in-flight writes record dispatch:'unknown' and accurate incompleteAtSeal counts!
     const pSnap = this.proxy?.controller.finalizeAtSeal() ?? { logCursor: 0, droppedGets: 0, refusedFull: 0 }
 
     const timeoutMs = this.opts.sealTimeoutMs ?? SEAL_STEP_TIMEOUT_MS

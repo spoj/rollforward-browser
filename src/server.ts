@@ -9,7 +9,7 @@ import { blocklist, isBlocked, loadBlocklists } from './blocklists.ts'
 import { createDriveVaultTap } from './cdp-tap.ts'
 import { ByteBudget, type AuditV2Config, type V2Entry } from './proxy.ts'
 
-const VERSION = '0.3.0'
+const VERSION = '0.3.1'
 const port = Number(process.env.BROWSER_PORT ?? 8797)
 const host = process.env.BROWSER_HOST ?? '127.0.0.1'
 const postTtlGcMs = Number(process.env.BROWSER_POST_TTL_GC_MS ?? 25 * 60_000)
@@ -177,7 +177,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
   const s = sessions.get(id)
   if (!s || s.client !== client.name) throw fail(404, 'no such session')
 
-  // ---- Routes ABOVE `if (s.closing)` so sealed & TTL-expired sessions remain drainable (§2.1.1) ----
+  // Routes available on sealed / TTL-expired sessions for draining
   if (rest === '' && req.method === 'DELETE') {
     clearTimeout(s.gcTimer)
     if (searchParams.get('sealed') === '1') {
@@ -316,11 +316,9 @@ server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffe
   const headers: Record<string, unknown> = { ...req.headers, host: 'localhost' }
   delete headers.authorization
   delete headers.origin
-  // Strip ALL x-rf-* headers before forwarding to Chromium (§3.1.1)
   for (const k of Object.keys(headers)) {
     if (k.toLowerCase().startsWith('x-rf-')) delete headers[k]
   }
-  // Strip sec-websocket-extensions on /view/watch, /view/drive, and tapped external /cdp (§3.1.2)
   if (rest === '/view/watch' || tapDriveVault || tapExternalCdp) {
     delete headers['sec-websocket-extensions']
   }

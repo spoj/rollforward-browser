@@ -137,12 +137,11 @@ function render() {
   if (document.activeElement !== url) url.value = targets.get(current)?.url ?? ''
 }
 
-// ---- B1 Polling Activity HUD (textContent-only, outside page DOM, suppressed on ?drive & live driving) ----
+// Polling Activity HUD (textContent-only, outside page DOM, suppressed on ?drive & live driving)
 let hudCursor = 0, hudStopped = initialDrive, hudInFlight = false, hudTimer = null, hudOpen = false, hudItems = []
 
 function formatHudEvent(ev) {
   const ts = typeof ev.t === 'string' && ev.t.length >= 19 ? ev.t.slice(11, 19) : ''
-  if (ev.kind === 'live_start' || ev.kind === 'live_end') return `${ts} [LIVE] ${ev.detail || ev.kind}`
   if (ev.kind === 'cdp') return `${ts} [CDP${ev.severity === 'high' ? '!' : ''}] ${ev.detail || ev.method || ''}`
   const status = ev.status ? ` ${ev.status}` : ''
   const blk = ev.blocked ? ` BLOCKED(${ev.blocked})` : ''
@@ -150,30 +149,27 @@ function formatHudEvent(ev) {
 }
 
 function renderHud(data) {
-  if (!hud) return
   hud.hidden = driving || hudStopped
   if (data) {
-    if (hudCounts) hudCounts.textContent = `writes: ${data.writeCount ?? 0} | blocked: ${data.blockedCount ?? 0}${data.dropped ? ` | dropped: ${data.dropped}` : ''}`
+    hudCounts.textContent = `writes: ${data.writeCount ?? 0} | blocked: ${data.blockedCount ?? 0}${data.dropped ? ` | dropped: ${data.dropped}` : ''}`
     if (Array.isArray(data.events) && data.events.length) {
       for (const ev of data.events) hudItems.push(ev)
       if (hudItems.length > 100) hudItems = hudItems.slice(-100)
     }
     const latest = hudItems.at(-1)
-    if (hudSummary) hudSummary.textContent = data.live ? 'Live control active (paused)' : latest ? formatHudEvent(latest) : 'Activity (idle)'
-    if (hudList && typeof hudList.replaceChildren === 'function') {
-      const rows = hudItems.slice(-50).reverse().map(ev => {
-        const div = document.createElement('div')
-        div.className = 'hud-row' + (ev.blocked ? ' blocked' : ev.severity === 'high' ? ' high' : ev.kind === 'live_start' || ev.kind === 'live_end' ? ' live' : ev.isWrite ? ' write' : '')
-        div.textContent = formatHudEvent(ev)
-        return div
-      })
-      hudList.replaceChildren(...rows)
-    }
+    hudSummary.textContent = data.live ? 'Live control active (paused)' : latest ? formatHudEvent(latest) : 'Activity (idle)'
+    const rows = hudItems.slice(-50).reverse().map(ev => {
+      const div = document.createElement('div')
+      div.className = 'hud-row' + (ev.blocked ? ' blocked' : ev.severity === 'high' ? ' high' : ev.isWrite ? ' write' : '')
+      div.textContent = formatHudEvent(ev)
+      return div
+    })
+    hudList.replaceChildren(...rows)
   }
 }
 
 function scheduleHudPoll() {
-  if (!hud || hudStopped || driving || hudTimer || typeof fetch !== 'function' || typeof setTimeout !== 'function') return
+  if (hudStopped || driving || hudTimer) return
   hudTimer = setTimeout(() => {
     hudTimer = null
     void pollHud()
@@ -181,7 +177,7 @@ function scheduleHudPoll() {
 }
 
 async function pollHud() {
-  if (!hud || hudStopped || driving || hudInFlight || typeof fetch !== 'function') return
+  if (hudStopped || driving || hudInFlight) return
   hudInFlight = true
   try {
     const res = await fetch(new URL(`view/activity?after=${hudCursor}`, location.href).href, { cache: 'no-store' })
@@ -196,7 +192,6 @@ async function pollHud() {
       renderHud(data)
     }
   } catch {
-    // Transient network error: retry on next 2s tick
   } finally {
     hudInFlight = false
     if (!hudStopped && !driving) scheduleHudPoll()
@@ -204,22 +199,18 @@ async function pollHud() {
 }
 
 function syncHudVisibility() {
-  if (!hud) return
   if (driving || hudStopped) {
     hud.hidden = true
-    if (hudTimer && typeof clearTimeout === 'function') { clearTimeout(hudTimer); hudTimer = null }
-  } else if (typeof fetch === 'function') {
+    if (hudTimer) { clearTimeout(hudTimer); hudTimer = null }
+  } else {
     void pollHud()
   }
 }
 
-if (hudBar && hudToggle) {
-  const toggleHud = () => {
-    hudOpen = !hudOpen
-    hud.classList?.toggle('open', hudOpen)
-    hudToggle.textContent = hudOpen ? 'Collapse' : 'Expand'
-  }
-  hudBar.onclick = toggleHud
+hudBar.onclick = () => {
+  hudOpen = !hudOpen
+  hud.classList.toggle('open', hudOpen)
+  hudToggle.textContent = hudOpen ? 'Collapse' : 'Expand'
 }
 
 const mods = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0)
