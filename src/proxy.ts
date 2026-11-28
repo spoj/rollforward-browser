@@ -267,7 +267,7 @@ export type ProxyController = {
 
 export type ProxyServer = http.Server & { controller: ProxyController }
 
-export type Site = { hosts: string[], start_url?: string, headers?: Record<string, string>, public?: boolean, open?: boolean, except?: string[], via?: { url: string, token: string, hosts: string[] } }
+export type Site = { hosts: string[], internalHosts?: string[], start_url?: string, headers?: Record<string, string>, public?: boolean, open?: boolean, except?: string[], via?: { url: string, token: string, hosts: string[] } }
 type Target = { scheme: string, authority: string }
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
@@ -788,6 +788,13 @@ export function startProxy(
   const matches = (list: string[], host: string) => list.some(h => h.toLowerCase() === host || h.startsWith('*.') && host.endsWith(h.slice(1).toLowerCase()))
   const isSiteHost = (url: URL | null) => Boolean(url && matches(site.hosts, url.hostname))
   const exact = (host: string) => site.hosts.some(h => h.toLowerCase() === host)
+  const allowInternal = (host: string) => {
+    if (site.public) return false
+    const norm = host.replace(/\.$/, '').toLowerCase()
+    return site.internalHosts !== undefined
+      ? site.internalHosts.some(h => h.toLowerCase() === norm)
+      : exact(norm)
+  }
   const via = (host: string) => !!site.via && matches(site.via.hosts, host.replace(/\.$/, ''))
   const origin = site.start_url && new URL(site.start_url).origin
   const secureContext = tls.createSecureContext(key)
@@ -839,7 +846,7 @@ export function startProxy(
     if (site.open && matches(site.except ?? [], host.replace(/\.$/, ''))) return 'host not on the list'
     if (site.open && isBlocked(host)) return 'on a blocklist'
     const ip = host.replace(/^\[(.*)\]$/, '$1')
-    if (net.isIP(ip)) return !exact(host) ? 'host not on the list' : !via(host) && (site.public ? isInternal : isNever)(ip, net.isIP(ip)) ? 'internal address' : undefined
+    if (net.isIP(ip)) return !exact(host) ? 'host not on the list' : !via(host) && (!allowInternal(host) ? isInternal : isNever)(ip, net.isIP(ip)) ? 'internal address' : undefined
     if (!matches(site.hosts, host) && !site.open) return 'host not on the list'
   }
 
@@ -857,7 +864,7 @@ export function startProxy(
     if (hadChunked && headers['content-length'] === undefined) {
       headers['transfer-encoding'] = 'chunked'
     }
-    const strict = !!site.public || !exact(url.hostname)
+    const strict = !allowInternal(url.hostname)
     return {
       method: req.method,
       headers,

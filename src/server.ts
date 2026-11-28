@@ -52,6 +52,7 @@ const json = (res: http.ServerResponse, status: number, body: unknown, extraHead
   res.writeHead(status, { 'content-type': 'application/json', ...extraHeaders }).end(JSON.stringify(body))
 const body = async (req: http.IncomingMessage) => Buffer.concat(await req.toArray())
 const names = (list: unknown) => Array.isArray(list) && list.every(h => typeof h === 'string' && /^(\*\.)?[a-z0-9_.-]+$|^\[[0-9a-f:.]+\]$/i.test(h))
+const exactNames = (list: unknown) => Array.isArray(list) && list.every(h => typeof h === 'string' && /^[a-z0-9_.-]+$|^\[[0-9a-f:.]+\]$/i.test(h))
 
 const sealSession = (s: Session, scheduleGc = false): Promise<SealSnapshot> => {
   clearTimeout(s.timer)
@@ -106,21 +107,24 @@ function checkSealedCap(clientName: string) {
 async function open(spec: any, client: typeof clients[number]) {
   const { site } = spec
   if (!site || !names(site.hosts) || !names(site.except ?? []) || site.via && !names(site.via.hosts)) throw fail(400, 'hosts, except and via.hosts: names such as sso.example.com, or *.example.com for any under it')
+  const rawInternal = spec.internalHosts ?? site.internalHosts
+  if (rawInternal !== undefined && !exactNames(rawInternal)) throw fail(400, 'internalHosts: exact hostnames without wildcards')
+  const siteCfg = rawInternal !== undefined ? { ...site, internalHosts: rawInternal } : site
   const auditV2 = validateAuditV2(spec.auditV2)
   try {
-    for (const [name, value] of Object.entries({ ...site.headers, ...site.via && { 'proxy-authorization': `Bearer ${site.via.token}` } })) {
+    for (const [name, value] of Object.entries({ ...siteCfg.headers, ...siteCfg.via && { 'proxy-authorization': `Bearer ${siteCfg.via.token}` } })) {
       http.validateHeaderName(name)
       http.validateHeaderValue(name, value)
     }
   } catch (e: any) {
     throw fail(400, e.message)
   }
-  if (site.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
+  if (siteCfg.open && !blocklist) throw fail(503, 'blocklists not loaded yet')
   checkSealedCap(client.name)
 
   const id = crypto.randomBytes(8).toString('hex')
   const s: Session = Object.assign(
-    new BrowserSession(id, `${runDir}/${id}`, label, spec.site, spec.audit === true, {
+    new BrowserSession(id, `${runDir}/${id}`, label, siteCfg, spec.audit === true, {
       auditV2,
       inFlightTracker,
       clientId: client.name,
