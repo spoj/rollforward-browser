@@ -145,7 +145,6 @@ export type ProxyV2Options = {
   vault?: SecretVault
   getCdpCursor?: () => number
   isLiveOrCooldown?: () => boolean
-  onWriteDetail?: (info: { dest?: string; isWrite: boolean }) => void
   byteBudget?: ByteBudget
   prefixTimeoutMs?: number
   streamTimeoutMs?: number
@@ -757,11 +756,7 @@ export function startProxy(
       r.on('end', () => {
         resDone = true
         tryComplete()
-        const dest = typeof req.headers['sec-fetch-dest'] === 'string' ? req.headers['sec-fetch-dest'] : undefined
-        if (!liveAtStart && arrival.isWrite && !isLiveNow() && liveGen?.() === genAtStart) {
-          opts?.onWriteDetail?.({ dest, isWrite: true })
-          if (!opts?.onWriteDetail) onWrite?.()
-        }
+        if (!liveAtStart && arrival.isWrite && !isLiveNow() && liveGen?.() === genAtStart) onWrite?.()
       })
       r.on('aborted', () => {
         resDone = true; reqDone = true

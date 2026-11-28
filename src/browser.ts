@@ -56,10 +56,8 @@ export type SealSnapshot = {
 
 const MAX_SHOTS = 60
 const MAX_SHOT_BYTES = 20 * 1024 * 1024
-const MAX_SINGLE_SHOT_JPEG_BYTES = 5 * 1024 * 1024
 const SHOT_SETTLE_MS = 500
 const SHOT_MIN_INTERVAL_MS = 1_500
-const SHOT_BG_WRITE_INTERVAL_MS = 10_000
 const MAX_SHOTS_PAGE_BYTES = 8 * 1024 * 1024
 const LIVE_COOLDOWN_MS = 5_000
 const SEAL_STEP_TIMEOUT_MS = 10_000
@@ -132,14 +130,7 @@ export class BrowserSession {
   private shotTimer?: NodeJS.Timeout
   private shotPage?: Page
   private shotTrigger: ShotTrigger = 'nav'
-  private shotPriority = 0
-  private shotGen = 0
-  private frameGen = 0
-  private taintedPages = new WeakSet<Page>()
   private capturing = false
-  private pendingShot = false
-  private pendingShotTrigger: ShotTrigger = 'nav'
-  private pendingShotPriority = 0
   private stopped = false
   private sealPromise?: Promise<SealSnapshot>
   private sealedSnapshot?: SealSnapshot
@@ -168,7 +159,7 @@ export class BrowserSession {
       this.cdpTap = new CdpSessionTap({
         vault: this.vault,
         isLive: () => this.isLiveOrCooldown(),
-        onFileUpload: () => this.scheduleShot(undefined, 'file-upload', false),
+        onFileUpload: () => this.scheduleShot(undefined, 'file-upload'),
       })
     }
   }
@@ -275,7 +266,6 @@ export class BrowserSession {
       vault: this.vault,
       getCdpCursor: () => this.cdpTap?.currentCursor ?? 0,
       isLiveOrCooldown: () => this.isLiveOrCooldown(),
-      onWriteDetail: this.audit ? ({ dest }: { dest?: string }) => this.scheduleShot(undefined, 'write', dest === 'empty') : undefined,
       byteBudget: this.opts.byteBudget,
     }
     this.proxy = startProxy(
@@ -284,7 +274,7 @@ export class BrowserSession {
       tlsKey,
       () => this.drivers > 0,
       this.log,
-      this.audit ? () => this.scheduleShot(undefined, 'write', false) : undefined,
+      this.audit ? () => this.scheduleShot(undefined, 'write') : undefined,
       () => this.driverGen,
       proxyOpts,
     )
@@ -302,90 +292,41 @@ export class BrowserSession {
     if (state) await ctx.setStorageState(state as any)
     if (this.audit) {
       const watch = (p: Page) => {
-        p.on('frameattached', () => { this.frameGen++ })
-        p.on('framedetached', () => { this.frameGen++ })
-        p.on('framenavigated', f => {
-          this.frameGen++
-          if (f === p.mainFrame()) this.scheduleShot(p, 'nav', false)
-        })
-        p.on('load', () => {
-          if (this.drivers === 0) this.taintedPages.delete(p)
-          this.scheduleShot(p, 'load', false)
-        })
-        p.on('download', () => this.scheduleShot(p, 'download', false))
+        p.on('framenavigated', f => { if (f === p.mainFrame()) this.scheduleShot(p, 'nav') })
+        p.on('load', () => this.scheduleShot(p, 'load'))
+        p.on('download', () => this.scheduleShot(p, 'download'))
       }
-      ctx.on('page', p => {
-        if (this.drivers > 0) this.taintedPages.add(p)
-        watch(p)
-        this.scheduleShot(p, 'tab', false)
-      })
+      ctx.on('page', p => { watch(p); this.scheduleShot(p, 'tab') })
       for (const p of ctx.pages()) watch(p)
     }
     if (this.site.start_url) await (ctx.pages()[0] ?? await ctx.newPage()).goto(this.site.start_url, { waitUntil: 'commit' })
   }
 
-  private taintOpenPages() {
-    for (const p of this.pw?.contexts()[0]?.pages() ?? []) this.taintedPages.add(p)
-  }
-
   onDriverStart() {
     this.drivers++
     this.driverGen++
-    this.taintOpenPages()
     clearTimeout(this.shotTimer)
     this.shotTimer = undefined
     this.shotPage = undefined
-    this.shotPriority = 0
-    this.pendingShot = false
-    this.pendingShotPriority = 0
   }
 
   onDriverEnd() {
-    this.taintOpenPages()
     this.drivers = Math.max(0, this.drivers - 1)
     this.driverGen++
     this.lastDriverEndedAt = Date.now()
   }
 
-  private scheduleShot(page?: Page, trigger: ShotTrigger = 'nav', bgWrite = false) {
-    if (!this.audit || this.stopped || this.drivers > 0) return
-    const priority = bgWrite ? 1 : 2
-    if (this.capturing) {
-      this.pendingShot = true
-      if (priority >= this.pendingShotPriority) {
-        this.pendingShotPriority = priority
-        this.pendingShotTrigger = trigger
-        if (page) this.shotPage = page
-      }
-      return
-    }
-    // Never let a lower-priority background write overwrite a pending high-priority trigger or delay it!
-    if (this.shotTimer) {
-      if (priority < this.shotPriority) return
-      if (priority > this.shotPriority) {
-        // Reschedule earlier for high-priority event (e.g., download/file-upload overriding 10s bg-write timer)
-        clearTimeout(this.shotTimer)
-        this.shotTimer = undefined
-      } else {
-        if (page) this.shotPage = page
-        this.shotTrigger = trigger
-        this.shotGen = this.driverGen
-        return
-      }
-    }
-
+  private scheduleShot(page?: Page, trigger: ShotTrigger = 'nav') {
+    if (!this.audit || this.stopped || this.isLiveOrCooldown()) return
     if (page) this.shotPage = page
     this.shotTrigger = trigger
-    this.shotPriority = priority
-    this.shotGen = this.driverGen
-    const minInterval = bgWrite ? SHOT_BG_WRITE_INTERVAL_MS : SHOT_MIN_INTERVAL_MS
-    const delay = Math.max(SHOT_SETTLE_MS, minInterval - (Date.now() - this.lastShotAt))
+    if (this.capturing || this.shotTimer) return
+    const delay = Math.max(SHOT_SETTLE_MS, SHOT_MIN_INTERVAL_MS - (Date.now() - this.lastShotAt))
     this.shotTimer = setTimeout(() => {
       this.shotTimer = undefined
-      this.shotPriority = 0
       void this.captureAudit()
     }, delay)
-    this.shotTimer.unref?.()
+    this.shotTimer.unref()
   }
 
   private async isSafeForShot(p: Page): Promise<boolean> {
@@ -400,21 +341,20 @@ export class BrowserSession {
   }
 
   private async captureAudit() {
-    if (!this.audit || this.stopped || this.drivers > 0 || this.driverGen !== this.shotGen || !this.pw?.isConnected()) return
-    if (this.capturing) { this.pendingShot = true; return }
+    if (!this.audit || this.stopped || this.capturing || this.isLiveOrCooldown() || !this.pw?.isConnected()) return
     this.capturing = true
     try {
-      const gen = this.shotGen
+      const gen = this.driverGen
       const trigger = this.shotTrigger
       const pages = this.pw.contexts()[0]?.pages() ?? []
       const p = (this.shotPage && !this.shotPage.isClosed() && pages.includes(this.shotPage)) ? this.shotPage : pages.at(-1)
       this.shotPage = undefined
-      if (!p || p.isClosed() || this.taintedPages.has(p)) return
-      const urlBefore = p.url(), fg = this.frameGen
+      if (!p || p.isClosed()) return
+      const urlBefore = p.url()
       if (!(await this.isSafeForShot(p))) return
-      if (this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg || p.isClosed()) return
+      if (this.stopped || this.isLiveOrCooldown() || this.driverGen !== gen || p.isClosed()) return
       const jpeg = await p.screenshot({ type: 'jpeg', quality: 65, timeout: 3000 }).catch(() => null)
-      if (!jpeg || jpeg.length > MAX_SINGLE_SHOT_JPEG_BYTES || this.stopped || this.drivers > 0 || this.driverGen !== gen || this.frameGen !== fg || p.isClosed() || p.url() !== urlBefore) return
+      if (!jpeg || jpeg.length > MAX_SHOT_BYTES || this.stopped || this.isLiveOrCooldown() || this.driverGen !== gen || p.isClosed() || p.url() !== urlBefore) return
       this.lastShotAt = Date.now()
       if (this.lastJpeg?.equals(jpeg)) return
       this.lastJpeg = jpeg
@@ -438,13 +378,6 @@ export class BrowserSession {
       // Best-effort audit capture must never affect the browser session.
     } finally {
       this.capturing = false
-      if (this.pendingShot && !this.stopped && this.drivers === 0) {
-        const nextTrigger = this.pendingShotTrigger
-        const nextBg = this.pendingShotPriority === 1
-        this.pendingShot = false
-        this.pendingShotPriority = 0
-        this.scheduleShot(undefined, nextTrigger, nextBg)
-      }
     }
   }
 
